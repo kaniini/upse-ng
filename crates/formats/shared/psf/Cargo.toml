@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-psf"
+description = "Safe PSF container parsing and dependency planning for UPSE-NG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

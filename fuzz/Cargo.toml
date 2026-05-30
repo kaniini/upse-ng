@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "LGPL-2.1-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+upse-psf = { path = "../crates/formats/shared/psf" }
+
+[[bin]]
+name = "psf_container"
+path = "fuzz_targets/psf_container.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
