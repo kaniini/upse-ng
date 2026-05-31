@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-psx-exe"
+description = "Checked PS-X EXE parsing and PSF1 overlay application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-psf = { path = "../../shared/psf" }
+
+[lints]
+workspace = true

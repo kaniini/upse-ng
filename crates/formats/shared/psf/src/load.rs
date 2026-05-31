@@ -218,6 +218,8 @@ pub struct PlanLayer {
 /// Deterministic PSF1 executable overlay plan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Psf1LoadPlan {
+    /// Canonical logical origin of the caller-supplied root module.
+    pub root_origin: String,
     /// Executable layers in last-overlay-wins application order.
     pub layers: Vec<PlanLayer>,
     /// Origin whose PS-X EXE supplies initial PC and SP.
@@ -231,6 +233,8 @@ pub struct Psf1LoadPlan {
 /// Deterministic PSF2 filesystem overlay plan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Psf2LoadPlan {
+    /// Canonical logical origin of the caller-supplied root module.
+    pub root_origin: String,
     /// Filesystem layers in last-overlay-wins application order.
     pub layers: Vec<PlanLayer>,
     /// First `_refresh` encountered in specified traversal order.
@@ -327,6 +331,7 @@ pub fn load_plan<R: Resolver>(
         PsfVersion::Psf1 => {
             let node = state.psf1_node(&root_origin, root, 0)?;
             LoadPlan::Psf1(Psf1LoadPlan {
+                root_origin,
                 layers: node.layers,
                 initial_state_origin: node.initial_state_origin,
                 refresh_override: state.refresh_override,
@@ -334,7 +339,8 @@ pub fn load_plan<R: Resolver>(
             })
         }
         PsfVersion::Psf2 => LoadPlan::Psf2(Psf2LoadPlan {
-            layers: state.psf2_node(root_origin, root, 0)?,
+            layers: state.psf2_node(root_origin.clone(), root, 0)?,
+            root_origin,
             refresh_override: state.refresh_override,
             metadata: root_metadata,
         }),
