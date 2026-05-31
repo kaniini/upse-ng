@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps1-timers"
+description = "Composable PS1 root counters and video refresh timing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-clock = { path = "../../../support/clock" }
+upse-ps1-irq = { path = "../irq" }
+
+[dev-dependencies]
+upse-r3000 = { path = "../../shared/r3000" }
+
+[lints]
+workspace = true

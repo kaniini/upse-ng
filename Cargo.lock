@@ -119,11 +119,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps1-irq"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "upse-ps1-memory"
 version = "0.1.0"
 dependencies = [
  "thiserror",
  "upse-psx-exe",
+]
+
+[[package]]
+name = "upse-ps1-timers"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-clock",
+ "upse-ps1-irq",
+ "upse-r3000",
 ]
 
 [[package]]

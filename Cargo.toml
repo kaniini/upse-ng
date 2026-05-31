@@ -10,6 +10,8 @@ members = [
     "crates/formats/ps1/psx-exe",
     "crates/hw/shared/r3000",
     "crates/hw/ps1/memory",
+    "crates/hw/ps1/irq",
+    "crates/hw/ps1/timers",
 ]
 
 [workspace.package]
