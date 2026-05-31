@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-r3000"
+description = "Composable MIPS-I R3000-family interpreter for UPSE-NG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+trace = []
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
