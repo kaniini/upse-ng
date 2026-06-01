@@ -12,6 +12,7 @@ members = [
     "crates/hw/ps1/memory",
     "crates/hw/ps1/irq",
     "crates/hw/ps1/timers",
+    "crates/hw/ps1/dma",
 ]
 
 [workspace.package]

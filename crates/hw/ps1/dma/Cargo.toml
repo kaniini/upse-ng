@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps1-dma"
+description = "Composable PS1 DMA channel 4 controller and sound endpoint contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-clock = { path = "../../../support/clock" }
+upse-ps1-irq = { path = "../irq" }
+upse-ps1-memory = { path = "../memory" }
+upse-scheduler = { path = "../../../support/scheduler" }
+
+[dev-dependencies]
+upse-r3000 = { path = "../../shared/r3000" }
+
+[lints]
+workspace = true
