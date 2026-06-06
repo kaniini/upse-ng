@@ -9,6 +9,7 @@ members = [
     "crates/formats/shared/psf",
     "crates/formats/ps1/psx-exe",
     "crates/hw/shared/r3000",
+    "crates/hw/shared/spu-common",
     "crates/hw/ps1/memory",
     "crates/hw/ps1/irq",
     "crates/hw/ps1/timers",

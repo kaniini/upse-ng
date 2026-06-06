@@ -186,3 +186,10 @@ dependencies = [
  "thiserror",
  "upse-clock",
 ]
+
+[[package]]
+name = "upse-spu-common"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
