@@ -146,6 +146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps1-spu"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-ps1-dma",
+ "upse-ps1-irq",
+ "upse-spu-common",
+]
+
+[[package]]
 name = "upse-ps1-timers"
 version = "0.1.0"
 dependencies = [
