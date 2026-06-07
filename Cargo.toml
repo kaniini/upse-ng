@@ -15,6 +15,7 @@ members = [
     "crates/hw/ps1/timers",
     "crates/hw/ps1/dma",
     "crates/hw/ps1/spu",
+    "crates/hle/ps1/bios",
 ]
 
 [workspace.package]

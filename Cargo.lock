@@ -119,6 +119,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps1-bios"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "upse-ps1-dma"
 version = "0.1.0"
 dependencies = [
