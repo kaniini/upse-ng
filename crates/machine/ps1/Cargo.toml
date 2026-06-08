@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps1-machine"
+description = "End-to-end composable PSF1 machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-clock = { path = "../../support/clock" }
+upse-psf = { path = "../../formats/shared/psf" }
+upse-psx-exe = { path = "../../formats/ps1/psx-exe" }
+upse-r3000 = { path = "../../hw/shared/r3000" }
+upse-ps1-bios = { path = "../../hle/ps1/bios" }
+upse-ps1-dma = { path = "../../hw/ps1/dma" }
+upse-ps1-irq = { path = "../../hw/ps1/irq" }
+upse-ps1-memory = { path = "../../hw/ps1/memory" }
+upse-ps1-spu = { path = "../../hw/ps1/spu" }
+upse-ps1-timers = { path = "../../hw/ps1/timers" }
+upse-scheduler = { path = "../../support/scheduler" }
+
+[lints]
+workspace = true

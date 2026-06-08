@@ -145,6 +145,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps1-machine"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-clock",
+ "upse-ps1-bios",
+ "upse-ps1-dma",
+ "upse-ps1-irq",
+ "upse-ps1-memory",
+ "upse-ps1-spu",
+ "upse-ps1-timers",
+ "upse-psf",
+ "upse-psx-exe",
+ "upse-r3000",
+ "upse-scheduler",
+]
+
+[[package]]
 name = "upse-ps1-memory"
 version = "0.1.0"
 dependencies = [
