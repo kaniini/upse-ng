@@ -6,6 +6,7 @@ members = [
     "crates/support/clock",
     "crates/support/scheduler",
     "crates/support/audio-types",
+    "crates/support/audio",
     "crates/formats/shared/psf",
     "crates/formats/ps1/psx-exe",
     "crates/hw/shared/r3000",
@@ -17,6 +18,7 @@ members = [
     "crates/hw/ps1/spu",
     "crates/hle/ps1/bios",
     "crates/machine/ps1",
+    "crates/api/upse",
 ]
 
 [workspace.package]

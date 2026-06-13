@@ -105,6 +105,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "upse"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-audio",
+ "upse-audio-types",
+ "upse-ps1-machine",
+ "upse-psf",
+]
+
+[[package]]
+name = "upse-audio"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "upse-audio-types"
 version = "0.1.0"
 dependencies = [

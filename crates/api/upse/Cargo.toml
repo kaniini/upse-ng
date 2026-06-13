@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse"
+description = "High-level UPSE-NG PSF playback facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["psf1"]
+psf1 = ["dep:upse-ps1-machine"]
+
+[dependencies]
+thiserror.workspace = true
+upse-audio = { path = "../../support/audio" }
+upse-audio-types = { path = "../../support/audio-types" }
+upse-psf = { path = "../../formats/shared/psf" }
+upse-ps1-machine = { path = "../../machine/ps1", optional = true }
+
+[lints]
+workspace = true
