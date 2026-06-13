@@ -137,6 +137,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ffi"
+version = "0.1.0"
+dependencies = [
+ "upse",
+ "upse-psf",
+]
+
+[[package]]
 name = "upse-ps1-bios"
 version = "0.1.0"
 dependencies = [

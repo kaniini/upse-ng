@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ffi"
+description = "Stable C ABI for libupse-ng"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "upse_ng"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+upse = { path = "../upse" }
+
+[dev-dependencies]
+upse-psf = { path = "../../formats/shared/psf" }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

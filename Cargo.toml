@@ -19,6 +19,7 @@ members = [
     "crates/hle/ps1/bios",
     "crates/machine/ps1",
     "crates/api/upse",
+    "crates/api/ffi",
 ]
 
 [workspace.package]
@@ -45,4 +46,4 @@ module_name_repetitions = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
