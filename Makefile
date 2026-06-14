@@ -21,7 +21,8 @@ SHARED_SONAME := libupse-ng.so.$(ABI_MAJOR)
 PKGCONFIG_FILE := $(BUILD_DIR)/libupse-ng.pc
 
 .PHONY: all check fmt clippy test doc header check-header rust-library \
-	libraries check-exports pkgconfig install uninstall clean
+	libraries check-exports pkgconfig upse123 install install-upse123 \
+	uninstall clean
 
 all: libraries pkgconfig
 
@@ -78,6 +79,11 @@ $(PKGCONFIG_FILE): pkgconfig/libupse-ng.pc.in | $(BUILD_DIR)
 
 pkgconfig: $(PKGCONFIG_FILE)
 
+upse123: libraries
+	$(MAKE) -C examples \
+		UPSE_CFLAGS='-I$(CURDIR)/include' \
+		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -Wl,-rpath,$(CURDIR)/$(BUILD_DIR) -lupse-ng'
+
 install: all
 	$(INSTALL) -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR) \
 		$(DESTDIR)$(PKGCONFIGDIR) \
@@ -91,6 +97,9 @@ install: all
 	$(INSTALL) -m 644 LICENSES/LGPL-2.1-or-later.txt \
 		$(DESTDIR)$(PREFIX)/share/licenses/libupse-ng/LGPL-2.1-or-later.txt
 
+install-upse123: upse123
+	$(MAKE) -C examples install DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
+
 uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/libupse-ng.a \
 		$(DESTDIR)$(LIBDIR)/libupse-ng.so \
@@ -101,5 +110,6 @@ uninstall:
 		$(DESTDIR)$(PREFIX)/share/licenses/libupse-ng/LGPL-2.1-or-later.txt
 
 clean:
+	$(MAKE) -C examples clean
 	$(CARGO) clean
 	rm -rf $(BUILD_DIR)
