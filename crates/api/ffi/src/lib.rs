@@ -20,61 +20,75 @@ use upse::{
     PlayerError, RenderOutcome, ResolvedFile, Resolver, ResolverError,
 };
 
+/// Stable C operation result and error category.
+pub type upse_result = i32;
+/// Stable action returned by an audio callback.
+pub type upse_audio_action = i32;
+/// Stable bounded-render outcome category.
+pub type upse_render_kind = u32;
+/// Stable metadata field identifier.
+pub type upse_metadata_field = u32;
+
 /// Current configuration/header ABI version.
 pub const UPSE_ABI_VERSION: u32 = 1;
 /// Operation succeeded.
-pub const UPSE_RESULT_OK: i32 = 0;
+pub const UPSE_RESULT_OK: upse_result = 0;
 /// A required pointer, size, enum, or UTF-8 string was invalid.
-pub const UPSE_RESULT_INVALID_ARGUMENT: i32 = -1;
+pub const UPSE_RESULT_INVALID_ARGUMENT: upse_result = -1;
 /// A root path or dependency could not be read.
-pub const UPSE_RESULT_IO: i32 = -2;
+pub const UPSE_RESULT_IO: upse_result = -2;
 /// A container, executable, or metadata value was malformed.
-pub const UPSE_RESULT_FORMAT: i32 = -3;
+pub const UPSE_RESULT_FORMAT: upse_result = -3;
 /// The parsed module requires an unavailable machine feature.
-pub const UPSE_RESULT_UNSUPPORTED: i32 = -4;
+pub const UPSE_RESULT_UNSUPPORTED: upse_result = -4;
 /// A configured parser, dependency, or callback bound was exceeded.
-pub const UPSE_RESULT_LIMIT: i32 = -5;
+pub const UPSE_RESULT_LIMIT: upse_result = -5;
 /// Guest execution or post-mixing failed.
-pub const UPSE_RESULT_EMULATION: i32 = -6;
+pub const UPSE_RESULT_EMULATION: upse_result = -6;
 /// Audio callback reported a failure.
-pub const UPSE_RESULT_CALLBACK_ERROR: i32 = -7;
+pub const UPSE_RESULT_CALLBACK_ERROR: upse_result = -7;
 /// A Rust panic was contained at the ABI boundary.
-pub const UPSE_RESULT_INTERNAL: i32 = -8;
+pub const UPSE_RESULT_INTERNAL: upse_result = -8;
 
 /// Callback asks playback to continue.
-pub const UPSE_CALLBACK_CONTINUE: i32 = 0;
+pub const UPSE_CALLBACK_CONTINUE: upse_audio_action = 0;
 /// Callback asks the current render call to stop gracefully.
-pub const UPSE_CALLBACK_STOP: i32 = 1;
+pub const UPSE_CALLBACK_STOP: upse_audio_action = 1;
 /// Callback reports a sink error.
-pub const UPSE_CALLBACK_ERROR: i32 = 2;
+pub const UPSE_CALLBACK_ERROR: upse_audio_action = 2;
 
 /// Render delivered the requested frame count.
-pub const UPSE_RENDER_COMPLETE: u32 = 0;
+pub const UPSE_RENDER_COMPLETE: upse_render_kind = 0;
 /// Render reached the declared length-plus-fade end.
-pub const UPSE_RENDER_END: u32 = 1;
+pub const UPSE_RENDER_END: upse_render_kind = 1;
 /// Callback stopped rendering after consuming its current block.
-pub const UPSE_RENDER_STOPPED: u32 = 2;
+pub const UPSE_RENDER_STOPPED: upse_render_kind = 2;
 
 /// Metadata field identifiers for [`upse_player_metadata`].
-pub const UPSE_METADATA_TITLE: u32 = 0;
+pub const UPSE_METADATA_TITLE: upse_metadata_field = 0;
 /// Artist metadata field.
-pub const UPSE_METADATA_ARTIST: u32 = 1;
+pub const UPSE_METADATA_ARTIST: upse_metadata_field = 1;
 /// Game metadata field.
-pub const UPSE_METADATA_GAME: u32 = 2;
+pub const UPSE_METADATA_GAME: upse_metadata_field = 2;
 /// Year metadata field.
-pub const UPSE_METADATA_YEAR: u32 = 3;
+pub const UPSE_METADATA_YEAR: upse_metadata_field = 3;
 /// Genre metadata field.
-pub const UPSE_METADATA_GENRE: u32 = 4;
+pub const UPSE_METADATA_GENRE: upse_metadata_field = 4;
 /// Comment metadata field.
-pub const UPSE_METADATA_COMMENT: u32 = 5;
+pub const UPSE_METADATA_COMMENT: upse_metadata_field = 5;
 /// Copyright metadata field.
-pub const UPSE_METADATA_COPYRIGHT: u32 = 6;
+pub const UPSE_METADATA_COPYRIGHT: upse_metadata_field = 6;
 /// Ripper metadata field.
-pub const UPSE_METADATA_PSF_BY: u32 = 7;
+pub const UPSE_METADATA_PSF_BY: upse_metadata_field = 7;
 
 /// C callback invoked synchronously with borrowed stereo floating-point frames.
-pub type upse_audio_callback =
-    Option<unsafe extern "C" fn(userdata: *mut c_void, samples: *const f32, frames: usize) -> i32>;
+pub type upse_audio_callback = Option<
+    unsafe extern "C" fn(
+        userdata: *mut c_void,
+        samples: *const f32,
+        frames: usize,
+    ) -> upse_audio_action,
+>;
 
 /// Releases a resolver-returned borrowed blob exactly once.
 pub type upse_blob_release =
@@ -87,7 +101,7 @@ pub type upse_resolve_callback = Option<
         containing_origin: *const c_char,
         reference: *const c_char,
         output: *mut upse_blob,
-    ) -> i32,
+    ) -> upse_result,
 >;
 
 /// Sized root/parser/dependency configuration.
@@ -198,20 +212,18 @@ pub struct upse_render_outcome {
     /// Caller initializes to `sizeof(upse_render_outcome)`.
     pub size: u32,
     /// One of the `UPSE_RENDER_*` constants.
-    pub kind: u32,
+    pub kind: upse_render_kind,
     /// Frames consumed by the current call.
     pub frames: u64,
 }
 
 /// Opaque owned error handle.
-#[repr(C)]
 pub struct upse_error {
-    code: i32,
+    code: upse_result,
     message: CString,
 }
 
 /// Opaque owned player handle.
-#[repr(C)]
 pub struct upse_player {
     player: Player,
     strings: [Option<CString>; 8],
@@ -323,7 +335,7 @@ fn copy_blob(blob: &upse_blob, reference: &str) -> Result<(String, Vec<u8>), Res
 
 /// Writes default configuration into a sized C structure.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn upse_config_init(config: *mut upse_config) -> i32 {
+pub unsafe extern "C" fn upse_config_init(config: *mut upse_config) -> upse_result {
     boundary(ptr::null_mut(), || {
         if config.is_null() {
             return Err(FfiError::invalid("config is null"));
@@ -343,7 +355,7 @@ pub unsafe extern "C" fn upse_player_open_memory(
     resolver: *const upse_resolver,
     output: *mut *mut upse_player,
     error: *mut *mut upse_error,
-) -> i32 {
+) -> upse_result {
     boundary(error, || {
         initialize_output(output)?;
         let bytes = borrowed_bytes(data, data_size)?;
@@ -376,7 +388,7 @@ pub unsafe extern "C" fn upse_player_open_path(
     config: *const upse_config,
     output: *mut *mut upse_player,
     error: *mut *mut upse_error,
-) -> i32 {
+) -> upse_result {
     boundary(error, || {
         initialize_output(output)?;
         let path = required_utf8(path, "path")?;
@@ -395,7 +407,7 @@ pub unsafe extern "C" fn upse_player_set_callback(
     callback: upse_audio_callback,
     userdata: *mut c_void,
     error: *mut *mut upse_error,
-) -> i32 {
+) -> upse_result {
     boundary(error, || {
         let player = player_mut(player)?;
         let binding = CallbackBinding {
@@ -414,7 +426,7 @@ pub unsafe extern "C" fn upse_player_render(
     max_frames: u64,
     outcome: *mut upse_render_outcome,
     error: *mut *mut upse_error,
-) -> i32 {
+) -> upse_result {
     boundary(error, || {
         let player = player_mut(player)?;
         if outcome.is_null() {
@@ -445,7 +457,7 @@ pub unsafe extern "C" fn upse_player_render(
 pub unsafe extern "C" fn upse_player_reset(
     player: *mut upse_player,
     error: *mut *mut upse_error,
-) -> i32 {
+) -> upse_result {
     boundary(error, || {
         player_mut(player)?.player.reset();
         Ok(())
@@ -458,7 +470,7 @@ pub unsafe extern "C" fn upse_player_audio_format(
     player: *const upse_player,
     output: *mut upse_audio_format,
     error: *mut *mut upse_error,
-) -> i32 {
+) -> upse_result {
     boundary(error, || {
         let player = player_ref(player)?;
         if output.is_null() {
@@ -479,7 +491,7 @@ pub unsafe extern "C" fn upse_player_audio_format(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn upse_player_metadata(
     player: *const upse_player,
-    field: u32,
+    field: upse_metadata_field,
 ) -> *const c_char {
     pointer_boundary(|| {
         let player = player_ref(player).ok()?;
@@ -552,7 +564,7 @@ pub unsafe extern "C" fn upse_error_message(error: *const upse_error) -> *const 
 
 /// Returns the stable result code stored in an error handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn upse_error_code(error: *const upse_error) -> i32 {
+pub unsafe extern "C" fn upse_error_code(error: *const upse_error) -> upse_result {
     catch_unwind(AssertUnwindSafe(|| {
         if error.is_null() {
             UPSE_RESULT_INVALID_ARGUMENT
@@ -709,7 +721,7 @@ fn require_size<T>(actual: u32, name: &str) -> Result<(), String> {
 
 #[derive(Debug)]
 struct FfiError {
-    code: i32,
+    code: upse_result,
     message: String,
 }
 
@@ -740,7 +752,7 @@ impl FfiError {
 fn boundary(
     error_output: *mut *mut upse_error,
     operation: impl FnOnce() -> Result<(), FfiError>,
-) -> i32 {
+) -> upse_result {
     if !error_output.is_null() {
         unsafe { ptr::write(error_output, ptr::null_mut()) };
     }
@@ -761,7 +773,7 @@ fn boundary(
     }
 }
 
-fn write_error(output: *mut *mut upse_error, code: i32, message: &str) {
+fn write_error(output: *mut *mut upse_error, code: upse_result, message: &str) {
     if output.is_null() {
         return;
     }

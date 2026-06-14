@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+language = "C"
+include_guard = "UPSE_H"
+cpp_compat = true
+documentation = true
+style = "both"
+usize_is_size_t = true
+header = "/* SPDX-License-Identifier: LGPL-2.1-or-later */"
+after_includes = """
+#if defined(_WIN32) && defined(UPSE_NG_SHARED)
+# if defined(UPSE_NG_BUILD)
+#  define UPSE_API __declspec(dllexport)
+# else
+#  define UPSE_API __declspec(dllimport)
+# endif
+#elif defined(__GNUC__) && defined(UPSE_NG_BUILD)
+# define UPSE_API __attribute__((visibility(\"default\")))
+#else
+# define UPSE_API
+#endif
+"""
+
+[parse]
+parse_deps = false
+
+[fn]
+prefix = "UPSE_API"

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+{
+  global:
+    upse_abi_version;
+    upse_config_init;
+    upse_player_open_memory;
+    upse_player_open_path;
+    upse_player_set_callback;
+    upse_player_render;
+    upse_player_reset;
+    upse_player_audio_format;
+    upse_player_metadata;
+    upse_player_volume;
+    upse_player_length_frames;
+    upse_player_fade_frames;
+    upse_player_frames_rendered;
+    upse_player_free;
+    upse_error_message;
+    upse_error_code;
+    upse_error_free;
+  local:
+    *;
+};

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+prefix=@PREFIX@
+exec_prefix=@EXEC_PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: libupse-ng
+Description: PlayStation game-music module playback library
+Version: @VERSION@
+Libs: -L${libdir} -lupse-ng
+Libs.private: -ldl -lpthread -lm
+Cflags: -I${includedir}
