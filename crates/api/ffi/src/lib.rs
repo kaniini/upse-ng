@@ -364,9 +364,7 @@ pub unsafe extern "C" fn upse_player_open_memory(
         let player = if resolver.is_null() {
             builder.open_memory(origin, bytes)
         } else {
-            let resolver_value = unsafe { ptr::read(resolver) };
-            require_size::<upse_resolver>(resolver_value.size, "upse_resolver")
-                .map_err(FfiError::invalid)?;
+            let resolver_value = read_sized(resolver, "upse_resolver")?;
             if resolver_value.resolve.is_none() {
                 return Err(FfiError::invalid("resolver callback is null"));
             }
@@ -589,9 +587,8 @@ fn configured_builder(config: *const upse_config) -> Result<PlayerBuilder, FfiEr
     let config = if config.is_null() {
         upse_config::default()
     } else {
-        unsafe { ptr::read(config) }
+        read_sized(config, "upse_config")?
     };
-    require_size::<upse_config>(config.size, "upse_config").map_err(FfiError::invalid)?;
     if config.abi_version != UPSE_ABI_VERSION {
         return Err(FfiError::invalid(format!(
             "unsupported ABI version {}",
@@ -717,6 +714,12 @@ fn require_size<T>(actual: u32, name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn read_sized<T: Copy>(value: *const T, name: &str) -> Result<T, FfiError> {
+    let size = unsafe { ptr::read(value.cast::<u32>()) };
+    require_size::<T>(size, name).map_err(FfiError::invalid)?;
+    Ok(unsafe { ptr::read(value) })
 }
 
 #[derive(Debug)]
