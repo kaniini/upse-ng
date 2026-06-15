@@ -16,8 +16,8 @@ use std::{
 };
 
 use upse::{
-    AudioAction, AudioBlock, DependencyLimits, Limits, ParseLimits, Player, PlayerBuilder,
-    PlayerError, RenderOutcome, ResolvedFile, Resolver, ResolverError,
+    AudioAction, AudioBlock, DependencyLimits, Limits, LoadError, ParseLimits, Player,
+    PlayerBuilder, PlayerError, RenderOutcome, ResolvedFile, Resolver, ResolverError,
 };
 
 /// Stable C operation result and error category.
@@ -739,7 +739,15 @@ impl FfiError {
     fn player(error: &PlayerError) -> Self {
         let code = match error {
             PlayerError::Io { .. } => UPSE_RESULT_IO,
-            PlayerError::Load(_) | PlayerError::Duration(_) => UPSE_RESULT_FORMAT,
+            PlayerError::Load(error) => match error {
+                LoadError::Resolve { .. } => UPSE_RESULT_IO,
+                LoadError::LimitExceeded(_) => UPSE_RESULT_LIMIT,
+                LoadError::Parse(_)
+                | LoadError::Metadata { .. }
+                | LoadError::VersionMismatch { .. }
+                | LoadError::Cycle { .. } => UPSE_RESULT_FORMAT,
+            },
+            PlayerError::Duration(_) => UPSE_RESULT_FORMAT,
             PlayerError::UnsupportedVersion => UPSE_RESULT_UNSUPPORTED,
             PlayerError::InvalidQuantum { .. } => UPSE_RESULT_LIMIT,
             PlayerError::Machine(_) | PlayerError::PostMix(_) => UPSE_RESULT_EMULATION,

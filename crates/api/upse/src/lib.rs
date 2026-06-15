@@ -41,10 +41,10 @@ use thiserror::Error;
 use upse_audio::{PostMixError, PostMixer};
 pub use upse_audio_types::{AudioAction, AudioBlock, AudioFormat, ChannelOrder, RenderOutcome};
 pub use upse_psf::{
-    DependencyLimits, ParseLimits, PlaybackMetadata as Metadata, ResolvedFile, Resolver,
+    DependencyLimits, LoadError, ParseLimits, PlaybackMetadata as Metadata, ResolvedFile, Resolver,
     ResolverError,
 };
-use upse_psf::{DurationError, FileResolver, LoadError, LoadPlan, MemoryResolver, load_plan};
+use upse_psf::{DurationError, FileResolver, LoadPlan, MemoryResolver, load_plan};
 
 #[cfg(feature = "psf1")]
 use upse_ps1_machine::{MachineConfig, MachineError, Ps1Machine};
