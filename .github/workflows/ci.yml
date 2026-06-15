@@ -25,3 +25,15 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  c-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update
+      - run: sudo apt-get install --yes libao-dev pkg-config
+      - run: cargo install cbindgen --version 0.29.4 --locked
+      - run: make check-header check-exports
+      - run: make check-c-api
+      - run: make check-c-api-sanitize

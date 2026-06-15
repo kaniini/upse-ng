@@ -21,12 +21,12 @@ SHARED_SONAME := libupse-ng.so.$(ABI_MAJOR)
 PKGCONFIG_FILE := $(BUILD_DIR)/libupse-ng.pc
 
 .PHONY: all check fmt clippy test doc header check-header rust-library \
-	libraries check-exports pkgconfig upse123 install install-upse123 \
-	uninstall clean
+	libraries check-exports pkgconfig upse123 check-c-api \
+	check-c-api-sanitize install install-upse123 uninstall clean
 
 all: libraries pkgconfig
 
-check: fmt clippy test doc check-header check-exports
+check: fmt clippy test doc check-header check-exports check-c-api
 
 fmt:
 	$(CARGO) fmt --all -- --check
@@ -83,6 +83,12 @@ upse123: libraries
 	$(MAKE) -C examples \
 		UPSE_CFLAGS='-I$(CURDIR)/include' \
 		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -Wl,-rpath,$(CURDIR)/$(BUILD_DIR) -lupse-ng'
+
+check-c-api:
+	sh tests/c-api/run.sh
+
+check-c-api-sanitize:
+	sh tests/c-api/run.sh sanitize
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR) \
