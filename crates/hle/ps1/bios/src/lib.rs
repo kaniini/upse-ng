@@ -11,8 +11,11 @@ use thiserror::Error;
 const REGISTER_COUNT: usize = 32;
 const V0: usize = 2;
 const A0: usize = 4;
+const S0: usize = 16;
+const GP: usize = 28;
 const T1: usize = 9;
 const SP: usize = 29;
+const FP: usize = 30;
 const RA: usize = 31;
 const EVENT_SLOTS: usize = 32;
 const INTERRUPT_PRIORITIES: usize = 8;
@@ -355,6 +358,8 @@ impl BiosHle {
         let pc = context.pc;
         let mut action = HleAction::Return;
         let cycles = match (vector, function) {
+            (BiosVector::A0, 0x13) => self.setjmp(context, memory)?,
+            (BiosVector::A0, 0x72) => 10,
             (BiosVector::A0, 0x2a) => self.memory_copy(context, memory, false)?,
             (BiosVector::A0, 0x2b) => self.memory_set(context, memory)?,
             (BiosVector::A0, 0x2c) => self.memory_copy(context, memory, true)?,
@@ -400,6 +405,7 @@ impl BiosHle {
                 8
             }
             (BiosVector::B0, 0x20) => self.undeliver_event(context),
+            (BiosVector::B0, 0x5b) => 6,
             (BiosVector::C0, 0x02) => self.enqueue_interrupt(context)?,
             (BiosVector::C0, 0x03) => self.dequeue_interrupt(context)?,
             (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
@@ -547,6 +553,44 @@ impl BiosHle {
         }
         context.return_value(destination);
         Ok(memory_cycles(size))
+    }
+
+    fn setjmp<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        const BUFFER_SIZE: u32 = 48;
+
+        self.check_memory_size(BUFFER_SIZE)?;
+        let buffer = context.argument(0);
+        let saved = [
+            context.registers[RA],
+            context.registers[SP],
+            context.registers[FP],
+            context.registers[S0],
+            context.registers[S0 + 1],
+            context.registers[S0 + 2],
+            context.registers[S0 + 3],
+            context.registers[S0 + 4],
+            context.registers[S0 + 5],
+            context.registers[S0 + 6],
+            context.registers[S0 + 7],
+            context.registers[GP],
+        ];
+        for (word_index, value) in saved.into_iter().enumerate() {
+            let word_offset = u32::try_from(word_index)
+                .map_err(|_| BiosError::AddressOverflow)?
+                .checked_mul(4)
+                .ok_or(BiosError::AddressOverflow)?;
+            for (byte_index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                let byte_offset =
+                    u32::try_from(byte_index).map_err(|_| BiosError::AddressOverflow)?;
+                write_byte(memory, buffer, word_offset + byte_offset, byte)?;
+            }
+        }
+        context.return_value(0);
+        Ok(memory_cycles(BUFFER_SIZE))
     }
 
     fn memory_set<M: GuestMemory>(
@@ -851,8 +895,8 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, BiosError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        A0, BiosError, BiosHle, BiosVector, CpuContext, GuestMemory, GuestMemoryError, HleAction,
-        HleLimits, RA, T1, V0,
+        A0, BiosError, BiosHle, BiosVector, CpuContext, FP, GP, GuestMemory, GuestMemoryError,
+        HleAction, HleLimits, RA, S0, SP, T1, V0,
     };
 
     struct Memory(Vec<u8>);
@@ -940,6 +984,52 @@ mod tests {
             call(&mut bios, BiosVector::A0, 0x2a, [63, 0, 2, 0], &mut memory),
             Err(BiosError::GuestMemory { .. })
         ));
+    }
+
+    #[test]
+    fn setjmp_saves_the_documented_abi_register_layout() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 128]);
+        let mut context = CpuContext::reset(0x00a0, 0x0102_0304);
+        context.set_register(A0, 64);
+        context.set_register(T1, 0x13);
+        context.set_register(RA, 0xaabb_ccdd);
+        context.set_register(FP, 0x0506_0708);
+        context.set_register(GP, 0x090a_0b0c);
+        for index in 0..8 {
+            context.set_register(S0 + index, 0x1000 + u32::try_from(index).unwrap());
+        }
+
+        let outcome = bios
+            .dispatch(BiosVector::A0, &mut context, &mut memory)
+            .unwrap();
+        let words: Vec<u32> = memory.0[64..112]
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+
+        assert_eq!(
+            words,
+            vec![
+                0xaabb_ccdd,
+                0x0102_0304,
+                0x0506_0708,
+                0x1000,
+                0x1001,
+                0x1002,
+                0x1003,
+                0x1004,
+                0x1005,
+                0x1006,
+                0x1007,
+                0x090a_0b0c,
+            ]
+        );
+        assert_eq!(context.register(V0), Some(0));
+        assert_eq!(context.register(SP), Some(0x0102_0304));
+        assert_eq!(context.pc, 0xaabb_ccdd);
+        assert_eq!(outcome.cycles, 104);
+        assert_eq!(outcome.action, HleAction::Return);
     }
 
     #[test]
@@ -1047,6 +1137,24 @@ mod tests {
         assert!(bios.interrupts_enabled());
 
         let mut memory = Memory(vec![0; 8]);
+        context.pc = 0x00b0;
+        context.set_register(RA, 0x400);
+        context.set_register(T1, 0x5b);
+        context.set_register(A0, 0);
+        context.set_register(V0, 0xfeed_beef);
+        bios.dispatch(BiosVector::B0, &mut context, &mut memory)
+            .unwrap();
+        assert_eq!(context.register(V0), Some(0xfeed_beef));
+        assert_eq!(context.pc, 0x400);
+
+        context.pc = 0x00a0;
+        context.set_register(RA, 0x500);
+        context.set_register(T1, 0x72);
+        bios.dispatch(BiosVector::A0, &mut context, &mut memory)
+            .unwrap();
+        assert_eq!(context.register(V0), Some(0xfeed_beef));
+        assert_eq!(context.pc, 0x500);
+
         call(
             &mut bios,
             BiosVector::B0,
