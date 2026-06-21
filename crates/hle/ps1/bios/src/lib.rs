@@ -358,6 +358,7 @@ impl BiosHle {
         let pc = context.pc;
         let mut action = HleAction::Return;
         let cycles = match (vector, function) {
+            (BiosVector::A0, 0x0c) => self.strtoul(context, memory)?,
             (BiosVector::A0, 0x13) => self.setjmp(context, memory)?,
             (BiosVector::A0, 0x72) => 10,
             (BiosVector::A0, 0x2a) => self.memory_copy(context, memory, false)?,
@@ -553,6 +554,98 @@ impl BiosHle {
         }
         context.return_value(destination);
         Ok(memory_cycles(size))
+    }
+
+    fn strtoul<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(6);
+        }
+
+        let end_pointer = context.argument(1);
+        let requested_base = context.argument(2);
+        let mut base = if (2..=36).contains(&requested_base) {
+            requested_base
+        } else {
+            10
+        };
+        let mut offset = 0_u32;
+        while matches!(
+            self.read_string_byte(memory, source, offset)?,
+            0x09..=0x0d | 0x20
+        ) {
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+
+        let first = self.read_string_byte(memory, source, offset)?;
+        let second = if first == b'0' {
+            Some(self.read_string_byte(
+                memory,
+                source,
+                offset.checked_add(1).ok_or(BiosError::AddressOverflow)?,
+            )?)
+        } else {
+            None
+        };
+        if matches!(second, Some(b'b' | b'B')) {
+            base = 2;
+            offset = offset.checked_add(2).ok_or(BiosError::AddressOverflow)?;
+        } else if matches!(second, Some(b'x' | b'X')) {
+            base = 16;
+            offset = offset.checked_add(2).ok_or(BiosError::AddressOverflow)?;
+        } else if matches!(first, b'o' | b'O') {
+            base = 8;
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+
+        let mut result = 0_u32;
+        loop {
+            let byte = self.read_string_byte(memory, source, offset)?;
+            let Some(digit) = ascii_digit(byte) else {
+                break;
+            };
+            if digit >= base {
+                break;
+            }
+            result = result.wrapping_mul(base).wrapping_add(digit);
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+
+        if end_pointer != 0 {
+            let end = source
+                .checked_add(offset)
+                .ok_or(BiosError::AddressOverflow)?;
+            for (byte_offset, byte) in end.to_le_bytes().into_iter().enumerate() {
+                write_byte(
+                    memory,
+                    end_pointer,
+                    u32::try_from(byte_offset).map_err(|_| BiosError::AddressOverflow)?,
+                    byte,
+                )?;
+            }
+        }
+        context.return_value(result);
+        Ok(memory_cycles(offset.saturating_add(1)).saturating_add(8))
+    }
+
+    fn read_string_byte<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        source: u32,
+        offset: u32,
+    ) -> Result<u8, BiosError> {
+        if offset >= self.limits.memory_operation_bytes {
+            return Err(BiosError::MemoryOperationLimit {
+                size: offset.saturating_add(1),
+                limit: self.limits.memory_operation_bytes,
+            });
+        }
+        read_byte(memory, source, offset)
     }
 
     fn setjmp<M: GuestMemory>(
@@ -885,6 +978,15 @@ fn memory_cycles(size: u32) -> u32 {
     8_u32.saturating_add(size.saturating_mul(2))
 }
 
+fn ascii_digit(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some(u32::from(byte - b'0')),
+        b'A'..=b'Z' => Some(u32::from(byte - b'A') + 10),
+        b'a'..=b'z' => Some(u32::from(byte - b'a') + 10),
+        _ => None,
+    }
+}
+
 fn align_up(value: u32, alignment: u32) -> Result<u32, BiosError> {
     value
         .checked_add(alignment - 1)
@@ -1030,6 +1132,54 @@ mod tests {
         assert_eq!(context.pc, 0xaabb_ccdd);
         assert_eq!(outcome.cycles, 104);
         assert_eq!(outcome.action, HleAction::Return);
+    }
+
+    #[test]
+    fn strtoul_parses_bios_prefixes_and_writes_the_guest_end_pointer() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 128]);
+        memory.0[32..40].copy_from_slice(b" \t0x1fZ\0");
+        let (context, _) =
+            call(&mut bios, BiosVector::A0, 0x0c, [32, 8, 10, 0], &mut memory).unwrap();
+        assert_eq!(context.register(V0), Some(31));
+        assert_eq!(u32::from_le_bytes(memory.0[8..12].try_into().unwrap()), 38);
+
+        memory.0[48..53].copy_from_slice(b"o77!\0");
+        let (context, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x0c,
+            [48, 12, 36, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(context.register(V0), Some(63));
+        assert_eq!(u32::from_le_bytes(memory.0[12..16].try_into().unwrap()), 51);
+
+        memory.0[16..20].copy_from_slice(&0xfeed_beef_u32.to_le_bytes());
+        let (context, _) =
+            call(&mut bios, BiosVector::A0, 0x0c, [0, 16, 10, 0], &mut memory).unwrap();
+        assert_eq!(context.register(V0), Some(0));
+        assert_eq!(
+            u32::from_le_bytes(memory.0[16..20].try_into().unwrap()),
+            0xfeed_beef
+        );
+
+        let mut bounded = BiosHle::new(HleLimits {
+            memory_operation_bytes: 3,
+            ..HleLimits::default()
+        });
+        memory.0[64..69].copy_from_slice(b"1234\0");
+        assert!(matches!(
+            call(
+                &mut bounded,
+                BiosVector::A0,
+                0x0c,
+                [64, 0, 10, 0],
+                &mut memory
+            ),
+            Err(BiosError::MemoryOperationLimit { size: 4, limit: 3 })
+        ));
     }
 
     #[test]
