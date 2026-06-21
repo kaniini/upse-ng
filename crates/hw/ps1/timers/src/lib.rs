@@ -455,7 +455,7 @@ impl RootCounters {
             let clock_bits = counter.clock_bits();
             match id {
                 TimerId::Timer0 | TimerId::Timer1 if clock_bits & 1 != 0 => {}
-                TimerId::Timer2 if clock_bits & 1 != 0 => {
+                TimerId::Timer2 if clock_bits & 2 != 0 => {
                     let total = u64::from(counter.divider_remainder) + ticks.get();
                     counter.divider_remainder =
                         u8::try_from(total % 8).expect("divider remainder is below eight");
@@ -689,6 +689,15 @@ mod tests {
         );
 
         timers.write_register(TimerId::Timer2, TimerRegister::Mode, 1 << 8);
+        timers
+            .advance(ClockInput::System, Ticks::new(15), &mut log)
+            .unwrap();
+        assert_eq!(
+            timers.read_register(TimerId::Timer2, TimerRegister::Counter),
+            15
+        );
+
+        timers.write_register(TimerId::Timer2, TimerRegister::Mode, 1 << 9);
         timers
             .advance(ClockInput::System, Ticks::new(15), &mut log)
             .unwrap();
