@@ -26,6 +26,8 @@ const VOICE_STRIDE: u32 = 0x10;
 const VOICE_REGISTER_END: u32 = SPU_BASE + 0x180;
 const MAIN_VOLUME_LEFT: u32 = 0x1f80_1d80;
 const MAIN_VOLUME_RIGHT: u32 = 0x1f80_1d82;
+const REVERB_VOLUME_LEFT: u32 = 0x1f80_1d84;
+const REVERB_VOLUME_RIGHT: u32 = 0x1f80_1d86;
 const KEY_ON_LOW: u32 = 0x1f80_1d88;
 const KEY_ON_HIGH: u32 = 0x1f80_1d8a;
 const KEY_OFF_LOW: u32 = 0x1f80_1d8c;
@@ -34,6 +36,8 @@ const PITCH_MOD_LOW: u32 = 0x1f80_1d90;
 const PITCH_MOD_HIGH: u32 = 0x1f80_1d92;
 const NOISE_LOW: u32 = 0x1f80_1d94;
 const NOISE_HIGH: u32 = 0x1f80_1d96;
+const REVERB_ON_LOW: u32 = 0x1f80_1d98;
+const REVERB_ON_HIGH: u32 = 0x1f80_1d9a;
 const ENDX_LOW: u32 = 0x1f80_1d9c;
 const ENDX_HIGH: u32 = 0x1f80_1d9e;
 const REVERB_BASE: u32 = 0x1f80_1da2;
@@ -43,6 +47,10 @@ const TRANSFER_FIFO: u32 = 0x1f80_1da8;
 const CONTROL: u32 = 0x1f80_1daa;
 const TRANSFER_CONTROL: u32 = 0x1f80_1dac;
 const STATUS: u32 = 0x1f80_1dae;
+const CD_VOLUME_LEFT: u32 = 0x1f80_1db0;
+const CD_VOLUME_RIGHT: u32 = 0x1f80_1db2;
+const EXTERNAL_VOLUME_LEFT: u32 = 0x1f80_1db4;
+const EXTERNAL_VOLUME_RIGHT: u32 = 0x1f80_1db6;
 const REVERB_REGISTERS_START: u32 = 0x1f80_1dc0;
 const CONTROL_ENABLE: u16 = 1 << 15;
 const CONTROL_IRQ_ENABLE: u16 = 1 << 6;
@@ -277,8 +285,11 @@ pub struct Spu {
     voices: [Voice; VOICE_COUNT],
     main_volume_left: u16,
     main_volume_right: u16,
+    reverb_volume_left: u16,
+    reverb_volume_right: u16,
     pitch_mod_mask: u32,
     noise_mask: u32,
+    reverb_mask: u32,
     endx: u32,
     reverb_base: u16,
     irq_address: u16,
@@ -286,6 +297,10 @@ pub struct Spu {
     control: u16,
     transfer_control: u16,
     status: u16,
+    cd_volume_left: u16,
+    cd_volume_right: u16,
+    external_volume_left: u16,
+    external_volume_right: u16,
     reverb_registers: [u16; 32],
     irq_request: bool,
     noise: NoiseGenerator,
@@ -306,8 +321,11 @@ impl Spu {
             voices: std::array::from_fn(|_| Voice::default()),
             main_volume_left: 0,
             main_volume_right: 0,
+            reverb_volume_left: 0,
+            reverb_volume_right: 0,
             pitch_mod_mask: 0,
             noise_mask: 0,
+            reverb_mask: 0,
             endx: 0,
             reverb_base: 0,
             irq_address: 0,
@@ -315,6 +333,10 @@ impl Spu {
             control: 0,
             transfer_control: 0,
             status: 0,
+            cd_volume_left: 0,
+            cd_volume_right: 0,
+            external_volume_left: 0,
+            external_volume_right: 0,
             reverb_registers: [0; 32],
             irq_request: false,
             noise: NoiseGenerator::default(),
@@ -372,10 +394,14 @@ impl Spu {
         match address {
             MAIN_VOLUME_LEFT => Ok(self.main_volume_left),
             MAIN_VOLUME_RIGHT => Ok(self.main_volume_right),
+            REVERB_VOLUME_LEFT => Ok(self.reverb_volume_left),
+            REVERB_VOLUME_RIGHT => Ok(self.reverb_volume_right),
             PITCH_MOD_LOW => Ok(low_half(self.pitch_mod_mask)),
             PITCH_MOD_HIGH => Ok(high_half(self.pitch_mod_mask)),
             NOISE_LOW => Ok(low_half(self.noise_mask)),
             NOISE_HIGH => Ok(high_half(self.noise_mask)),
+            REVERB_ON_LOW => Ok(low_half(self.reverb_mask)),
+            REVERB_ON_HIGH => Ok(high_half(self.reverb_mask)),
             ENDX_LOW => Ok(low_half(self.endx)),
             ENDX_HIGH => Ok(high_half(self.endx)),
             REVERB_BASE => Ok(self.reverb_base),
@@ -384,6 +410,10 @@ impl Spu {
             CONTROL => Ok(self.control),
             TRANSFER_CONTROL => Ok(self.transfer_control),
             STATUS => Ok(self.status),
+            CD_VOLUME_LEFT => Ok(self.cd_volume_left),
+            CD_VOLUME_RIGHT => Ok(self.cd_volume_right),
+            EXTERNAL_VOLUME_LEFT => Ok(self.external_volume_left),
+            EXTERNAL_VOLUME_RIGHT => Ok(self.external_volume_right),
             REVERB_REGISTERS_START..=SPU_END => Ok(self.reverb_registers[reverb_index(address)]),
             _ => Err(SpuError::InvalidRegister { address }),
         }
@@ -415,6 +445,8 @@ impl Spu {
         match address {
             MAIN_VOLUME_LEFT => self.main_volume_left = value,
             MAIN_VOLUME_RIGHT => self.main_volume_right = value,
+            REVERB_VOLUME_LEFT => self.reverb_volume_left = value,
+            REVERB_VOLUME_RIGHT => self.reverb_volume_right = value,
             KEY_ON_LOW => self.key_on(u32::from(value)),
             KEY_ON_HIGH => self.key_on(u32::from(value) << 16),
             KEY_OFF_LOW => self.key_off(u32::from(value)),
@@ -423,6 +455,8 @@ impl Spu {
             PITCH_MOD_HIGH => set_high_half(&mut self.pitch_mod_mask, value),
             NOISE_LOW => set_low_half(&mut self.noise_mask, value),
             NOISE_HIGH => set_high_half(&mut self.noise_mask, value),
+            REVERB_ON_LOW => set_low_half(&mut self.reverb_mask, value),
+            REVERB_ON_HIGH => set_high_half(&mut self.reverb_mask, value),
             ENDX_LOW => self.endx &= !u32::from(value),
             ENDX_HIGH => self.endx &= !(u32::from(value) << 16),
             REVERB_BASE => self.reverb_base = value,
@@ -437,6 +471,10 @@ impl Spu {
                 }
             }
             TRANSFER_CONTROL => self.transfer_control = value,
+            CD_VOLUME_LEFT => self.cd_volume_left = value,
+            CD_VOLUME_RIGHT => self.cd_volume_right = value,
+            EXTERNAL_VOLUME_LEFT => self.external_volume_left = value,
+            EXTERNAL_VOLUME_RIGHT => self.external_volume_right = value,
             REVERB_REGISTERS_START..=SPU_END => {
                 self.reverb_registers[reverb_index(address)] = value;
             }
@@ -653,9 +691,11 @@ mod tests {
     use upse_ps1_irq::{InterruptController, InterruptSource};
 
     use super::{
-        CONTROL, CONTROL_ENABLE, CONTROL_IRQ_ENABLE, ENDX_LOW, IRQ_ADDRESS, KEY_OFF_LOW,
-        KEY_ON_LOW, MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT, NOISE_LOW, PITCH_MOD_LOW, SOUND_RAM_SIZE,
-        SPU_BASE, STATUS, STATUS_IRQ, Spu, SpuError, TRANSFER_ADDRESS, VOICE_COUNT,
+        CD_VOLUME_LEFT, CD_VOLUME_RIGHT, CONTROL, CONTROL_ENABLE, CONTROL_IRQ_ENABLE, ENDX_LOW,
+        EXTERNAL_VOLUME_LEFT, EXTERNAL_VOLUME_RIGHT, IRQ_ADDRESS, KEY_OFF_LOW, KEY_ON_LOW,
+        MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT, NOISE_LOW, PITCH_MOD_LOW, REVERB_ON_HIGH,
+        REVERB_ON_LOW, REVERB_VOLUME_LEFT, REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE, STATUS,
+        STATUS_IRQ, Spu, SpuError, TRANSFER_ADDRESS, VOICE_COUNT,
     };
 
     fn constant_block(nibble: u8, flags: u8) -> [u8; 16] {
@@ -777,6 +817,22 @@ mod tests {
     #[test]
     fn register_and_ram_boundaries_are_checked() {
         let mut spu = Spu::new();
+        spu.write_register(REVERB_VOLUME_LEFT, 0x1234).unwrap();
+        spu.write_register(REVERB_VOLUME_RIGHT, 0xfedc).unwrap();
+        spu.write_register(REVERB_ON_LOW, 0x4567).unwrap();
+        spu.write_register(REVERB_ON_HIGH, 0x00ab).unwrap();
+        spu.write_register(CD_VOLUME_LEFT, 0x1111).unwrap();
+        spu.write_register(CD_VOLUME_RIGHT, 0x2222).unwrap();
+        spu.write_register(EXTERNAL_VOLUME_LEFT, 0x3333).unwrap();
+        spu.write_register(EXTERNAL_VOLUME_RIGHT, 0x4444).unwrap();
+        assert_eq!(spu.read_register(REVERB_VOLUME_LEFT).unwrap(), 0x1234);
+        assert_eq!(spu.read_register(REVERB_VOLUME_RIGHT).unwrap(), 0xfedc);
+        assert_eq!(spu.read_register(REVERB_ON_LOW).unwrap(), 0x4567);
+        assert_eq!(spu.read_register(REVERB_ON_HIGH).unwrap(), 0x00ab);
+        assert_eq!(spu.read_register(CD_VOLUME_LEFT).unwrap(), 0x1111);
+        assert_eq!(spu.read_register(CD_VOLUME_RIGHT).unwrap(), 0x2222);
+        assert_eq!(spu.read_register(EXTERNAL_VOLUME_LEFT).unwrap(), 0x3333);
+        assert_eq!(spu.read_register(EXTERNAL_VOLUME_RIGHT).unwrap(), 0x4444);
         assert!(matches!(
             spu.write_register(SPU_BASE + 1, 0),
             Err(SpuError::InvalidRegister { .. })
