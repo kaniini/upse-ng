@@ -13,6 +13,22 @@ const MMIO_END: u32 = 0x1f80_3000;
 const ROM_START: u32 = 0x1fc0_0000;
 const ROM_END: u32 = 0x1fc8_0000;
 
+/// First memory-control register address.
+pub const MEMORY_CONTROL_START: u32 = 0x1f80_1000;
+/// Last byte occupied by the memory-control register block.
+pub const MEMORY_CONTROL_END: u32 = 0x1f80_1023;
+const MEMORY_CONTROL_RESET: [u32; 9] = [
+    0x1f00_0000,
+    0x1f80_2000,
+    0x0013_243f,
+    0x0000_3022,
+    0x0013_243f,
+    0x2009_31e1,
+    0x0002_0843,
+    0x0007_0777,
+    0x0003_1125,
+];
+
 /// Handling for otherwise unmapped physical addresses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OpenBusPolicy {
@@ -105,6 +121,7 @@ pub enum MemoryError {
 pub struct Ps1Memory {
     ram: Vec<u8>,
     scratchpad: [u8; SCRATCH_SIZE],
+    memory_control: [u32; 9],
     open_bus: OpenBusPolicy,
 }
 
@@ -115,6 +132,7 @@ impl Ps1Memory {
         Self {
             ram: vec![0; RAM_SIZE],
             scratchpad: [0; SCRATCH_SIZE],
+            memory_control: MEMORY_CONTROL_RESET,
             open_bus,
         }
     }
@@ -137,8 +155,33 @@ impl Ps1Memory {
         Ok(Self {
             ram: image.ram().to_vec(),
             scratchpad: [0; SCRATCH_SIZE],
+            memory_control: MEMORY_CONTROL_RESET,
             open_bus,
         })
+    }
+
+    /// Reads one aligned memory-control register.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Mmio`] outside the nine-register block.
+    pub fn read_control(&self, address: u32) -> Result<u32, MemoryError> {
+        let index = memory_control_index(address)?;
+        Ok(self.memory_control[index])
+    }
+
+    /// Writes one aligned memory-control register.
+    ///
+    /// Timing fields are retained for guest-visible readback; the PSF profile
+    /// does not use them to stall the host-side memory implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Mmio`] outside the nine-register block.
+    pub fn write_control(&mut self, address: u32, value: u32) -> Result<(), MemoryError> {
+        let index = memory_control_index(address)?;
+        self.memory_control[index] = value;
+        Ok(())
     }
 
     /// Decodes a guest virtual address without performing an access.
@@ -262,17 +305,35 @@ impl Ps1Memory {
 
     fn read_bytes<const N: usize>(&self, address: u32) -> Result<[u8; N], MemoryError> {
         let first = Self::classify(address)?;
-        let mut bytes = [0_u8; N];
-        for (index, output) in bytes.iter_mut().enumerate() {
-            let current = address
-                .checked_add(u32::try_from(index).expect("small access"))
-                .ok_or(MemoryError::CrossesBoundary { address })?;
-            if !same_region(first, Self::classify(current)?) {
-                return Err(MemoryError::CrossesBoundary { address });
-            }
-            *output = self.read_u8(current)?;
+        let last = address
+            .checked_add(u32::try_from(N.saturating_sub(1)).expect("small access"))
+            .ok_or(MemoryError::CrossesBoundary { address })?;
+        if !same_region(first, Self::classify(last)?) {
+            return Err(MemoryError::CrossesBoundary { address });
         }
-        Ok(bytes)
+        match first {
+            MemoryRegion::Ram { offset } => Ok(std::array::from_fn(|index| {
+                self.ram[(offset + index) % RAM_SIZE]
+            })),
+            MemoryRegion::Scratchpad { offset } => {
+                let end = offset
+                    .checked_add(N)
+                    .ok_or(MemoryError::CrossesBoundary { address })?;
+                let source = self
+                    .scratchpad
+                    .get(offset..end)
+                    .ok_or(MemoryError::CrossesBoundary { address })?;
+                let mut bytes = [0_u8; N];
+                bytes.copy_from_slice(source);
+                Ok(bytes)
+            }
+            MemoryRegion::Mmio { physical } => Err(MemoryError::Mmio { address: physical }),
+            MemoryRegion::HleRom { physical } => Err(MemoryError::HleRom { address: physical }),
+            MemoryRegion::Unmapped { physical } => match self.open_bus {
+                OpenBusPolicy::Strict => Err(MemoryError::Unmapped { address: physical }),
+                OpenBusPolicy::Ones => Ok([u8::MAX; N]),
+            },
+        }
     }
 
     fn write_bytes<const N: usize>(
@@ -281,16 +342,38 @@ impl Ps1Memory {
         bytes: [u8; N],
     ) -> Result<(), MemoryError> {
         let first = Self::classify(address)?;
-        for index in 0..N {
-            let current = address
-                .checked_add(u32::try_from(index).expect("small access"))
-                .ok_or(MemoryError::CrossesBoundary { address })?;
-            if !same_region(first, Self::classify(current)?) {
-                return Err(MemoryError::CrossesBoundary { address });
-            }
+        let last = address
+            .checked_add(u32::try_from(N.saturating_sub(1)).expect("small access"))
+            .ok_or(MemoryError::CrossesBoundary { address })?;
+        if !same_region(first, Self::classify(last)?) {
+            return Err(MemoryError::CrossesBoundary { address });
         }
-        for (index, value) in bytes.into_iter().enumerate() {
-            self.write_u8(address + u32::try_from(index).expect("small access"), value)?;
+        match first {
+            MemoryRegion::Ram { offset } => {
+                for (index, value) in bytes.into_iter().enumerate() {
+                    self.ram[(offset + index) % RAM_SIZE] = value;
+                }
+            }
+            MemoryRegion::Scratchpad { offset } => {
+                let end = offset
+                    .checked_add(N)
+                    .ok_or(MemoryError::CrossesBoundary { address })?;
+                self.scratchpad
+                    .get_mut(offset..end)
+                    .ok_or(MemoryError::CrossesBoundary { address })?
+                    .copy_from_slice(&bytes);
+            }
+            MemoryRegion::Mmio { physical } => {
+                return Err(MemoryError::Mmio { address: physical });
+            }
+            MemoryRegion::HleRom { physical } => {
+                return Err(MemoryError::HleRom { address: physical });
+            }
+            MemoryRegion::Unmapped { physical } => {
+                if self.open_bus == OpenBusPolicy::Strict {
+                    return Err(MemoryError::Unmapped { address: physical });
+                }
+            }
         }
         Ok(())
     }
@@ -301,6 +384,14 @@ fn translate(address: u32) -> Result<u32, MemoryError> {
         0..=5 => Ok(address & 0x1fff_ffff),
         _ => Err(MemoryError::UnsupportedSegment { address }),
     }
+}
+
+fn memory_control_index(address: u32) -> Result<usize, MemoryError> {
+    if !(MEMORY_CONTROL_START..=MEMORY_CONTROL_END).contains(&address) || address & 3 != 0 {
+        return Err(MemoryError::Mmio { address });
+    }
+    usize::try_from((address - MEMORY_CONTROL_START) / 4)
+        .map_err(|_| MemoryError::UnsupportedAddressWidth { address })
 }
 
 const fn same_region(left: MemoryRegion, right: MemoryRegion) -> bool {
@@ -319,7 +410,9 @@ const fn same_region(left: MemoryRegion, right: MemoryRegion) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryError, MemoryRegion, OpenBusPolicy, Ps1Memory, RAM_SIZE};
+    use super::{
+        MEMORY_CONTROL_START, MemoryError, MemoryRegion, OpenBusPolicy, Ps1Memory, RAM_SIZE,
+    };
 
     #[test]
     fn ram_is_mirrored_through_first_eight_megabytes_and_kseg_aliases() {
@@ -339,6 +432,20 @@ mod tests {
         assert!(matches!(
             memory.read_u32(0x1f80_03fe),
             Err(MemoryError::CrossesBoundary { .. })
+        ));
+    }
+
+    #[test]
+    fn memory_control_reset_values_and_readback_are_instance_owned() {
+        let mut first = Ps1Memory::new(OpenBusPolicy::Strict);
+        let second = Ps1Memory::new(OpenBusPolicy::Strict);
+        assert_eq!(first.read_control(0x1f80_1014).unwrap(), 0x2009_31e1);
+        first.write_control(0x1f80_1014, 0x2209_31e1).unwrap();
+        assert_eq!(first.read_control(0x1f80_1014).unwrap(), 0x2209_31e1);
+        assert_eq!(second.read_control(0x1f80_1014).unwrap(), 0x2009_31e1);
+        assert!(matches!(
+            first.read_control(MEMORY_CONTROL_START + 2),
+            Err(MemoryError::Mmio { .. })
         ));
     }
 
