@@ -20,6 +20,8 @@ const RA: usize = 31;
 const EVENT_SLOTS: usize = 32;
 const INTERRUPT_PRIORITIES: usize = 8;
 const CALLBACK_RETURN_PC: u32 = 0xffff_ff00;
+const TTY_FORMAT_BYTES: u32 = 4096;
+const TTY_STRING_BYTES: u32 = 4096;
 
 /// BIOS call-table vector intercepted by the machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,8 +168,6 @@ pub struct HleOutcome {
 pub struct CallbackRequest {
     /// Guest callback entry address.
     pub address: u32,
-    /// Event handle supplied as callback argument zero.
-    pub argument: u32,
 }
 
 /// Configurable HLE resource bounds.
@@ -212,15 +212,6 @@ pub enum BiosError {
         /// Guest call-site PC.
         pc: u32,
     },
-    /// Event handle is stale or malformed.
-    #[error("invalid PS1 event handle {handle:#010x}")]
-    InvalidEvent {
-        /// Guest event handle.
-        handle: u32,
-    },
-    /// Fixed event table is full.
-    #[error("PS1 HLE event table is full")]
-    EventCapacity,
     /// Pending callback queue reached its configured bound.
     #[error("PS1 HLE callback queue is full")]
     CallbackCapacity,
@@ -286,15 +277,11 @@ struct Event {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EventSlot {
-    generation: u16,
     event: Option<Event>,
 }
 
 impl EventSlot {
-    const EMPTY: Self = Self {
-        generation: 1,
-        event: None,
-    };
+    const EMPTY: Self = Self { event: None };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,7 +302,7 @@ pub struct BiosHle {
     critical_depth: u32,
     interrupt_hook: Option<u32>,
     interrupt_queues: [u32; INTERRUPT_PRIORITIES],
-    clear_root_counter: [bool; 3],
+    clear_root_counter: [bool; 4],
 }
 
 impl Default for BiosHle {
@@ -338,7 +325,7 @@ impl BiosHle {
             critical_depth: 0,
             interrupt_hook: None,
             interrupt_queues: [0; INTERRUPT_PRIORITIES],
-            clear_root_counter: [true; 3],
+            clear_root_counter: [true; 4],
         }
     }
 
@@ -384,12 +371,13 @@ impl BiosHle {
                 4
             }
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
+            (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
-            (BiosVector::B0, 0x08) => self.open_event(context)?,
-            (BiosVector::B0, 0x09) => self.close_event(context)?,
-            (BiosVector::B0, 0x0a | 0x0b) => self.test_event(context)?,
-            (BiosVector::B0, 0x0c) => self.enable_event(context, true)?,
-            (BiosVector::B0, 0x0d) => self.enable_event(context, false)?,
+            (BiosVector::B0, 0x08) => self.open_event(context),
+            (BiosVector::B0, 0x09) => self.close_event(context),
+            (BiosVector::B0, 0x0a | 0x0b) => self.test_event(context),
+            (BiosVector::B0, 0x0c) => self.enable_event(context, true),
+            (BiosVector::B0, 0x0d) => self.enable_event(context, false),
             (BiosVector::B0, 0x17) => {
                 context.return_value(1);
                 action = HleAction::ReturnFromException;
@@ -475,12 +463,92 @@ impl BiosHle {
         self.interrupt_hook
     }
 
+    /// Reports whether the default handler acknowledges a root-counter or
+    /// vertical-blank interrupt and returns immediately from the exception.
+    #[must_use]
+    pub fn clear_root_counter(&self, index: usize) -> Option<bool> {
+        self.clear_root_counter.get(index).copied()
+    }
+
+    /// Applies the installed `HookEntryInt` jump-buffer context and returns
+    /// whether a hook was present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BiosError`] when the guest hook structure cannot be read.
+    pub fn prepare_interrupt_hook<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<bool, BiosError> {
+        let Some(buffer) = self.interrupt_hook else {
+            return Ok(false);
+        };
+        let mut saved = [0_u32; 12];
+        for (index, word) in saved.iter_mut().enumerate() {
+            let offset = u32::try_from(index)
+                .map_err(|_| BiosError::AddressOverflow)?
+                .checked_mul(4)
+                .ok_or(BiosError::AddressOverflow)?;
+            *word = read_word(memory, buffer, offset)?;
+        }
+        context.pc = saved[0];
+        context.registers[RA] = saved[0];
+        context.registers[SP] = saved[1];
+        context.registers[FP] = saved[2];
+        context.registers[S0..S0 + 8].copy_from_slice(&saved[3..11]);
+        context.registers[GP] = saved[11];
+        context.return_value(1);
+        Ok(true)
+    }
+
     /// Removes the oldest deferred event callback.
     pub fn take_callback(&mut self) -> Option<CallbackRequest> {
         self.pending_callbacks.pop_front()
     }
 
-    /// Saves a context and enters a guest callback with `a0` and `ra` prepared.
+    /// Reports whether guest code is currently executing in callback context.
+    #[must_use]
+    pub fn callback_active(&self) -> bool {
+        !self.callback_stack.is_empty()
+    }
+
+    /// Delivers one kernel event raised by an emulated hardware source.
+    ///
+    /// Callback-mode events are queued for entry at the next safe machine
+    /// boundary. Ready-mode events remain latched until `TestEvent` consumes
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BiosError::CallbackCapacity`] when delivery would exceed the
+    /// configured pending-callback bound.
+    pub fn signal_event(&mut self, class: u32, spec: u32) -> Result<u32, BiosError> {
+        let mut delivered = 0_u32;
+        for slot in &mut self.events {
+            let Some(event) = slot.event.as_mut() else {
+                continue;
+            };
+            if !event.enabled || event.class != class || event.spec != spec {
+                continue;
+            }
+            delivered = delivered.saturating_add(1);
+            if event.mode == 0x1000 && event.callback != 0 {
+                if self.pending_callbacks.len() >= self.limits.pending_callbacks {
+                    return Err(BiosError::CallbackCapacity);
+                }
+                self.pending_callbacks.push_back(CallbackRequest {
+                    address: event.callback,
+                });
+            } else if event.mode == 0x2000 {
+                event.state = EventState::Delivered;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Saves a context and enters a zero-argument guest callback with `ra`
+    /// prepared.
     ///
     /// # Errors
     ///
@@ -495,7 +563,6 @@ impl BiosHle {
         }
         self.callback_stack.push(context.clone());
         context.pc = callback.address;
-        context.registers[A0] = callback.argument;
         context.registers[RA] = CALLBACK_RETURN_PC;
         Ok(())
     }
@@ -648,6 +715,107 @@ impl BiosHle {
         read_byte(memory, source, offset)
     }
 
+    fn printf<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let format = self.read_tty_string(memory, context.argument(0), TTY_FORMAT_BYTES)?;
+        let mut output = String::new();
+        let mut index = 0_usize;
+        let mut argument = 0_usize;
+        while index < format.len() {
+            if format[index] != b'%' {
+                output.push(char::from(format[index]));
+                index += 1;
+                continue;
+            }
+            index += 1;
+            if format.get(index) == Some(&b'%') {
+                output.push('%');
+                index += 1;
+                continue;
+            }
+            while format
+                .get(index)
+                .is_some_and(|byte| b"-+ #0".contains(byte))
+            {
+                index += 1;
+            }
+            while format.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if format.get(index) == Some(&b'.') {
+                index += 1;
+                while format.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+            }
+            while format
+                .get(index)
+                .is_some_and(|byte| matches!(byte, b'h' | b'l'))
+            {
+                index += 1;
+            }
+            let Some(&conversion) = format.get(index) else {
+                output.push('%');
+                break;
+            };
+            index += 1;
+            let value = printf_argument(context, memory, argument)?;
+            argument += 1;
+            match conversion {
+                b'c' => output.push(char::from(value.to_le_bytes()[0])),
+                b'd' | b'i' => {
+                    output.push_str(&i32::from_ne_bytes(value.to_ne_bytes()).to_string())
+                }
+                b'o' => output.push_str(&format!("{value:o}")),
+                b'p' => output.push_str(&format!("0x{value:08x}")),
+                b's' => {
+                    if value == 0 {
+                        output.push_str("(null)");
+                    } else {
+                        let string = self.read_tty_string(memory, value, TTY_STRING_BYTES)?;
+                        output.push_str(&String::from_utf8_lossy(&string));
+                    }
+                }
+                b'u' => output.push_str(&value.to_string()),
+                b'x' => output.push_str(&format!("{value:x}")),
+                b'X' => output.push_str(&format!("{value:X}")),
+                other => {
+                    output.push('%');
+                    output.push(char::from(other));
+                }
+            }
+        }
+        if output.ends_with('\n') {
+            eprint!("[PS1 BIOS TTY] {output}");
+        } else {
+            eprintln!("[PS1 BIOS TTY] {output}");
+        }
+        let length = u32::try_from(output.len()).unwrap_or(u32::MAX);
+        context.return_value(length);
+        Ok(12_u32.saturating_add(length.saturating_mul(2)))
+    }
+
+    fn read_tty_string<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        source: u32,
+        limit: u32,
+    ) -> Result<Vec<u8>, BiosError> {
+        let limit = limit.min(self.limits.memory_operation_bytes);
+        let mut output = Vec::new();
+        for offset in 0..limit {
+            let byte = read_byte(memory, source, offset)?;
+            if byte == 0 {
+                return Ok(output);
+            }
+            output.push(byte);
+        }
+        Err(BiosError::MemoryOperationLimit { size: limit, limit })
+    }
+
     fn setjmp<M: GuestMemory>(
         &self,
         context: &mut CpuContext,
@@ -787,14 +955,15 @@ impl BiosHle {
         Ok(memory_cycles(size).saturating_add(12))
     }
 
-    fn open_event(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
+    fn open_event(&mut self, context: &mut CpuContext) -> u32 {
         let Some((index, slot)) = self
             .events
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.event.is_none())
         else {
-            return Err(BiosError::EventCapacity);
+            context.return_value(u32::MAX);
+            return 8;
         };
         slot.event = Some(Event {
             class: context.argument(0),
@@ -804,62 +973,46 @@ impl BiosHle {
             enabled: false,
             state: EventState::Idle,
         });
-        let handle = event_handle(index, slot.generation);
+        let handle = event_handle(index);
         context.return_value(handle);
-        Ok(18)
+        18
     }
 
-    fn close_event(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
+    fn close_event(&mut self, context: &mut CpuContext) -> u32 {
         let handle = context.argument(0);
-        let slot = self.event_slot_mut(handle)?;
-        slot.event = None;
-        slot.generation = slot.generation.wrapping_add(1).max(1);
-        context.return_value(1);
-        Ok(10)
-    }
-
-    fn enable_event(&mut self, context: &mut CpuContext, enabled: bool) -> Result<u32, BiosError> {
-        let handle = context.argument(0);
-        let event = self.event_mut(handle)?;
-        event.enabled = enabled;
-        context.return_value(1);
-        Ok(8)
-    }
-
-    fn test_event(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
-        let handle = context.argument(0);
-        let event = self.event_mut(handle)?;
-        let delivered = event.state == EventState::Delivered;
-        if delivered {
-            event.state = EventState::Idle;
+        if let Some(slot) = self.event_slot_mut(handle) {
+            slot.event = None;
         }
+        context.return_value(1);
+        10
+    }
+
+    fn enable_event(&mut self, context: &mut CpuContext, enabled: bool) -> u32 {
+        let handle = context.argument(0);
+        if let Some(event) = self.event_mut(handle) {
+            event.enabled = enabled;
+        }
+        context.return_value(1);
+        8
+    }
+
+    fn test_event(&mut self, context: &mut CpuContext) -> u32 {
+        let handle = context.argument(0);
+        let delivered = self.event_mut(handle).is_some_and(|event| {
+            let delivered = event.enabled && event.state == EventState::Delivered;
+            if delivered {
+                event.state = EventState::Idle;
+            }
+            delivered
+        });
         context.return_value(u32::from(delivered));
-        Ok(8)
+        8
     }
 
     fn deliver_event(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
         let class = context.argument(0);
         let spec = context.argument(1);
-        let mut delivered = 0_u32;
-        for (index, slot) in self.events.iter_mut().enumerate() {
-            let Some(event) = slot.event.as_mut() else {
-                continue;
-            };
-            if !event.enabled || event.class != class || event.spec != spec {
-                continue;
-            }
-            event.state = EventState::Delivered;
-            delivered = delivered.saturating_add(1);
-            if event.callback != 0 {
-                if self.pending_callbacks.len() >= self.limits.pending_callbacks {
-                    return Err(BiosError::CallbackCapacity);
-                }
-                self.pending_callbacks.push_back(CallbackRequest {
-                    address: event.callback,
-                    argument: event_handle(index, slot.generation),
-                });
-            }
-        }
+        let delivered = self.signal_event(class, spec)?;
         context.return_value(delivered);
         Ok(12_u32.saturating_add(delivered.saturating_mul(4)))
     }
@@ -872,7 +1025,7 @@ impl BiosHle {
             let Some(event) = slot.event.as_mut() else {
                 continue;
             };
-            if event.class == class && event.spec == spec {
+            if event.class == class && event.spec == spec && event.mode == 0x2000 {
                 event.state = EventState::Idle;
                 changed = changed.saturating_add(1);
             }
@@ -881,25 +1034,19 @@ impl BiosHle {
         10
     }
 
-    fn event_slot_mut(&mut self, handle: u32) -> Result<&mut EventSlot, BiosError> {
+    fn event_slot_mut(&mut self, handle: u32) -> Option<&mut EventSlot> {
+        if handle & 0xffff_0000 != 0xf100_0000 {
+            return None;
+        }
         let bytes = handle.to_le_bytes();
-        let encoded_index = usize::from(bytes[0]);
-        if encoded_index == 0 || encoded_index > EVENT_SLOTS {
-            return Err(BiosError::InvalidEvent { handle });
-        }
-        let generation = u16::from_le_bytes([bytes[1], bytes[2]]);
-        let slot = &mut self.events[encoded_index - 1];
-        if slot.generation != generation || slot.event.is_none() {
-            return Err(BiosError::InvalidEvent { handle });
-        }
-        Ok(slot)
+        let index = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        self.events
+            .get_mut(index)
+            .filter(|slot| slot.event.is_some())
     }
 
-    fn event_mut(&mut self, handle: u32) -> Result<&mut Event, BiosError> {
-        self.event_slot_mut(handle)?
-            .event
-            .as_mut()
-            .ok_or(BiosError::InvalidEvent { handle })
+    fn event_mut(&mut self, handle: u32) -> Option<&mut Event> {
+        self.event_slot_mut(handle)?.event.as_mut()
     }
 
     fn enqueue_interrupt(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
@@ -942,9 +1089,8 @@ impl BiosHle {
     }
 }
 
-fn event_handle(index: usize, generation: u16) -> u32 {
-    let index = u32::try_from(index + 1).unwrap_or(0);
-    index | (u32::from(generation) << 8)
+fn event_handle(index: usize) -> u32 {
+    0xf100_0000 | u32::try_from(index).unwrap_or(u32::MAX)
 }
 
 fn read_byte<M: GuestMemory>(memory: &mut M, base: u32, offset: u32) -> Result<u8, BiosError> {
@@ -956,6 +1102,36 @@ fn read_byte<M: GuestMemory>(memory: &mut M, base: u32, offset: u32) -> Result<u
             operation: MemoryOperation::Read,
             source,
         })
+}
+
+fn read_word<M: GuestMemory>(memory: &mut M, base: u32, offset: u32) -> Result<u32, BiosError> {
+    let mut bytes = [0_u8; 4];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let byte_offset = u32::try_from(index).map_err(|_| BiosError::AddressOverflow)?;
+        *byte = read_byte(memory, base, offset + byte_offset)?;
+    }
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn printf_argument<M: GuestMemory>(
+    context: &CpuContext,
+    memory: &mut M,
+    index: usize,
+) -> Result<u32, BiosError> {
+    match index {
+        0..=2 => Ok(context.registers[A0 + 1 + index]),
+        _ => {
+            let stack_index = u32::try_from(index - 3).map_err(|_| BiosError::AddressOverflow)?;
+            let offset = 16_u32
+                .checked_add(
+                    stack_index
+                        .checked_mul(4)
+                        .ok_or(BiosError::AddressOverflow)?,
+                )
+                .ok_or(BiosError::AddressOverflow)?;
+            read_word(memory, context.registers[SP], offset)
+        }
+    }
 }
 
 fn write_byte<M: GuestMemory>(
@@ -1183,6 +1359,25 @@ mod tests {
     }
 
     #[test]
+    fn printf_formats_register_and_stack_arguments_for_the_tty() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 0x8020]);
+        memory.0[32..45].copy_from_slice(b"%s %x %d %u\n\0");
+        memory.0[64..70].copy_from_slice(b"hello\0");
+        memory.0[0x8010..0x8014].copy_from_slice(&9_u32.to_le_bytes());
+        let (context, outcome) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x3f,
+            [32, 64, 0x2a, (-7_i32) as u32],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(context.register(V0), Some(14));
+        assert_eq!(outcome.cycles, 40);
+    }
+
+    #[test]
     fn heap_random_and_zeroed_allocation_have_deterministic_results() {
         let mut bios = BiosHle::default();
         let mut memory = Memory(vec![0xaa; 256]);
@@ -1211,11 +1406,13 @@ mod tests {
     }
 
     #[test]
-    fn events_and_nested_callbacks_preserve_complete_contexts() {
+    fn events_queue_callbacks_and_preserve_complete_contexts() {
         let mut bios = BiosHle::default();
         let mut memory = Memory(vec![0; 16]);
         let first = open_event(&mut bios, &mut memory, 1, 0x3000);
         let second = open_event(&mut bios, &mut memory, 1, 0x4000);
+        assert_eq!(first, 0xf100_0000);
+        assert_eq!(second, 0xf100_0001);
         for handle in [first, second] {
             call(
                 &mut bios,
@@ -1231,17 +1428,21 @@ mod tests {
         assert_eq!(delivered.register(V0), Some(2));
 
         let mut context = CpuContext::reset(0x5000, 0x9000);
+        context.set_register(A0, 0xaa55_aa55);
         context.set_register(5, 0x55aa);
         let callback1 = bios.take_callback().unwrap();
-        let callback2 = bios.take_callback().unwrap();
         bios.enter_callback(&mut context, callback1).unwrap();
+        assert!(bios.callback_active());
         assert_eq!(context.pc, 0x3000);
-        assert_eq!(context.register(A0), Some(first));
+        assert_eq!(context.register(A0), Some(0xaa55_aa55));
         assert_eq!(context.register(RA), Some(BiosHle::callback_return_pc()));
+        bios.return_from_callback(&mut context).unwrap();
+        assert!(!bios.callback_active());
+        assert_eq!(context.pc, 0x5000);
+
+        let callback2 = bios.take_callback().unwrap();
         bios.enter_callback(&mut context, callback2).unwrap();
         assert_eq!(context.pc, 0x4000);
-        bios.return_from_callback(&mut context).unwrap();
-        assert_eq!(context.pc, 0x3000);
         bios.return_from_callback(&mut context).unwrap();
         assert_eq!(context.pc, 0x5000);
         assert_eq!(context.register(5), Some(0x55aa));
@@ -1258,16 +1459,17 @@ mod tests {
             &mut memory,
         )
         .unwrap();
-        assert!(matches!(
-            call(
-                &mut bios,
-                BiosVector::B0,
-                0x0c,
-                [first, 0, 0, 0],
-                &mut memory
-            ),
-            Err(BiosError::InvalidEvent { .. })
-        ));
+        let (result, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x0c,
+            [first, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(result.register(V0), Some(1));
+        let (result, _) = call(&mut bios, BiosVector::B0, 0x09, [0, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(result.register(V0), Some(1));
     }
 
     #[test]
