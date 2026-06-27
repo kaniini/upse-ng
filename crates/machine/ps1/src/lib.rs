@@ -15,7 +15,9 @@ use upse_ps1_dma::{
     InterruptSink as DmaInterruptSink,
 };
 use upse_ps1_irq::{I_MASK, I_STAT, InterruptController, InterruptSource};
-use upse_ps1_memory::{MemoryError, MemoryRegion, OpenBusPolicy, Ps1Memory};
+use upse_ps1_memory::{
+    MEMORY_CONTROL_END, MEMORY_CONTROL_START, MemoryError, MemoryRegion, OpenBusPolicy, Ps1Memory,
+};
 use upse_ps1_spu::{
     InterruptSink as SpuInterruptSink, SAMPLE_RATE, SPU_BASE, SPU_END, Spu, SpuError,
 };
@@ -25,11 +27,15 @@ use upse_ps1_timers::{
 };
 use upse_psf::{Psf1LoadPlan, RefreshRate};
 use upse_psx_exe::{ExecutableImage, ImageError};
-use upse_r3000::{Bus, BusFault, Cpu, CpuError, ResetProfile, StepEvent};
+use upse_r3000::{Bus, BusFault, Cpu, CpuError, Exception, ResetProfile, StepEvent};
 use upse_scheduler::{Scheduler, SchedulerError};
 
 const TIMER_END: u32 = TIMER_BASE + 0x28;
 const AUDIO_CHUNK_FRAMES: usize = 256;
+const EVENT_SPEC_INTERRUPTED: u32 = 0x0000_0002;
+const EVENT_SPEC_COMMAND_COMPLETE: u32 = 0x0000_0020;
+const EVENT_SPEC_INTERRUPT: u32 = 0x0000_1000;
+const EVENT_CLASS_SPU: u32 = 0xf000_0009;
 
 /// Machine construction and diagnostic policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,8 +73,12 @@ pub enum MachineStepKind {
     Cpu(StepEvent),
     /// One BIOS HLE table call.
     Bios(BiosVector),
+    /// One HLE kernel syscall.
+    Syscall(u32),
     /// One deferred event callback context was restored.
     CallbackReturn,
+    /// One default BIOS hardware interrupt handler returned from exception.
+    Interrupt(InterruptSource),
 }
 
 /// Observable result of one CPU/HLE boundary plus device advancement.
@@ -93,8 +103,43 @@ pub enum MachineError {
     #[error("PS1 CPU failure: {0}")]
     Cpu(#[from] CpuError),
     /// BIOS HLE dispatch failed.
-    #[error("PS1 BIOS HLE failure: {0}")]
-    Bios(#[from] BiosError),
+    #[error(
+        "PS1 BIOS HLE {vector:?} call {function:#04x} (ra={ra:#010x}, a0={a0:#010x}, a1={a1:#010x}, a2={a2:#010x}, a3={a3:#010x}) failed: {source}"
+    )]
+    Bios {
+        /// BIOS call-table vector.
+        vector: BiosVector,
+        /// Function number from `t1`.
+        function: u8,
+        /// Guest return address.
+        ra: u32,
+        /// Guest argument zero.
+        a0: u32,
+        /// Guest argument one.
+        a1: u32,
+        /// Guest argument two.
+        a2: u32,
+        /// Guest argument three.
+        a3: u32,
+        /// Structured HLE failure.
+        source: BiosError,
+    },
+    /// Deferred BIOS callback state transition failed.
+    #[error("PS1 BIOS HLE state failure: {0}")]
+    BiosState(#[from] BiosError),
+    /// The HLE callback sentinel had no matching saved CPU pipeline state.
+    #[error("PS1 BIOS HLE callback CPU state is missing")]
+    CallbackCpuState,
+    /// Kernel syscall HLE dispatch failed.
+    #[error("PS1 BIOS HLE syscall {number} at {pc:#010x} failed: {source}")]
+    Syscall {
+        /// Syscall number from `a0`.
+        number: u32,
+        /// Guest syscall instruction address.
+        pc: u32,
+        /// Structured HLE failure.
+        source: BiosError,
+    },
     /// Timer clock arithmetic failed.
     #[error("PS1 timer failure: {0}")]
     Timer(#[from] TimerError),
@@ -143,6 +188,8 @@ struct MachineState {
     now: Deadline,
     sample_clock: RateConverter,
     pending_audio: VecDeque<i16>,
+    callback_cpu: Option<Cpu>,
+    interrupt_cpu: Option<Cpu>,
     trace_events: bool,
     event_log: Vec<MachineEvent>,
 }
@@ -189,6 +236,8 @@ impl Ps1Machine {
             now: Deadline::ZERO,
             sample_clock: RateConverter::new(CPU_HZ, u64::from(SAMPLE_RATE))?,
             pending_audio: VecDeque::new(),
+            callback_cpu: None,
+            interrupt_cpu: None,
             trace_events: config.trace_events,
             event_log: Vec::new(),
         };
@@ -235,18 +284,42 @@ impl Ps1Machine {
         if self.state.cpu.pc() == BiosHle::callback_return_pc() {
             let mut context = cpu_context(&self.state.cpu);
             self.state.bios.return_from_callback(&mut context)?;
-            apply_context(&mut self.state.cpu, &context);
+            self.state.cpu = self
+                .state
+                .callback_cpu
+                .take()
+                .ok_or(MachineError::CallbackCpuState)?;
             self.advance_devices(1)?;
             return Ok(MachineStep {
                 cycles: 1,
                 kind: MachineStepKind::CallbackReturn,
             });
         }
+        if self.state.interrupt_cpu.is_none()
+            && self.state.callback_cpu.is_none()
+            && self.state.bios.interrupts_enabled()
+            && self.state.irq.pending()
+        {
+            if let Some(source) = self.handle_default_interrupt()? {
+                self.advance_devices(12)?;
+                return Ok(MachineStep {
+                    cycles: 12,
+                    kind: MachineStepKind::Interrupt(source),
+                });
+            }
+            if self.state.bios.interrupt_hook().is_some() {
+                self.enter_interrupt_hook()?;
+            }
+        }
         if self.state.bios.interrupts_enabled()
+            && self.state.interrupt_cpu.is_none()
+            && !self.state.bios.callback_active()
             && let Some(callback) = self.state.bios.take_callback()
         {
+            let saved_cpu = self.state.cpu.clone();
             let mut context = cpu_context(&self.state.cpu);
             self.state.bios.enter_callback(&mut context, callback)?;
+            self.state.callback_cpu = Some(saved_cpu);
             apply_context(&mut self.state.cpu, &context);
         }
         if let Some(vector) = bios_vector(self.state.cpu.pc()) {
@@ -266,6 +339,9 @@ impl Ps1Machine {
             };
             state.cpu.step(&mut bus)?
         };
+        if outcome.event == StepEvent::Exception(Exception::Syscall) {
+            return self.step_syscall(outcome.cycles);
+        }
         self.advance_devices(outcome.cycles)?;
         Ok(MachineStep {
             cycles: outcome.cycles,
@@ -303,20 +379,76 @@ impl Ps1Machine {
         Ok(())
     }
 
+    fn enter_interrupt_hook(&mut self) -> Result<(), MachineError> {
+        let saved_cpu = self.state.cpu.clone();
+        let mut context = cpu_context(&self.state.cpu);
+        let prepared = {
+            let mut memory = BiosMemory(&mut self.state.memory);
+            self.state
+                .bios
+                .prepare_interrupt_hook(&mut context, &mut memory)?
+        };
+        if prepared {
+            self.state.interrupt_cpu = Some(saved_cpu);
+            apply_context(&mut self.state.cpu, &context);
+        }
+        Ok(())
+    }
+
+    fn handle_default_interrupt(&mut self) -> Result<Option<InterruptSource>, MachineError> {
+        let pending = self.state.irq.status() & self.state.irq.mask();
+        for (source, counter) in [
+            (InterruptSource::VBlank, 3),
+            (InterruptSource::Timer2, 2),
+            (InterruptSource::Timer1, 1),
+            (InterruptSource::Timer0, 0),
+        ] {
+            if pending & source.bit() == 0 {
+                continue;
+            }
+            self.state.bios.signal_event(
+                0xf200_0000 | u32::try_from(counter).unwrap_or(0),
+                EVENT_SPEC_INTERRUPTED,
+            )?;
+            if self.state.bios.clear_root_counter(counter) == Some(true) {
+                self.state.irq.acknowledge(!source.bit());
+                return Ok(Some(source));
+            }
+        }
+        Ok(None)
+    }
+
     fn step_bios(&mut self, vector: BiosVector) -> Result<MachineStep, MachineError> {
         let mut context = cpu_context(&self.state.cpu);
+        let function = context.register(9).unwrap_or(0).to_le_bytes()[0];
+        let arguments: [u32; 4] =
+            std::array::from_fn(|index| context.register(4 + index).unwrap_or(0));
         let outcome = {
             let mut memory = BiosMemory(&mut self.state.memory);
             self.state
                 .bios
-                .dispatch(vector, &mut context, &mut memory)?
+                .dispatch(vector, &mut context, &mut memory)
+                .map_err(|source| MachineError::Bios {
+                    vector,
+                    function,
+                    ra: context.register(31).unwrap_or(0),
+                    a0: arguments[0],
+                    a1: arguments[1],
+                    a2: arguments[2],
+                    a3: arguments[3],
+                    source,
+                })?
         };
-        apply_context(&mut self.state.cpu, &context);
         if outcome.action == HleAction::ReturnFromException {
-            let epc = self.state.cpu.cop0().epc;
-            let status = self.state.cpu.cop0().status;
-            self.state.cpu.cop0_mut().status = (status & !0x0f) | ((status >> 2) & 0x0f);
-            self.state.cpu.set_pc(epc);
+            if let Some(saved_cpu) = self.state.interrupt_cpu.take() {
+                self.state.cpu = saved_cpu;
+            } else {
+                apply_context(&mut self.state.cpu, &context);
+                let epc = self.restore_exception_status();
+                self.state.cpu.set_pc(epc);
+            }
+        } else {
+            apply_context(&mut self.state.cpu, &context);
         }
         self.advance_devices(outcome.cycles)?;
         Ok(MachineStep {
@@ -325,14 +457,45 @@ impl Ps1Machine {
         })
     }
 
+    fn step_syscall(&mut self, cpu_cycles: u32) -> Result<MachineStep, MachineError> {
+        let pc = self.state.cpu.cop0().epc;
+        let mut context = cpu_context(&self.state.cpu);
+        context.pc = pc;
+        let number = context.register(4).unwrap_or(0);
+        let outcome = self
+            .state
+            .bios
+            .dispatch_syscall(number, &mut context)
+            .map_err(|source| MachineError::Syscall { number, pc, source })?;
+        apply_context(&mut self.state.cpu, &context);
+        self.restore_exception_status();
+        let cycles = cpu_cycles
+            .checked_add(outcome.cycles)
+            .ok_or(MachineError::ClockOverflow)?;
+        self.advance_devices(cycles)?;
+        Ok(MachineStep {
+            cycles,
+            kind: MachineStepKind::Syscall(number),
+        })
+    }
+
+    fn restore_exception_status(&mut self) -> u32 {
+        let epc = self.state.cpu.cop0().epc;
+        let status = self.state.cpu.cop0().status;
+        self.state.cpu.cop0_mut().status = (status & !0x0f) | ((status >> 2) & 0x0f);
+        epc
+    }
+
     fn advance_devices(&mut self, cycles: u32) -> Result<(), MachineError> {
         let ticks = Ticks::new(u64::from(cycles));
         self.state.now = self.state.now.checked_advance(ticks)?;
+        let mut interrupt_requests = Vec::new();
         {
             let mut sink = EventSink {
                 irq: &mut self.state.irq,
                 trace: self.state.trace_events,
                 events: &mut self.state.event_log,
+                requests: &mut interrupt_requests,
             };
             self.state
                 .timers
@@ -347,6 +510,7 @@ impl Ps1Machine {
                 irq: &mut self.state.irq,
                 trace: self.state.trace_events,
                 events: &mut self.state.event_log,
+                requests: &mut interrupt_requests,
             };
             self.state.dma.complete(
                 event,
@@ -354,6 +518,11 @@ impl Ps1Machine {
                 &mut self.state.spu,
                 &mut sink,
             )?;
+            if self.state.bios.interrupt_hook().is_none() {
+                self.state
+                    .bios
+                    .signal_event(EVENT_CLASS_SPU, EVENT_SPEC_COMMAND_COMPLETE)?;
+            }
         }
         let due_frames = self.state.sample_clock.advance(ticks)?.get();
         if due_frames != 0 {
@@ -369,8 +538,16 @@ impl Ps1Machine {
                 irq: &mut self.state.irq,
                 trace: self.state.trace_events,
                 events: &mut self.state.event_log,
+                requests: &mut interrupt_requests,
             };
             self.state.spu.drain_irq(&mut sink);
+        }
+        if self.state.bios.interrupt_hook().is_none() {
+            for source in interrupt_requests {
+                for &(class, spec) in bios_interrupt_events(source) {
+                    self.state.bios.signal_event(class, spec)?;
+                }
+            }
         }
         Ok(())
     }
@@ -395,11 +572,13 @@ struct EventSink<'a> {
     irq: &'a mut InterruptController,
     trace: bool,
     events: &'a mut Vec<MachineEvent>,
+    requests: &'a mut Vec<InterruptSource>,
 }
 
 impl EventSink<'_> {
     fn request(&mut self, source: InterruptSource) {
         self.irq.request(source);
+        self.requests.push(source);
         if self.trace {
             self.events.push(MachineEvent::Interrupt(source));
         }
@@ -457,6 +636,15 @@ impl MachineBus<'_> {
 
     fn read_mmio_u16(&mut self, address: u32) -> Result<u16, BusFault> {
         match address {
+            MEMORY_CONTROL_START..=MEMORY_CONTROL_END => {
+                let word = self.memory.read_control(address & !3).map_err(bus_fault)?;
+                let bytes = word.to_le_bytes();
+                if address & 2 == 0 {
+                    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+                } else {
+                    Ok(u16::from_le_bytes([bytes[2], bytes[3]]))
+                }
+            }
             I_STAT | I_MASK => self.irq.read(address).map(low_half).map_err(bus_fault),
             TIMER_BASE..=TIMER_END => self.timers.read(address).map(low_half).map_err(bus_fault),
             D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => {
@@ -471,6 +659,23 @@ impl MachineBus<'_> {
 
     fn write_mmio_u16(&mut self, address: u32, value: u16) -> Result<(), BusFault> {
         match address {
+            MEMORY_CONTROL_START..=MEMORY_CONTROL_END => {
+                let aligned = address & !3;
+                let mut bytes = self
+                    .memory
+                    .read_control(aligned)
+                    .map_err(bus_fault)?
+                    .to_le_bytes();
+                let value = value.to_le_bytes();
+                if address & 2 == 0 {
+                    bytes[..2].copy_from_slice(&value);
+                } else {
+                    bytes[2..].copy_from_slice(&value);
+                }
+                self.memory
+                    .write_control(aligned, u32::from_le_bytes(bytes))
+                    .map_err(bus_fault)
+            }
             I_STAT | I_MASK => self.irq.write(address, u32::from(value)).map_err(bus_fault),
             TIMER_BASE..=TIMER_END => self
                 .timers
@@ -513,6 +718,9 @@ impl Bus for MachineBus<'_> {
     fn read_u32(&mut self, address: u32) -> Result<u32, BusFault> {
         match Self::physical_region(address)? {
             MemoryRegion::Mmio { physical } => match physical {
+                MEMORY_CONTROL_START..=MEMORY_CONTROL_END => {
+                    self.memory.read_control(physical).map_err(bus_fault)
+                }
                 I_STAT | I_MASK => self.irq.read(physical).map_err(bus_fault),
                 TIMER_BASE..=TIMER_END => self.timers.read(physical).map_err(bus_fault),
                 D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => {
@@ -553,6 +761,10 @@ impl Bus for MachineBus<'_> {
     fn write_u32(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
         match Self::physical_region(address)? {
             MemoryRegion::Mmio { physical } => match physical {
+                MEMORY_CONTROL_START..=MEMORY_CONTROL_END => self
+                    .memory
+                    .write_control(physical, value)
+                    .map_err(bus_fault),
                 I_STAT | I_MASK => self.irq.write(physical, value).map_err(bus_fault),
                 TIMER_BASE..=TIMER_END => self.timers.write(physical, value).map_err(bus_fault),
                 D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => self
@@ -577,7 +789,39 @@ impl Bus for MachineBus<'_> {
     }
 
     fn interrupt_pending(&self) -> bool {
-        self.irq.pending()
+        // The firmware exception vector is deliberately absent in an HLE-only
+        // machine. Device IRQs are translated into kernel events after each
+        // boundary, so exposing the raw line here would enter uninitialized
+        // low RAM instead of the BIOS interrupt dispatcher.
+        false
+    }
+}
+
+fn bios_interrupt_events(source: InterruptSource) -> &'static [(u32, u32)] {
+    match source {
+        InterruptSource::VBlank => &[
+            (0xf200_0003, EVENT_SPEC_INTERRUPTED),
+            (0xf000_0001, EVENT_SPEC_INTERRUPT),
+        ],
+        InterruptSource::Gpu => &[(0xf000_0002, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::CdRom => &[(0xf000_0003, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::Dma => &[(0xf000_0004, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::Timer0 => &[
+            (0xf200_0000, EVENT_SPEC_INTERRUPTED),
+            (0xf000_0005, EVENT_SPEC_INTERRUPT),
+        ],
+        InterruptSource::Timer1 => &[
+            (0xf200_0001, EVENT_SPEC_INTERRUPTED),
+            (0xf000_0006, EVENT_SPEC_INTERRUPT),
+        ],
+        InterruptSource::Timer2 => &[
+            (0xf200_0002, EVENT_SPEC_INTERRUPTED),
+            (0xf000_0006, EVENT_SPEC_INTERRUPT),
+        ],
+        InterruptSource::Controller => &[(0xf000_0008, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::Sio => &[(0xf000_000b, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::Spu => &[(EVENT_CLASS_SPU, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::LightPen => &[(0xf000_000a, EVENT_SPEC_INTERRUPT)],
     }
 }
 
@@ -632,7 +876,7 @@ mod tests {
     };
     use upse_scheduler::Scheduler;
 
-    use super::{MachineConfig, MachineEvent, Ps1Machine, VideoStandard};
+    use super::{MachineConfig, MachineEvent, MachineStepKind, Ps1Machine, VideoStandard};
 
     fn instruction_lui(rt: u32, immediate: u16) -> u32 {
         (0x0f << 26) | (rt << 16) | u32::from(immediate)
@@ -765,6 +1009,65 @@ mod tests {
         let mut reset = [0_i16; 32];
         machine.render(16, &mut reset).unwrap();
         assert_eq!(reset, golden);
+    }
+
+    #[test]
+    fn kernel_syscalls_return_from_the_exception_boundary() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let wrapper = 0x8001_0000;
+        machine
+            .state
+            .memory
+            .write_u32(wrapper, instruction_addiu(4, 0, 1))
+            .unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(wrapper + 4, 0x0000_000c)
+            .unwrap();
+        machine.state.cpu.set_register(31, 0x8001_0100);
+        machine.state.cpu.cop0_mut().status = 0x0000_0401;
+        machine.state.cpu.set_pc(wrapper);
+
+        machine.step().unwrap();
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Syscall(1));
+        assert_eq!(outcome.cycles, 7);
+        assert_eq!(machine.pc(), 0x8001_0100);
+        assert_eq!(machine.state.cpu.cop0().status & 0x0f, 1);
+        assert!(!machine.state.bios.interrupts_enabled());
+
+        machine
+            .state
+            .memory
+            .write_u32(wrapper, instruction_addiu(4, 0, 2))
+            .unwrap();
+        machine.state.cpu.set_register(31, 0x8001_0200);
+        machine.state.cpu.set_pc(wrapper);
+        machine.step().unwrap();
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Syscall(2));
+        assert_eq!(machine.pc(), 0x8001_0200);
+        assert!(machine.state.bios.interrupts_enabled());
+    }
+
+    #[test]
+    fn default_timer_handler_acknowledges_before_guest_interrupt_hooks() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        machine.state.irq.set_mask(InterruptSource::Timer2.bit());
+        machine.state.irq.request(InterruptSource::Timer2);
+        let pc = machine.pc();
+
+        let outcome = machine.step().unwrap();
+
+        assert_eq!(
+            outcome.kind,
+            MachineStepKind::Interrupt(InterruptSource::Timer2)
+        );
+        assert_eq!(machine.state.irq.status(), 0);
+        assert_eq!(machine.pc(), pc);
     }
 
     #[test]
