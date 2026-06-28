@@ -235,8 +235,8 @@ impl Ps1Memory {
     ///
     /// Returns [`MemoryError`] under the same policy as [`Ps1Memory::read_u8`].
     pub fn read_u16(&self, address: u32) -> Result<u16, MemoryError> {
-        let bytes = self.read_bytes::<2>(address)?;
-        Ok(u16::from_le_bytes(bytes))
+        let region = Self::classify(address)?;
+        self.read_decoded_u16(address, region)
     }
 
     /// Reads one little-endian word without crossing a region boundary.
@@ -245,8 +245,62 @@ impl Ps1Memory {
     ///
     /// Returns [`MemoryError`] under the same policy as [`Ps1Memory::read_u8`].
     pub fn read_u32(&self, address: u32) -> Result<u32, MemoryError> {
-        let bytes = self.read_bytes::<4>(address)?;
-        Ok(u32::from_le_bytes(bytes))
+        let region = Self::classify(address)?;
+        self.read_decoded_u32(address, region)
+    }
+
+    /// Reads a halfword using an address classification already obtained by a
+    /// machine-level bus router.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError`] when the access crosses the supplied region or
+    /// when the region is not directly backed by this component.
+    pub fn read_decoded_u16(&self, address: u32, region: MemoryRegion) -> Result<u16, MemoryError> {
+        self.validate_decoded_access::<2>(address, region)?;
+        match region {
+            MemoryRegion::Ram { offset } => {
+                Ok(u16::from(self.ram[offset])
+                    | (u16::from(self.ram[(offset + 1) % RAM_SIZE]) << 8))
+            }
+            MemoryRegion::Scratchpad { offset } => {
+                Ok(u16::from(self.scratchpad[offset])
+                    | (u16::from(self.scratchpad[offset + 1]) << 8))
+            }
+            MemoryRegion::Mmio { physical } => Err(MemoryError::Mmio { address: physical }),
+            MemoryRegion::HleRom { physical } => Err(MemoryError::HleRom { address: physical }),
+            MemoryRegion::Unmapped { physical } => match self.open_bus {
+                OpenBusPolicy::Strict => Err(MemoryError::Unmapped { address: physical }),
+                OpenBusPolicy::Ones => Ok(u16::MAX),
+            },
+        }
+    }
+
+    /// Reads a word using an address classification already obtained by a
+    /// machine-level bus router.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError`] when the access crosses the supplied region or
+    /// when the region is not directly backed by this component.
+    pub fn read_decoded_u32(&self, address: u32, region: MemoryRegion) -> Result<u32, MemoryError> {
+        self.validate_decoded_access::<4>(address, region)?;
+        match region {
+            MemoryRegion::Ram { offset } => Ok(u32::from(self.ram[offset])
+                | (u32::from(self.ram[(offset + 1) % RAM_SIZE]) << 8)
+                | (u32::from(self.ram[(offset + 2) % RAM_SIZE]) << 16)
+                | (u32::from(self.ram[(offset + 3) % RAM_SIZE]) << 24)),
+            MemoryRegion::Scratchpad { offset } => Ok(u32::from(self.scratchpad[offset])
+                | (u32::from(self.scratchpad[offset + 1]) << 8)
+                | (u32::from(self.scratchpad[offset + 2]) << 16)
+                | (u32::from(self.scratchpad[offset + 3]) << 24)),
+            MemoryRegion::Mmio { physical } => Err(MemoryError::Mmio { address: physical }),
+            MemoryRegion::HleRom { physical } => Err(MemoryError::HleRom { address: physical }),
+            MemoryRegion::Unmapped { physical } => match self.open_bus {
+                OpenBusPolicy::Strict => Err(MemoryError::Unmapped { address: physical }),
+                OpenBusPolicy::Ones => Ok(u32::MAX),
+            },
+        }
     }
 
     /// Writes one byte.
@@ -279,7 +333,8 @@ impl Ps1Memory {
     ///
     /// Returns [`MemoryError`] under the same policy as [`Ps1Memory::write_u8`].
     pub fn write_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryError> {
-        self.write_bytes(address, value.to_le_bytes())
+        let region = Self::classify(address)?;
+        self.write_decoded_bytes(address, region, value.to_le_bytes())
     }
 
     /// Writes one little-endian word without crossing a region boundary.
@@ -288,7 +343,40 @@ impl Ps1Memory {
     ///
     /// Returns [`MemoryError`] under the same policy as [`Ps1Memory::write_u8`].
     pub fn write_u32(&mut self, address: u32, value: u32) -> Result<(), MemoryError> {
-        self.write_bytes(address, value.to_le_bytes())
+        let region = Self::classify(address)?;
+        self.write_decoded_bytes(address, region, value.to_le_bytes())
+    }
+
+    /// Writes a halfword using an address classification already obtained by
+    /// a machine-level bus router.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError`] when the access crosses the supplied region or
+    /// when the region is not directly backed by this component.
+    pub fn write_decoded_u16(
+        &mut self,
+        address: u32,
+        region: MemoryRegion,
+        value: u16,
+    ) -> Result<(), MemoryError> {
+        self.write_decoded_bytes(address, region, value.to_le_bytes())
+    }
+
+    /// Writes a word using an address classification already obtained by a
+    /// machine-level bus router.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError`] when the access crosses the supplied region or
+    /// when the region is not directly backed by this component.
+    pub fn write_decoded_u32(
+        &mut self,
+        address: u32,
+        region: MemoryRegion,
+        value: u32,
+    ) -> Result<(), MemoryError> {
+        self.write_decoded_bytes(address, region, value.to_le_bytes())
     }
 
     /// Returns the physical main-RAM bytes for checked DMA integration.
@@ -303,52 +391,33 @@ impl Ps1Memory {
         &mut self.ram
     }
 
-    fn read_bytes<const N: usize>(&self, address: u32) -> Result<[u8; N], MemoryError> {
-        let first = Self::classify(address)?;
+    fn validate_decoded_access<const N: usize>(
+        &self,
+        address: u32,
+        region: MemoryRegion,
+    ) -> Result<(), MemoryError> {
         let last = address
             .checked_add(u32::try_from(N.saturating_sub(1)).expect("small access"))
             .ok_or(MemoryError::CrossesBoundary { address })?;
-        if !same_region(first, Self::classify(last)?) {
+        if !same_region(region, Self::classify(last)?) {
             return Err(MemoryError::CrossesBoundary { address });
         }
-        match first {
-            MemoryRegion::Ram { offset } => Ok(std::array::from_fn(|index| {
-                self.ram[(offset + index) % RAM_SIZE]
-            })),
-            MemoryRegion::Scratchpad { offset } => {
-                let end = offset
-                    .checked_add(N)
-                    .ok_or(MemoryError::CrossesBoundary { address })?;
-                let source = self
-                    .scratchpad
-                    .get(offset..end)
-                    .ok_or(MemoryError::CrossesBoundary { address })?;
-                let mut bytes = [0_u8; N];
-                bytes.copy_from_slice(source);
-                Ok(bytes)
-            }
-            MemoryRegion::Mmio { physical } => Err(MemoryError::Mmio { address: physical }),
-            MemoryRegion::HleRom { physical } => Err(MemoryError::HleRom { address: physical }),
-            MemoryRegion::Unmapped { physical } => match self.open_bus {
-                OpenBusPolicy::Strict => Err(MemoryError::Unmapped { address: physical }),
-                OpenBusPolicy::Ones => Ok([u8::MAX; N]),
-            },
-        }
+        Ok(())
     }
 
-    fn write_bytes<const N: usize>(
+    fn write_decoded_bytes<const N: usize>(
         &mut self,
         address: u32,
+        region: MemoryRegion,
         bytes: [u8; N],
     ) -> Result<(), MemoryError> {
-        let first = Self::classify(address)?;
         let last = address
             .checked_add(u32::try_from(N.saturating_sub(1)).expect("small access"))
             .ok_or(MemoryError::CrossesBoundary { address })?;
-        if !same_region(first, Self::classify(last)?) {
+        if !same_region(region, Self::classify(last)?) {
             return Err(MemoryError::CrossesBoundary { address });
         }
-        match first {
+        match region {
             MemoryRegion::Ram { offset } => {
                 for (index, value) in bytes.into_iter().enumerate() {
                     self.ram[(offset + index) % RAM_SIZE] = value;
