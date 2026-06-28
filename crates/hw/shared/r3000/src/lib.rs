@@ -339,10 +339,38 @@ impl Cpu {
     /// Returns [`CpuError`] only for a machine bus failure. Architectural traps
     /// enter the configured exception vector and are returned in [`StepOutcome`].
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Result<StepOutcome, CpuError> {
-        self.update_interrupt_line(bus.interrupt_pending());
+        self.step_inner(bus, true)
+    }
+
+    /// Executes one instruction without sampling the external interrupt line.
+    ///
+    /// Machine profiles that route interrupts through HLE can use this entry
+    /// point to avoid redundant COP0 interrupt checks on every instruction.
+    /// Software interrupts and all instruction-raised exceptions remain
+    /// architectural.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CpuError`] only for a machine bus failure. Architectural traps
+    /// enter the configured exception vector and are returned in [`StepOutcome`].
+    pub fn step_without_external_interrupts<B: Bus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<StepOutcome, CpuError> {
+        self.step_inner(bus, false)
+    }
+
+    fn step_inner<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        sample_external_interrupt: bool,
+    ) -> Result<StepOutcome, CpuError> {
+        if sample_external_interrupt {
+            self.update_interrupt_line(bus.interrupt_pending());
+        }
         let current_pc = self.pc;
         let in_delay_slot = self.in_delay_slot;
-        if self.interrupt_enabled() {
+        if sample_external_interrupt && self.interrupt_enabled() {
             self.commit_old_load(None);
             self.enter_exception(Exception::Interrupt, current_pc, in_delay_slot, None);
             return Ok(StepOutcome {
