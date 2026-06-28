@@ -32,6 +32,8 @@ use upse_scheduler::{Scheduler, SchedulerError};
 
 const TIMER_END: u32 = TIMER_BASE + 0x28;
 const AUDIO_CHUNK_FRAMES: usize = 256;
+const DEVICE_SYNC_CYCLES: u64 = 256;
+const IDLE_ADVANCE_CYCLES: u32 = 256;
 const EVENT_SPEC_INTERRUPTED: u32 = 0x0000_0002;
 const EVENT_SPEC_COMMAND_COMPLETE: u32 = 0x0000_0020;
 const EVENT_SPEC_INTERRUPT: u32 = 0x0000_1000;
@@ -79,6 +81,8 @@ pub enum MachineStepKind {
     CallbackReturn,
     /// One default BIOS hardware interrupt handler returned from exception.
     Interrupt(InterruptSource),
+    /// A side-effect-free guest idle loop advanced emulated time.
+    Idle,
 }
 
 /// Observable result of one CPU/HLE boundary plus device advancement.
@@ -187,6 +191,7 @@ struct MachineState {
     scheduler: Scheduler,
     now: Deadline,
     sample_clock: RateConverter,
+    deferred_device_ticks: u64,
     pending_audio: VecDeque<i16>,
     callback_cpu: Option<Cpu>,
     interrupt_cpu: Option<Cpu>,
@@ -235,6 +240,7 @@ impl Ps1Machine {
             scheduler: Scheduler::new(),
             now: Deadline::ZERO,
             sample_clock: RateConverter::new(CPU_HZ, u64::from(SAMPLE_RATE))?,
+            deferred_device_ticks: 0,
             pending_audio: VecDeque::new(),
             callback_cpu: None,
             interrupt_cpu: None,
@@ -281,6 +287,10 @@ impl Ps1Machine {
     ///
     /// Returns [`MachineError`] for CPU, bus, HLE, device, or clock failure.
     pub fn step(&mut self) -> Result<MachineStep, MachineError> {
+        self.step_inner(true)
+    }
+
+    fn step_inner(&mut self, synchronize_devices: bool) -> Result<MachineStep, MachineError> {
         if self.state.cpu.pc() == BiosHle::callback_return_pc() {
             let mut context = cpu_context(&self.state.cpu);
             self.state.bios.return_from_callback(&mut context)?;
@@ -289,7 +299,7 @@ impl Ps1Machine {
                 .callback_cpu
                 .take()
                 .ok_or(MachineError::CallbackCpuState)?;
-            self.advance_devices(1)?;
+            self.advance_devices(1, synchronize_devices)?;
             return Ok(MachineStep {
                 cycles: 1,
                 kind: MachineStepKind::CallbackReturn,
@@ -301,7 +311,7 @@ impl Ps1Machine {
             && self.state.irq.pending()
         {
             if let Some(source) = self.handle_default_interrupt()? {
-                self.advance_devices(12)?;
+                self.advance_devices(12, synchronize_devices)?;
                 return Ok(MachineStep {
                     cycles: 12,
                     kind: MachineStepKind::Interrupt(source),
@@ -325,6 +335,13 @@ impl Ps1Machine {
         if let Some(vector) = bios_vector(self.state.cpu.pc()) {
             return self.step_bios(vector);
         }
+        if !synchronize_devices && self.in_idle_loop()? {
+            self.advance_devices(IDLE_ADVANCE_CYCLES, true)?;
+            return Ok(MachineStep {
+                cycles: IDLE_ADVANCE_CYCLES,
+                kind: MachineStepKind::Idle,
+            });
+        }
 
         let outcome = {
             let state = &mut self.state;
@@ -337,12 +354,12 @@ impl Ps1Machine {
                 scheduler: &mut state.scheduler,
                 now: state.now,
             };
-            state.cpu.step(&mut bus)?
+            state.cpu.step_without_external_interrupts(&mut bus)?
         };
         if outcome.event == StepEvent::Exception(Exception::Syscall) {
             return self.step_syscall(outcome.cycles);
         }
-        self.advance_devices(outcome.cycles)?;
+        self.advance_devices(outcome.cycles, synchronize_devices)?;
         Ok(MachineStep {
             cycles: outcome.cycles,
             kind: MachineStepKind::Cpu(outcome.event),
@@ -368,7 +385,7 @@ impl Ps1Machine {
         }
         for sample in output {
             while self.state.pending_audio.is_empty() {
-                self.step()?;
+                self.step_inner(false)?;
             }
             *sample = self
                 .state
@@ -393,6 +410,21 @@ impl Ps1Machine {
             apply_context(&mut self.state.cpu, &context);
         }
         Ok(())
+    }
+
+    fn in_idle_loop(&self) -> Result<bool, MachineError> {
+        let pc = self.state.cpu.pc();
+        if pc & 3 != 0 {
+            return Ok(false);
+        }
+        let instruction = self.state.memory.read_u32(pc)?;
+        let branch_to_self = instruction == 0x1000_ffff;
+        let jump_to_self = instruction >> 26 == 2
+            && ((pc.wrapping_add(4) & 0xf000_0000) | ((instruction & 0x03ff_ffff) << 2)) == pc;
+        if !branch_to_self && !jump_to_self {
+            return Ok(false);
+        }
+        Ok(self.state.memory.read_u32(pc.wrapping_add(4))? == 0)
     }
 
     fn handle_default_interrupt(&mut self) -> Result<Option<InterruptSource>, MachineError> {
@@ -450,7 +482,7 @@ impl Ps1Machine {
         } else {
             apply_context(&mut self.state.cpu, &context);
         }
-        self.advance_devices(outcome.cycles)?;
+        self.advance_devices(outcome.cycles, true)?;
         Ok(MachineStep {
             cycles: outcome.cycles,
             kind: MachineStepKind::Bios(vector),
@@ -472,7 +504,7 @@ impl Ps1Machine {
         let cycles = cpu_cycles
             .checked_add(outcome.cycles)
             .ok_or(MachineError::ClockOverflow)?;
-        self.advance_devices(cycles)?;
+        self.advance_devices(cycles, true)?;
         Ok(MachineStep {
             cycles,
             kind: MachineStepKind::Syscall(number),
@@ -486,9 +518,24 @@ impl Ps1Machine {
         epc
     }
 
-    fn advance_devices(&mut self, cycles: u32) -> Result<(), MachineError> {
+    fn advance_devices(&mut self, cycles: u32, synchronize: bool) -> Result<(), MachineError> {
         let ticks = Ticks::new(u64::from(cycles));
         self.state.now = self.state.now.checked_advance(ticks)?;
+        self.state.deferred_device_ticks = self
+            .state
+            .deferred_device_ticks
+            .checked_add(u64::from(cycles))
+            .ok_or(MachineError::ClockOverflow)?;
+        let scheduler_due = !self.state.scheduler.is_empty()
+            && self
+                .state
+                .scheduler
+                .next_deadline()
+                .is_some_and(|deadline| deadline <= self.state.now);
+        if !synchronize && !scheduler_due && self.state.deferred_device_ticks < DEVICE_SYNC_CYCLES {
+            return Ok(());
+        }
+        let ticks = Ticks::new(std::mem::take(&mut self.state.deferred_device_ticks));
         let mut interrupt_requests = Vec::new();
         {
             let mut sink = EventSink {
@@ -709,14 +756,19 @@ impl Bus for MachineBus<'_> {
     }
 
     fn read_u16(&mut self, address: u32) -> Result<u16, BusFault> {
-        match Self::physical_region(address)? {
+        let region = Self::physical_region(address)?;
+        match region {
             MemoryRegion::Mmio { physical } => self.read_mmio_u16(physical),
-            _ => self.memory.read_u16(address).map_err(bus_fault),
+            _ => self
+                .memory
+                .read_decoded_u16(address, region)
+                .map_err(bus_fault),
         }
     }
 
     fn read_u32(&mut self, address: u32) -> Result<u32, BusFault> {
-        match Self::physical_region(address)? {
+        let region = Self::physical_region(address)?;
+        match region {
             MemoryRegion::Mmio { physical } => match physical {
                 MEMORY_CONTROL_START..=MEMORY_CONTROL_END => {
                     self.memory.read_control(physical).map_err(bus_fault)
@@ -735,7 +787,10 @@ impl Bus for MachineBus<'_> {
                     "unmodeled PS1 MMIO read at {physical:#010x}"
                 ))),
             },
-            _ => self.memory.read_u32(address).map_err(bus_fault),
+            _ => self
+                .memory
+                .read_decoded_u32(address, region)
+                .map_err(bus_fault),
         }
     }
 
@@ -752,14 +807,19 @@ impl Bus for MachineBus<'_> {
     }
 
     fn write_u16(&mut self, address: u32, value: u16) -> Result<(), BusFault> {
-        match Self::physical_region(address)? {
+        let region = Self::physical_region(address)?;
+        match region {
             MemoryRegion::Mmio { physical } => self.write_mmio_u16(physical, value),
-            _ => self.memory.write_u16(address, value).map_err(bus_fault),
+            _ => self
+                .memory
+                .write_decoded_u16(address, region, value)
+                .map_err(bus_fault),
         }
     }
 
     fn write_u32(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
-        match Self::physical_region(address)? {
+        let region = Self::physical_region(address)?;
+        match region {
             MemoryRegion::Mmio { physical } => match physical {
                 MEMORY_CONTROL_START..=MEMORY_CONTROL_END => self
                     .memory
@@ -784,7 +844,10 @@ impl Bus for MachineBus<'_> {
                     "unmodeled PS1 MMIO write at {physical:#010x}"
                 ))),
             },
-            _ => self.memory.write_u32(address, value).map_err(bus_fault),
+            _ => self
+                .memory
+                .write_decoded_u32(address, region, value)
+                .map_err(bus_fault),
         }
     }
 
@@ -876,7 +939,10 @@ mod tests {
     };
     use upse_scheduler::Scheduler;
 
-    use super::{MachineConfig, MachineEvent, MachineStepKind, Ps1Machine, VideoStandard};
+    use super::{
+        IDLE_ADVANCE_CYCLES, MachineConfig, MachineEvent, MachineStepKind, Ps1Machine, StepEvent,
+        VideoStandard,
+    };
 
     fn instruction_lui(rt: u32, immediate: u16) -> u32 {
         (0x0f << 26) | (rt << 16) | u32::from(immediate)
@@ -1071,6 +1137,27 @@ mod tests {
     }
 
     #[test]
+    fn render_fast_forwards_canonical_idle_loops_without_changing_single_step() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let idle = 0x8001_0000;
+        machine.state.memory.write_u32(idle, 0x1000_ffff).unwrap();
+        machine.state.memory.write_u32(idle + 4, 0).unwrap();
+        machine.state.cpu.set_pc(idle);
+
+        let outcome = machine.step_inner(false).unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Idle);
+        assert_eq!(outcome.cycles, IDLE_ADVANCE_CYCLES);
+        assert_eq!(machine.pc(), idle);
+        assert_eq!(machine.now(), Deadline::new(u64::from(IDLE_ADVANCE_CYCLES)));
+
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Cpu(StepEvent::Instruction));
+        assert_eq!(outcome.cycles, 1);
+        assert_eq!(machine.pc(), idle + 4);
+    }
+
+    #[test]
     fn same_cycle_timer_dma_and_irq_order_is_trace_stable() {
         let plan = synthetic_plan();
         let mut machine = Ps1Machine::from_plan(
@@ -1137,7 +1224,7 @@ mod tests {
             )
             .unwrap();
         machine.state.scheduler = scheduler;
-        machine.advance_devices(4).unwrap();
+        machine.advance_devices(4, true).unwrap();
         assert_eq!(
             machine.take_event_log(),
             [
