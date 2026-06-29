@@ -5,6 +5,7 @@
 //! guest registers and a consumer-provided memory contract.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 use thiserror::Error;
 
@@ -767,10 +768,14 @@ impl BiosHle {
             match conversion {
                 b'c' => output.push(char::from(value.to_le_bytes()[0])),
                 b'd' | b'i' => {
-                    output.push_str(&i32::from_ne_bytes(value.to_ne_bytes()).to_string())
+                    output.push_str(&i32::from_ne_bytes(value.to_ne_bytes()).to_string());
                 }
-                b'o' => output.push_str(&format!("{value:o}")),
-                b'p' => output.push_str(&format!("0x{value:08x}")),
+                b'o' => {
+                    let _ = write!(output, "{value:o}");
+                }
+                b'p' => {
+                    let _ = write!(output, "0x{value:08x}");
+                }
                 b's' => {
                     if value == 0 {
                         output.push_str("(null)");
@@ -780,8 +785,12 @@ impl BiosHle {
                     }
                 }
                 b'u' => output.push_str(&value.to_string()),
-                b'x' => output.push_str(&format!("{value:x}")),
-                b'X' => output.push_str(&format!("{value:X}")),
+                b'x' => {
+                    let _ = write!(output, "{value:x}");
+                }
+                b'X' => {
+                    let _ = write!(output, "{value:X}");
+                }
                 other => {
                     output.push('%');
                     output.push(char::from(other));
@@ -1118,20 +1127,18 @@ fn printf_argument<M: GuestMemory>(
     memory: &mut M,
     index: usize,
 ) -> Result<u32, BiosError> {
-    match index {
-        0..=2 => Ok(context.registers[A0 + 1 + index]),
-        _ => {
-            let stack_index = u32::try_from(index - 3).map_err(|_| BiosError::AddressOverflow)?;
-            let offset = 16_u32
-                .checked_add(
-                    stack_index
-                        .checked_mul(4)
-                        .ok_or(BiosError::AddressOverflow)?,
-                )
-                .ok_or(BiosError::AddressOverflow)?;
-            read_word(memory, context.registers[SP], offset)
-        }
+    if index <= 2 {
+        return Ok(context.registers[A0 + 1 + index]);
     }
+    let stack_index = u32::try_from(index - 3).map_err(|_| BiosError::AddressOverflow)?;
+    let offset = 16_u32
+        .checked_add(
+            stack_index
+                .checked_mul(4)
+                .ok_or(BiosError::AddressOverflow)?,
+        )
+        .ok_or(BiosError::AddressOverflow)?;
+    read_word(memory, context.registers[SP], offset)
 }
 
 fn write_byte<M: GuestMemory>(
@@ -1369,7 +1376,7 @@ mod tests {
             &mut bios,
             BiosVector::A0,
             0x3f,
-            [32, 64, 0x2a, (-7_i32) as u32],
+            [32, 64, 0x2a, u32::from_ne_bytes((-7_i32).to_ne_bytes())],
             &mut memory,
         )
         .unwrap();
