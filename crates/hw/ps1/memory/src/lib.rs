@@ -257,7 +257,7 @@ impl Ps1Memory {
     /// Returns [`MemoryError`] when the access crosses the supplied region or
     /// when the region is not directly backed by this component.
     pub fn read_decoded_u16(&self, address: u32, region: MemoryRegion) -> Result<u16, MemoryError> {
-        self.validate_decoded_access::<2>(address, region)?;
+        Self::validate_decoded_access::<2>(address, region)?;
         match region {
             MemoryRegion::Ram { offset } => {
                 Ok(u16::from(self.ram[offset])
@@ -284,7 +284,7 @@ impl Ps1Memory {
     /// Returns [`MemoryError`] when the access crosses the supplied region or
     /// when the region is not directly backed by this component.
     pub fn read_decoded_u32(&self, address: u32, region: MemoryRegion) -> Result<u32, MemoryError> {
-        self.validate_decoded_access::<4>(address, region)?;
+        Self::validate_decoded_access::<4>(address, region)?;
         match region {
             MemoryRegion::Ram { offset } => Ok(u32::from(self.ram[offset])
                 | (u32::from(self.ram[(offset + 1) % RAM_SIZE]) << 8)
@@ -392,7 +392,6 @@ impl Ps1Memory {
     }
 
     fn validate_decoded_access<const N: usize>(
-        &self,
         address: u32,
         region: MemoryRegion,
     ) -> Result<(), MemoryError> {
