@@ -3,6 +3,8 @@
 
 #![allow(clippy::too_many_lines)]
 
+mod reverb;
+
 use thiserror::Error;
 use upse_ps1_dma::{EndpointError, SoundDmaEndpoint};
 use upse_ps1_irq::{InterruptController, InterruptSource};
@@ -10,6 +12,8 @@ use upse_spu_common::{
     AdpcmError, AdpcmFlags, AdpcmHistory, Envelope, EnvelopeConfig, EnvelopePhase,
     GaussianInterpolator, NoiseGenerator, PitchCounter, clamp_i16,
 };
+
+use reverb::Reverb;
 
 /// Number of independently mixed hardware voices.
 pub const VOICE_COUNT: usize = 24;
@@ -53,6 +57,7 @@ const EXTERNAL_VOLUME_LEFT: u32 = 0x1f80_1db4;
 const EXTERNAL_VOLUME_RIGHT: u32 = 0x1f80_1db6;
 const REVERB_REGISTERS_START: u32 = 0x1f80_1dc0;
 const CONTROL_ENABLE: u16 = 1 << 15;
+const CONTROL_REVERB_ENABLE: u16 = 1 << 7;
 const CONTROL_IRQ_ENABLE: u16 = 1 << 6;
 const STATUS_IRQ: u16 = 1 << 6;
 const RAM_MASK: usize = SOUND_RAM_SIZE - 1;
@@ -302,6 +307,7 @@ pub struct Spu {
     external_volume_left: u16,
     external_volume_right: u16,
     reverb_registers: [u16; 32],
+    reverb: Reverb,
     irq_request: bool,
     noise: NoiseGenerator,
 }
@@ -338,6 +344,7 @@ impl Spu {
             external_volume_left: 0,
             external_volume_right: 0,
             reverb_registers: [0; 32],
+            reverb: Reverb::new(),
             irq_request: false,
             noise: NoiseGenerator::default(),
         }
@@ -459,7 +466,10 @@ impl Spu {
             REVERB_ON_HIGH => set_high_half(&mut self.reverb_mask, value),
             ENDX_LOW => self.endx &= !u32::from(value),
             ENDX_HIGH => self.endx &= !(u32::from(value) << 16),
-            REVERB_BASE => self.reverb_base = value,
+            REVERB_BASE => {
+                self.reverb_base = value;
+                self.reverb.set_base(value);
+            }
             IRQ_ADDRESS => self.irq_address = value,
             TRANSFER_ADDRESS => self.transfer_address = usize::from(value) * 8,
             TRANSFER_FIFO => self.write_transfer_halfword(value),
@@ -524,6 +534,8 @@ impl Spu {
         }
         let mut left = 0_i64;
         let mut right = 0_i64;
+        let mut reverb_left = 0_i64;
+        let mut reverb_right = 0_i64;
         let mut previous = 0_i16;
         for index in 0..VOICE_COUNT {
             let bit = 1_u32 << index;
@@ -549,11 +561,30 @@ impl Spu {
             }
             if result.ended {
                 self.endx |= bit;
+                self.reverb_mask &= !bit;
             }
             previous = result.dry;
-            left += i64::from(apply_volume(result.dry, self.voices[index].volume_left));
-            right += i64::from(apply_volume(result.dry, self.voices[index].volume_right));
+            let voice_left = apply_volume(result.dry, self.voices[index].volume_left);
+            let voice_right = apply_volume(result.dry, self.voices[index].volume_right);
+            left += i64::from(voice_left);
+            right += i64::from(voice_right);
+            if self.reverb_mask & bit != 0 {
+                reverb_left += i64::from(voice_left);
+                reverb_right += i64::from(voice_right);
+            }
         }
+        let reverb = self.reverb.process(
+            &mut self.ram,
+            self.reverb_base,
+            &self.reverb_registers,
+            self.control & CONTROL_REVERB_ENABLE != 0,
+            [
+                clamp_i64_to_i16(reverb_left),
+                clamp_i64_to_i16(reverb_right),
+            ],
+        );
+        left += i64::from(apply_signed_volume(reverb[0], self.reverb_volume_left));
+        right += i64::from(apply_signed_volume(reverb[1], self.reverb_volume_right));
         let left = apply_volume(clamp_i64_to_i16(left), self.main_volume_left);
         let right = apply_volume(clamp_i64_to_i16(right), self.main_volume_right);
         Ok((left, right))
@@ -669,6 +700,11 @@ fn apply_volume(sample: i16, register: u16) -> i16 {
     clamp_i16((i32::from(sample) * signed) >> 14)
 }
 
+fn apply_signed_volume(sample: i16, register: u16) -> i16 {
+    let volume = i16::from_le_bytes(register.to_le_bytes());
+    clamp_i16((i32::from(sample) * i32::from(volume)) >> 15)
+}
+
 fn modulated_pitch(base: u16, previous: i16) -> u16 {
     let factor = i64::from(i32::from(previous) + 0x8000);
     let pitch = (i64::from(base) * factor) >> 15;
@@ -691,12 +727,19 @@ mod tests {
     use upse_ps1_irq::{InterruptController, InterruptSource};
 
     use super::{
-        CD_VOLUME_LEFT, CD_VOLUME_RIGHT, CONTROL, CONTROL_ENABLE, CONTROL_IRQ_ENABLE, ENDX_LOW,
-        EXTERNAL_VOLUME_LEFT, EXTERNAL_VOLUME_RIGHT, IRQ_ADDRESS, KEY_OFF_LOW, KEY_ON_LOW,
-        MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT, NOISE_LOW, PITCH_MOD_LOW, REVERB_ON_HIGH,
-        REVERB_ON_LOW, REVERB_VOLUME_LEFT, REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE, STATUS,
-        STATUS_IRQ, Spu, SpuError, TRANSFER_ADDRESS, VOICE_COUNT,
+        CD_VOLUME_LEFT, CD_VOLUME_RIGHT, CONTROL, CONTROL_ENABLE, CONTROL_IRQ_ENABLE,
+        CONTROL_REVERB_ENABLE, ENDX_LOW, EXTERNAL_VOLUME_LEFT, EXTERNAL_VOLUME_RIGHT, IRQ_ADDRESS,
+        KEY_OFF_LOW, KEY_ON_LOW, MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT, NOISE_LOW, PITCH_MOD_LOW,
+        REVERB_BASE, REVERB_ON_HIGH, REVERB_ON_LOW, REVERB_REGISTERS_START, REVERB_VOLUME_LEFT,
+        REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE, STATUS, STATUS_IRQ, Spu, SpuError,
+        TRANSFER_ADDRESS, TRANSFER_CONTROL, VOICE_COUNT,
     };
+
+    const ROOM_REVERB: [u16; 32] = [
+        0x007d, 0x005b, 0x6d80, 0x54b8, 0xbed0, 0x0000, 0x0000, 0xba80, 0x5800, 0x5300, 0x04d6,
+        0x0333, 0x03f0, 0x0227, 0x0374, 0x01ef, 0x0334, 0x01b5, 0x0000, 0x0000, 0x0000, 0x0000,
+        0x0000, 0x0000, 0x0000, 0x0000, 0x01b4, 0x0136, 0x00b8, 0x005c, 0x8000, 0x8000,
+    ];
 
     fn constant_block(nibble: u8, flags: u8) -> [u8; 16] {
         let mut block = [0_u8; 16];
@@ -728,6 +771,21 @@ mod tests {
         spu.write_register(CONTROL, CONTROL_ENABLE).unwrap();
         spu.write_register(KEY_ON_LOW, 1).unwrap();
         spu
+    }
+
+    fn configure_room_reverb(spu: &mut Spu, master_enable: bool) {
+        let base = u16::try_from((SOUND_RAM_SIZE - 0x26c0) / 8).unwrap();
+        spu.write_register(REVERB_BASE, base).unwrap();
+        spu.write_register(REVERB_VOLUME_LEFT, 0x7fff).unwrap();
+        spu.write_register(REVERB_VOLUME_RIGHT, 0x7fff).unwrap();
+        spu.write_register(REVERB_ON_LOW, 1).unwrap();
+        spu.write_register(TRANSFER_CONTROL, 4).unwrap();
+        for (index, value) in ROOM_REVERB.into_iter().enumerate() {
+            let address = REVERB_REGISTERS_START + u32::try_from(index).unwrap() * 2;
+            spu.write_register(address, value).unwrap();
+        }
+        let control = CONTROL_ENABLE | (u16::from(master_enable) * CONTROL_REVERB_ENABLE);
+        spu.write_register(CONTROL, control).unwrap();
     }
 
     #[test]
@@ -762,6 +820,28 @@ mod tests {
                 actual: 3
             })
         );
+    }
+
+    #[test]
+    fn room_reverb_writes_its_ring_and_adds_a_delayed_wet_signal() {
+        let mut dry = configured_spu();
+        let mut disabled = dry.clone();
+        let mut wet = dry.clone();
+        configure_room_reverb(&mut disabled, false);
+        configure_room_reverb(&mut wet, true);
+
+        let mut dry_output = vec![0_i16; 16_384];
+        let mut disabled_output = vec![0_i16; 16_384];
+        let mut wet_output = vec![0_i16; 16_384];
+        dry.render(8_192, &mut dry_output).unwrap();
+        disabled.render(8_192, &mut disabled_output).unwrap();
+        wet.render(8_192, &mut wet_output).unwrap();
+
+        assert_eq!(disabled_output, dry_output);
+        assert_ne!(wet_output, dry_output);
+        let base = SOUND_RAM_SIZE - 0x26c0;
+        assert!(disabled.ram()[base..].iter().all(|&byte| byte == 0));
+        assert!(wet.ram()[base..].iter().any(|&byte| byte != 0));
     }
 
     #[test]
