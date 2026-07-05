@@ -27,7 +27,7 @@ use upse_ps1_timers::{
 };
 use upse_psf::{Psf1LoadPlan, RefreshRate};
 use upse_psx_exe::{ExecutableImage, ImageError};
-use upse_r3000::{Bus, BusFault, Cpu, CpuError, Exception, ResetProfile, StepEvent};
+use upse_r3000::{Bus, BusFault, Cpu, CpuError, Exception, LoadDelayMode, ResetProfile, StepEvent};
 use upse_scheduler::{Scheduler, SchedulerError};
 
 const TIMER_END: u32 = TIMER_BASE + 0x28;
@@ -220,13 +220,19 @@ impl Ps1Machine {
             RefreshRate::Hz50 => VideoStandard::Pal,
             RefreshRate::Hz60 => VideoStandard::Ntsc,
         };
-        let mut cpu = Cpu::new(ResetProfile {
-            pc: image.pc,
-            exception_vector: 0x8000_0080,
-            bootstrap_exception_vector: 0xbfc0_0180,
-            status: 0,
-            processor_id: 2,
-        });
+        // PSF rip drivers are emulator-facing executables. Some intentionally
+        // place consumers directly after loads and therefore require the
+        // interlocked behavior historically supplied by PSF players.
+        let mut cpu = Cpu::with_load_delay_mode(
+            ResetProfile {
+                pc: image.pc,
+                exception_vector: 0x8000_0080,
+                bootstrap_exception_vector: 0xbfc0_0180,
+                status: 0,
+                processor_id: 2,
+            },
+            LoadDelayMode::Interlocked,
+        );
         cpu.set_register(29, image.sp);
         let state = MachineState {
             cpu,

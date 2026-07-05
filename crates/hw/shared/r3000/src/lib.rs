@@ -126,6 +126,20 @@ impl Default for ResetProfile {
     }
 }
 
+/// Visibility of a completed load to the immediately following instruction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LoadDelayMode {
+    /// Preserve the R3000A architectural load-delay slot.
+    #[default]
+    Architectural,
+    /// Make the loaded value visible after the load instruction completes.
+    ///
+    /// This models the interlocked behavior assumed by some emulator-oriented
+    /// PSF driver executables while leaving the standalone CPU hardware-accurate
+    /// by default.
+    Interlocked,
+}
+
 /// Implemented architectural exception classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Exception {
@@ -249,12 +263,19 @@ pub struct Cpu {
     pending_load: Option<(usize, u32)>,
     cop0: Cop0,
     profile: ResetProfile,
+    load_delay_mode: LoadDelayMode,
 }
 
 impl Cpu {
     /// Constructs reset state for a machine profile.
     #[must_use]
     pub fn new(profile: ResetProfile) -> Self {
+        Self::with_load_delay_mode(profile, LoadDelayMode::Architectural)
+    }
+
+    /// Constructs reset state with an explicit load-delay policy.
+    #[must_use]
+    pub fn with_load_delay_mode(profile: ResetProfile, load_delay_mode: LoadDelayMode) -> Self {
         Self {
             registers: [0; 32],
             hi: 0,
@@ -269,12 +290,13 @@ impl Cpu {
                 ..Cop0::default()
             },
             profile,
+            load_delay_mode,
         }
     }
 
     /// Restores architectural reset state.
     pub fn reset(&mut self) {
-        *self = Self::new(self.profile);
+        *self = Self::with_load_delay_mode(self.profile, self.load_delay_mode);
     }
 
     /// Returns a general-purpose register; register zero is always zero.
@@ -414,7 +436,15 @@ impl Cpu {
         }
 
         self.commit_old_load(execution.register_write);
-        self.pending_load = execution.delayed_write;
+        match self.load_delay_mode {
+            LoadDelayMode::Architectural => self.pending_load = execution.delayed_write,
+            LoadDelayMode::Interlocked => {
+                if let Some((register, value)) = execution.delayed_write {
+                    self.write_register(register, value);
+                }
+                self.pending_load = None;
+            }
+        }
         let sequential = self.next_pc;
         self.pc = sequential;
         self.next_pc = execution
@@ -954,7 +984,9 @@ impl Cpu {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bus, BusFault, CAUSE_BD, CAUSE_IP2, Cpu, Exception, ResetProfile, StepEvent};
+    use super::{
+        Bus, BusFault, CAUSE_BD, CAUSE_IP2, Cpu, Exception, LoadDelayMode, ResetProfile, StepEvent,
+    };
 
     struct TestBus {
         memory: Vec<u8>,
@@ -1108,6 +1140,20 @@ mod tests {
         assert_eq!(cpu.register(1), Some(0x1234_5678));
         assert_eq!(cpu.register(2), Some(0));
         assert_eq!(cpu.register(3), Some(0x1234_5678));
+    }
+
+    #[test]
+    fn interlocked_loads_are_visible_to_the_following_instruction() {
+        let words = [i(0x23, 0, 1, 0x100), r(1, 0, 2, 0, 0x21)];
+        let mut bus = TestBus::new(&words);
+        bus.write_u32(0x100, 0x1234_5678).unwrap();
+        let mut cpu = Cpu::with_load_delay_mode(profile(), LoadDelayMode::Interlocked);
+        cpu.step(&mut bus).unwrap();
+        cpu.step(&mut bus).unwrap();
+        assert_eq!(cpu.register(1), Some(0x1234_5678));
+        assert_eq!(cpu.register(2), Some(0x1234_5678));
+        cpu.reset();
+        assert_eq!(cpu.register(1), Some(0));
     }
 
     #[test]
