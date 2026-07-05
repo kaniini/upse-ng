@@ -44,6 +44,7 @@ const REVERB_ON_LOW: u32 = 0x1f80_1d98;
 const REVERB_ON_HIGH: u32 = 0x1f80_1d9a;
 const ENDX_LOW: u32 = 0x1f80_1d9c;
 const ENDX_HIGH: u32 = 0x1f80_1d9e;
+const UNKNOWN_DA0: u32 = 0x1f80_1da0;
 const REVERB_BASE: u32 = 0x1f80_1da2;
 const IRQ_ADDRESS: u32 = 0x1f80_1da4;
 const TRANSFER_ADDRESS: u32 = 0x1f80_1da6;
@@ -55,6 +56,10 @@ const CD_VOLUME_LEFT: u32 = 0x1f80_1db0;
 const CD_VOLUME_RIGHT: u32 = 0x1f80_1db2;
 const EXTERNAL_VOLUME_LEFT: u32 = 0x1f80_1db4;
 const EXTERNAL_VOLUME_RIGHT: u32 = 0x1f80_1db6;
+const CURRENT_MAIN_VOLUME_LEFT: u32 = 0x1f80_1db8;
+const CURRENT_MAIN_VOLUME_RIGHT: u32 = 0x1f80_1dba;
+const UNKNOWN_DBC: u32 = 0x1f80_1dbc;
+const UNKNOWN_DBE: u32 = 0x1f80_1dbe;
 const REVERB_REGISTERS_START: u32 = 0x1f80_1dc0;
 const CONTROL_ENABLE: u16 = 1 << 15;
 const CONTROL_REVERB_ENABLE: u16 = 1 << 7;
@@ -296,6 +301,7 @@ pub struct Spu {
     noise_mask: u32,
     reverb_mask: u32,
     endx: u32,
+    unknown_da0: u16,
     reverb_base: u16,
     irq_address: u16,
     transfer_address: usize,
@@ -306,6 +312,8 @@ pub struct Spu {
     cd_volume_right: u16,
     external_volume_left: u16,
     external_volume_right: u16,
+    unknown_dbc: u16,
+    unknown_dbe: u16,
     reverb_registers: [u16; 32],
     reverb: Reverb,
     irq_request: bool,
@@ -333,6 +341,7 @@ impl Spu {
             noise_mask: 0,
             reverb_mask: 0,
             endx: 0,
+            unknown_da0: 0,
             reverb_base: 0,
             irq_address: 0,
             transfer_address: 0,
@@ -343,6 +352,8 @@ impl Spu {
             cd_volume_right: 0,
             external_volume_left: 0,
             external_volume_right: 0,
+            unknown_dbc: 0,
+            unknown_dbe: 0,
             reverb_registers: [0; 32],
             reverb: Reverb::new(),
             irq_request: false,
@@ -399,8 +410,8 @@ impl Spu {
             };
         }
         match address {
-            MAIN_VOLUME_LEFT => Ok(self.main_volume_left),
-            MAIN_VOLUME_RIGHT => Ok(self.main_volume_right),
+            MAIN_VOLUME_LEFT | CURRENT_MAIN_VOLUME_LEFT => Ok(self.main_volume_left),
+            MAIN_VOLUME_RIGHT | CURRENT_MAIN_VOLUME_RIGHT => Ok(self.main_volume_right),
             REVERB_VOLUME_LEFT => Ok(self.reverb_volume_left),
             REVERB_VOLUME_RIGHT => Ok(self.reverb_volume_right),
             PITCH_MOD_LOW => Ok(low_half(self.pitch_mod_mask)),
@@ -411,6 +422,7 @@ impl Spu {
             REVERB_ON_HIGH => Ok(high_half(self.reverb_mask)),
             ENDX_LOW => Ok(low_half(self.endx)),
             ENDX_HIGH => Ok(high_half(self.endx)),
+            UNKNOWN_DA0 => Ok(self.unknown_da0),
             REVERB_BASE => Ok(self.reverb_base),
             IRQ_ADDRESS => Ok(self.irq_address),
             TRANSFER_ADDRESS => Ok(u16::try_from(self.transfer_address / 8).unwrap_or(0)),
@@ -421,6 +433,8 @@ impl Spu {
             CD_VOLUME_RIGHT => Ok(self.cd_volume_right),
             EXTERNAL_VOLUME_LEFT => Ok(self.external_volume_left),
             EXTERNAL_VOLUME_RIGHT => Ok(self.external_volume_right),
+            UNKNOWN_DBC => Ok(self.unknown_dbc),
+            UNKNOWN_DBE => Ok(self.unknown_dbe),
             REVERB_REGISTERS_START..=SPU_END => Ok(self.reverb_registers[reverb_index(address)]),
             _ => Err(SpuError::InvalidRegister { address }),
         }
@@ -466,6 +480,7 @@ impl Spu {
             REVERB_ON_HIGH => set_high_half(&mut self.reverb_mask, value),
             ENDX_LOW => self.endx &= !u32::from(value),
             ENDX_HIGH => self.endx &= !(u32::from(value) << 16),
+            UNKNOWN_DA0 => self.unknown_da0 = value,
             REVERB_BASE => {
                 self.reverb_base = value;
                 self.reverb.set_base(value);
@@ -481,10 +496,13 @@ impl Spu {
                 }
             }
             TRANSFER_CONTROL => self.transfer_control = value,
+            STATUS | CURRENT_MAIN_VOLUME_LEFT | CURRENT_MAIN_VOLUME_RIGHT => {}
             CD_VOLUME_LEFT => self.cd_volume_left = value,
             CD_VOLUME_RIGHT => self.cd_volume_right = value,
             EXTERNAL_VOLUME_LEFT => self.external_volume_left = value,
             EXTERNAL_VOLUME_RIGHT => self.external_volume_right = value,
+            UNKNOWN_DBC => self.unknown_dbc = value,
+            UNKNOWN_DBE => self.unknown_dbe = value,
             REVERB_REGISTERS_START..=SPU_END => {
                 self.reverb_registers[reverb_index(address)] = value;
             }
@@ -732,7 +750,7 @@ mod tests {
         KEY_OFF_LOW, KEY_ON_LOW, MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT, NOISE_LOW, PITCH_MOD_LOW,
         REVERB_BASE, REVERB_ON_HIGH, REVERB_ON_LOW, REVERB_REGISTERS_START, REVERB_VOLUME_LEFT,
         REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE, STATUS, STATUS_IRQ, Spu, SpuError,
-        TRANSFER_ADDRESS, TRANSFER_CONTROL, VOICE_COUNT,
+        TRANSFER_ADDRESS, TRANSFER_CONTROL, UNKNOWN_DA0, UNKNOWN_DBC, UNKNOWN_DBE, VOICE_COUNT,
     };
 
     const ROOM_REVERB: [u16; 32] = [
@@ -905,6 +923,9 @@ mod tests {
         spu.write_register(CD_VOLUME_RIGHT, 0x2222).unwrap();
         spu.write_register(EXTERNAL_VOLUME_LEFT, 0x3333).unwrap();
         spu.write_register(EXTERNAL_VOLUME_RIGHT, 0x4444).unwrap();
+        spu.write_register(UNKNOWN_DA0, 0x5555).unwrap();
+        spu.write_register(UNKNOWN_DBC, 0x6666).unwrap();
+        spu.write_register(UNKNOWN_DBE, 0x7777).unwrap();
         assert_eq!(spu.read_register(REVERB_VOLUME_LEFT).unwrap(), 0x1234);
         assert_eq!(spu.read_register(REVERB_VOLUME_RIGHT).unwrap(), 0xfedc);
         assert_eq!(spu.read_register(REVERB_ON_LOW).unwrap(), 0x4567);
@@ -913,6 +934,9 @@ mod tests {
         assert_eq!(spu.read_register(CD_VOLUME_RIGHT).unwrap(), 0x2222);
         assert_eq!(spu.read_register(EXTERNAL_VOLUME_LEFT).unwrap(), 0x3333);
         assert_eq!(spu.read_register(EXTERNAL_VOLUME_RIGHT).unwrap(), 0x4444);
+        assert_eq!(spu.read_register(UNKNOWN_DA0).unwrap(), 0x5555);
+        assert_eq!(spu.read_register(UNKNOWN_DBC).unwrap(), 0x6666);
+        assert_eq!(spu.read_register(UNKNOWN_DBE).unwrap(), 0x7777);
         assert!(matches!(
             spu.write_register(SPU_BASE + 1, 0),
             Err(SpuError::InvalidRegister { .. })
