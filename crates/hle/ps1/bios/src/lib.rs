@@ -372,6 +372,7 @@ impl BiosHle {
                 4
             }
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
+            (BiosVector::A0, 0x39) => self.initialize_heap(context)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
@@ -1388,7 +1389,7 @@ mod tests {
     fn heap_random_and_zeroed_allocation_have_deterministic_results() {
         let mut bios = BiosHle::default();
         let mut memory = Memory(vec![0xaa; 256]);
-        call(&mut bios, BiosVector::C0, 0x08, [3, 100, 0, 0], &mut memory).unwrap();
+        call(&mut bios, BiosVector::A0, 0x39, [3, 100, 0, 0], &mut memory).unwrap();
         let (first, _) = call(&mut bios, BiosVector::A0, 0x33, [9, 0, 0, 0], &mut memory).unwrap();
         assert_eq!(first.register(V0), Some(8));
         let (second, _) = call(&mut bios, BiosVector::A0, 0x37, [2, 4, 0, 0], &mut memory).unwrap();
