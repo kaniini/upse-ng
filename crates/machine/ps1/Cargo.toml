@@ -14,6 +14,7 @@ upse-psf = { path = "../../formats/shared/psf" }
 upse-psx-exe = { path = "../../formats/ps1/psx-exe" }
 upse-r3000 = { path = "../../hw/shared/r3000" }
 upse-ps1-bios = { path = "../../hle/ps1/bios" }
+upse-ps1-cdrom = { path = "../../hw/ps1/cdrom" }
 upse-ps1-dma = { path = "../../hw/ps1/dma" }
 upse-ps1-irq = { path = "../../hw/ps1/irq" }
 upse-ps1-memory = { path = "../../hw/ps1/memory" }

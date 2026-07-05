@@ -152,6 +152,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps1-cdrom"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "upse-ps1-dma"
 version = "0.1.0"
 dependencies = [
@@ -177,6 +184,7 @@ dependencies = [
  "thiserror",
  "upse-clock",
  "upse-ps1-bios",
+ "upse-ps1-cdrom",
  "upse-ps1-dma",
  "upse-ps1-irq",
  "upse-ps1-memory",

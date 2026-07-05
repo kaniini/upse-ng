@@ -10,6 +10,7 @@ use upse_clock::{ClockError, Deadline, RateConverter, Ticks};
 use upse_ps1_bios::{
     BiosError, BiosHle, BiosVector, CpuContext, GuestMemory, GuestMemoryError, HleAction,
 };
+use upse_ps1_cdrom::{CDROM_BASE, CDROM_END, CdRom};
 use upse_ps1_dma::{
     D4_BCR, D4_CHCR, D4_MADR, DICR, DPCR, DmaController, DmaError,
     InterruptSink as DmaInterruptSink,
@@ -182,6 +183,7 @@ impl From<SchedulerError> for MachineError {
 struct MachineState {
     cpu: Cpu,
     memory: Ps1Memory,
+    cdrom: CdRom,
     irq: InterruptController,
     timers: RootCounters,
     refresh: VBlankClock,
@@ -237,6 +239,7 @@ impl Ps1Machine {
         let state = MachineState {
             cpu,
             memory,
+            cdrom: CdRom::new(),
             irq: InterruptController::new(),
             timers: RootCounters::new(),
             refresh: VBlankClock::new(standard),
@@ -353,6 +356,7 @@ impl Ps1Machine {
             let state = &mut self.state;
             let mut bus = MachineBus {
                 memory: &mut state.memory,
+                cdrom: &mut state.cdrom,
                 irq: &mut state.irq,
                 timers: &mut state.timers,
                 dma: &mut state.dma,
@@ -674,6 +678,7 @@ impl GuestMemory for BiosMemory<'_> {
 
 struct MachineBus<'a> {
     memory: &'a mut Ps1Memory,
+    cdrom: &'a mut CdRom,
     irq: &'a mut InterruptController,
     timers: &'a mut RootCounters,
     dma: &'a mut DmaController,
@@ -753,6 +758,9 @@ impl Bus for MachineBus<'_> {
     fn read_u8(&mut self, address: u32) -> Result<u8, BusFault> {
         match Self::physical_region(address)? {
             MemoryRegion::Mmio { physical } => {
+                if (CDROM_BASE..=CDROM_END).contains(&physical) {
+                    return self.cdrom.read_register(physical).map_err(bus_fault);
+                }
                 let aligned = physical & !1;
                 let value = self.read_mmio_u16(aligned)?;
                 Ok(value.to_le_bytes()[usize::from((physical & 1).to_le_bytes()[0])])
@@ -803,6 +811,12 @@ impl Bus for MachineBus<'_> {
     fn write_u8(&mut self, address: u32, value: u8) -> Result<(), BusFault> {
         match Self::physical_region(address)? {
             MemoryRegion::Mmio { physical } => {
+                if (CDROM_BASE..=CDROM_END).contains(&physical) {
+                    return self
+                        .cdrom
+                        .write_register(physical, value)
+                        .map_err(bus_fault);
+                }
                 let aligned = physical & !1;
                 let mut bytes = self.read_mmio_u16(aligned)?.to_le_bytes();
                 bytes[usize::from((physical & 1).to_le_bytes()[0])] = value;
