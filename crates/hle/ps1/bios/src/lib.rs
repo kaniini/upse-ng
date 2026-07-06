@@ -23,6 +23,7 @@ const INTERRUPT_PRIORITIES: usize = 8;
 const CALLBACK_RETURN_PC: u32 = 0xffff_ff00;
 const TTY_FORMAT_BYTES: u32 = 4096;
 const TTY_STRING_BYTES: u32 = 4096;
+const RESIDENT_FILE_DESCRIPTOR: u32 = 3;
 
 /// BIOS call-table vector intercepted by the machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,6 +292,11 @@ struct Heap {
     next: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidentFile {
+    position: u32,
+}
+
 /// Instance-owned HLE kernel state with bounded resources.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BiosHle {
@@ -299,6 +305,7 @@ pub struct BiosHle {
     pending_callbacks: VecDeque<CallbackRequest>,
     callback_stack: Vec<CpuContext>,
     heap: Option<Heap>,
+    resident_file: Option<ResidentFile>,
     random_state: u32,
     critical_depth: u32,
     interrupt_hook: Option<u32>,
@@ -322,6 +329,7 @@ impl BiosHle {
             pending_callbacks: VecDeque::new(),
             callback_stack: Vec::new(),
             heap: None,
+            resident_file: None,
             random_state: 1,
             critical_depth: 0,
             interrupt_hook: None,
@@ -346,8 +354,13 @@ impl BiosHle {
         let pc = context.pc;
         let mut action = HleAction::Return;
         let cycles = match (vector, function) {
+            (BiosVector::A0, 0x00) | (BiosVector::B0, 0x32) => self.open(context, memory)?,
+            (BiosVector::A0, 0x01) | (BiosVector::B0, 0x33) => self.lseek(context)?,
+            (BiosVector::A0, 0x02) | (BiosVector::B0, 0x34) => self.read(context),
+            (BiosVector::A0, 0x04) | (BiosVector::B0, 0x36) => self.close(context),
             (BiosVector::A0, 0x0c) => self.strtoul(context, memory)?,
             (BiosVector::A0, 0x13) => self.setjmp(context, memory)?,
+            (BiosVector::A0, 0x15) => self.strcat(context, memory)?,
             (BiosVector::A0, 0x72) => 10,
             (BiosVector::A0, 0x2a) => self.memory_copy(context, memory, false)?,
             (BiosVector::A0, 0x2b) => self.memory_set(context, memory)?,
@@ -372,7 +385,7 @@ impl BiosHle {
                 4
             }
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
-            (BiosVector::A0, 0x39) => self.initialize_heap(context)?,
+            (BiosVector::A0, 0x39) | (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
@@ -399,7 +412,6 @@ impl BiosHle {
             (BiosVector::B0, 0x5b) => 6,
             (BiosVector::C0, 0x02) => self.enqueue_interrupt(context)?,
             (BiosVector::C0, 0x03) => self.dequeue_interrupt(context)?,
-            (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
             (BiosVector::C0, 0x0a) => self.change_clear_counter(context)?,
             _ => {
                 return Err(BiosError::UnsupportedCall {
@@ -625,6 +637,80 @@ impl BiosHle {
         Ok(memory_cycles(size))
     }
 
+    fn open<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let path = self.read_tty_string(memory, context.argument(0), TTY_STRING_BYTES)?;
+        if path.starts_with(b"sim:") {
+            // PSF executables are RAM snapshots: data that the original Psy-Q
+            // development build read from its `sim:` device is already mapped
+            // at the read destination by the PSF load plan.
+            self.resident_file = Some(ResidentFile { position: 0 });
+            context.return_value(RESIDENT_FILE_DESCRIPTOR);
+        } else {
+            context.return_value(u32::MAX);
+        }
+        Ok(memory_cycles(
+            u32::try_from(path.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1),
+        ))
+    }
+
+    fn lseek(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
+        if context.argument(0) != RESIDENT_FILE_DESCRIPTOR {
+            context.return_value(u32::MAX);
+            return Ok(6);
+        }
+        let Some(file) = self.resident_file.as_mut() else {
+            context.return_value(u32::MAX);
+            return Ok(6);
+        };
+        let offset = i32::from_ne_bytes(context.argument(1).to_ne_bytes());
+        let base = match context.argument(2) {
+            0 => 0,
+            1 => file.position,
+            _ => {
+                context.return_value(u32::MAX);
+                return Ok(6);
+            }
+        };
+        let position = i64::from(base) + i64::from(offset);
+        if !(0..=i64::from(u32::MAX)).contains(&position) {
+            context.return_value(u32::MAX);
+            return Ok(6);
+        }
+        file.position = u32::try_from(position).map_err(|_| BiosError::AddressOverflow)?;
+        context.return_value(file.position);
+        Ok(8)
+    }
+
+    fn read(&mut self, context: &mut CpuContext) -> u32 {
+        let size = context.argument(2);
+        if context.argument(0) != RESIDENT_FILE_DESCRIPTOR {
+            context.return_value(u32::MAX);
+            return 6;
+        }
+        let Some(file) = self.resident_file.as_mut() else {
+            context.return_value(u32::MAX);
+            return 6;
+        };
+        file.position = file.position.saturating_add(size);
+        context.return_value(size);
+        memory_cycles(size)
+    }
+
+    fn close(&mut self, context: &mut CpuContext) -> u32 {
+        if context.argument(0) == RESIDENT_FILE_DESCRIPTOR && self.resident_file.take().is_some() {
+            context.return_value(0);
+        } else {
+            context.return_value(u32::MAX);
+        }
+        6
+    }
+
     fn strtoul<M: GuestMemory>(
         &self,
         context: &mut CpuContext,
@@ -700,6 +786,49 @@ impl BiosHle {
         }
         context.return_value(result);
         Ok(memory_cycles(offset.saturating_add(1)).saturating_add(8))
+    }
+
+    fn strcat<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let destination = context.argument(0);
+        let source = context.argument(1);
+        if destination == 0 || source == 0 {
+            context.return_value(0);
+            return Ok(6);
+        }
+
+        let mut destination_length = 0_u32;
+        while self.read_string_byte(memory, destination, destination_length)? != 0 {
+            destination_length = destination_length
+                .checked_add(1)
+                .ok_or(BiosError::AddressOverflow)?;
+        }
+
+        let mut source_offset = 0_u32;
+        loop {
+            let size = destination_length
+                .checked_add(source_offset)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(BiosError::AddressOverflow)?;
+            self.check_memory_size(size)?;
+            let value = read_byte(memory, source, source_offset)?;
+            write_byte(
+                memory,
+                destination,
+                destination_length + source_offset,
+                value,
+            )?;
+            if value == 0 {
+                context.return_value(destination);
+                return Ok(memory_cycles(size));
+            }
+            source_offset = source_offset
+                .checked_add(1)
+                .ok_or(BiosError::AddressOverflow)?;
+        }
     }
 
     fn read_string_byte<M: GuestMemory>(
@@ -1182,7 +1311,7 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, BiosError> {
 mod tests {
     use super::{
         A0, BiosError, BiosHle, BiosVector, CpuContext, FP, GP, GuestMemory, GuestMemoryError,
-        HleAction, HleLimits, RA, S0, SP, T1, V0,
+        HleAction, HleLimits, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP, T1, V0,
     };
 
     struct Memory(Vec<u8>);
@@ -1270,6 +1399,45 @@ mod tests {
             call(&mut bios, BiosVector::A0, 0x2a, [63, 0, 2, 0], &mut memory),
             Err(BiosError::GuestMemory { .. })
         ));
+    }
+
+    #[test]
+    fn resident_sim_file_reads_preserve_preloaded_psf_memory() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 128]);
+        memory.0[8..20].copy_from_slice(b"sim:\\AF2.CD\0");
+        memory.0[64..68].copy_from_slice(&[1, 2, 3, 4]);
+
+        let (opened, _) = call(&mut bios, BiosVector::B0, 0x32, [8, 1, 0, 0], &mut memory).unwrap();
+        assert_eq!(opened.register(V0), Some(RESIDENT_FILE_DESCRIPTOR));
+        let (seeked, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x33,
+            [RESIDENT_FILE_DESCRIPTOR, 32, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(seeked.register(V0), Some(32));
+        let (read, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x34,
+            [RESIDENT_FILE_DESCRIPTOR, 64, 4, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(read.register(V0), Some(4));
+        assert_eq!(&memory.0[64..68], &[1, 2, 3, 4]);
+        let (closed, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x36,
+            [RESIDENT_FILE_DESCRIPTOR, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(closed.register(V0), Some(0));
     }
 
     #[test]
@@ -1364,6 +1532,22 @@ mod tests {
             ),
             Err(BiosError::MemoryOperationLimit { size: 4, limit: 3 })
         ));
+    }
+
+    #[test]
+    fn strcat_appends_the_terminator_and_returns_the_destination() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 64]);
+        memory.0[8..14].copy_from_slice(b"hello\0");
+        memory.0[32..39].copy_from_slice(b" world\0");
+        let (context, _) =
+            call(&mut bios, BiosVector::A0, 0x15, [8, 32, 0, 0], &mut memory).unwrap();
+        assert_eq!(&memory.0[8..20], b"hello world\0");
+        assert_eq!(context.register(V0), Some(8));
+
+        let (context, _) =
+            call(&mut bios, BiosVector::A0, 0x15, [0, 32, 0, 0], &mut memory).unwrap();
+        assert_eq!(context.register(V0), Some(0));
     }
 
     #[test]
