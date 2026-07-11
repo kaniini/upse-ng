@@ -15,6 +15,7 @@ use upse_ps1_dma::{
     D4_BCR, D4_CHCR, D4_MADR, DICR, DPCR, DmaController, DmaError,
     InterruptSink as DmaInterruptSink,
 };
+use upse_ps1_gpu::{GP0, GP1, Gpu};
 use upse_ps1_irq::{I_MASK, I_STAT, InterruptController, InterruptSource};
 use upse_ps1_memory::{
     MEMORY_CONTROL_END, MEMORY_CONTROL_START, MemoryError, MemoryRegion, OpenBusPolicy, Ps1Memory,
@@ -184,6 +185,7 @@ struct MachineState {
     cpu: Cpu,
     memory: Ps1Memory,
     cdrom: CdRom,
+    gpu: Gpu,
     irq: InterruptController,
     timers: RootCounters,
     refresh: VBlankClock,
@@ -240,6 +242,7 @@ impl Ps1Machine {
             cpu,
             memory,
             cdrom: CdRom::new(),
+            gpu: Gpu::new(),
             irq: InterruptController::new(),
             timers: RootCounters::new(),
             refresh: VBlankClock::new(standard),
@@ -357,6 +360,7 @@ impl Ps1Machine {
             let mut bus = MachineBus {
                 memory: &mut state.memory,
                 cdrom: &mut state.cdrom,
+                gpu: &mut state.gpu,
                 irq: &mut state.irq,
                 timers: &mut state.timers,
                 dma: &mut state.dma,
@@ -679,6 +683,7 @@ impl GuestMemory for BiosMemory<'_> {
 struct MachineBus<'a> {
     memory: &'a mut Ps1Memory,
     cdrom: &'a mut CdRom,
+    gpu: &'a mut Gpu,
     irq: &'a mut InterruptController,
     timers: &'a mut RootCounters,
     dma: &'a mut DmaController,
@@ -792,6 +797,7 @@ impl Bus for MachineBus<'_> {
                 D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => {
                     self.dma.read(physical).map_err(bus_fault)
                 }
+                GP0 | GP1 => self.gpu.read_register(physical).map_err(bus_fault),
                 SPU_BASE..=SPU_END => {
                     let low = self.spu.read_register(physical).map_err(bus_fault)?;
                     let high = self.spu.read_register(physical + 2).map_err(bus_fault)?;
@@ -851,6 +857,7 @@ impl Bus for MachineBus<'_> {
                     .dma
                     .write(physical, value, self.now, self.scheduler, self.irq)
                     .map_err(bus_fault),
+                GP0 | GP1 => self.gpu.write_register(physical, value).map_err(bus_fault),
                 SPU_BASE..=SPU_END => {
                     let bytes = value.to_le_bytes();
                     self.spu

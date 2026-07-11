@@ -13,6 +13,7 @@ members = [
     "crates/hw/shared/spu-common",
     "crates/hw/ps1/memory",
     "crates/hw/ps1/cdrom",
+    "crates/hw/ps1/gpu",
     "crates/hw/ps1/irq",
     "crates/hw/ps1/timers",
     "crates/hw/ps1/dma",

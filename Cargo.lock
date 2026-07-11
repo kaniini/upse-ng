@@ -171,6 +171,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps1-gpu"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "upse-ps1-irq"
 version = "0.1.0"
 dependencies = [
@@ -186,6 +193,7 @@ dependencies = [
  "upse-ps1-bios",
  "upse-ps1-cdrom",
  "upse-ps1-dma",
+ "upse-ps1-gpu",
  "upse-ps1-irq",
  "upse-ps1-memory",
  "upse-ps1-spu",
