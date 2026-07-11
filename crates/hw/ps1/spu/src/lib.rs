@@ -278,6 +278,7 @@ impl Voice {
             if flags.repeat {
                 self.current_address = usize::from(self.repeat_address) * 8;
             } else {
+                self.envelope = Envelope::new();
                 self.active = false;
                 return true;
             }
@@ -882,6 +883,7 @@ mod tests {
         assert!(output.iter().any(|&sample| sample >= 32_760));
         assert_ne!(spu.read_register(ENDX_LOW).unwrap() & 1, 0);
         assert_eq!(spu.read_register(ENDX_LOW).unwrap() & !1, 0);
+        assert_eq!(spu.read_register(SPU_BASE + 12).unwrap(), 0);
         spu.write_register(KEY_OFF_LOW, 2).unwrap();
         let mut tail = [0_i16; 8];
         spu.render(4, &mut tail).unwrap();
