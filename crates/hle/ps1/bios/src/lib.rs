@@ -152,6 +152,8 @@ impl CpuContext {
 pub enum HleAction {
     /// Resume at the guest return address.
     Return,
+    /// Keep the guest at the BIOS vector until a kernel event is delivered.
+    Wait,
     /// Resume after restoring the machine's exception frame.
     ReturnFromException,
 }
@@ -390,7 +392,14 @@ impl BiosHle {
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
             (BiosVector::B0, 0x09) => self.close_event(context),
-            (BiosVector::B0, 0x0a | 0x0b) => self.test_event(context),
+            (BiosVector::B0, 0x0a) => {
+                let (cycles, ready) = self.wait_event(context);
+                if !ready {
+                    action = HleAction::Wait;
+                }
+                cycles
+            }
+            (BiosVector::B0, 0x0b) => self.test_event(context),
             (BiosVector::B0, 0x0c) => self.enable_event(context, true),
             (BiosVector::B0, 0x0d) => self.enable_event(context, false),
             (BiosVector::B0, 0x17) => {
@@ -1148,6 +1157,21 @@ impl BiosHle {
         8
     }
 
+    fn wait_event(&mut self, context: &mut CpuContext) -> (u32, bool) {
+        let handle = context.argument(0);
+        let delivered = self.event_mut(handle).is_some_and(|event| {
+            let delivered = event.enabled && event.state == EventState::Delivered;
+            if delivered {
+                event.state = EventState::Idle;
+            }
+            delivered
+        });
+        if delivered {
+            context.return_value(1);
+        }
+        (8, delivered)
+    }
+
     fn deliver_event(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
         let class = context.argument(0);
         let spec = context.argument(1);
@@ -1662,6 +1686,53 @@ mod tests {
         assert_eq!(result.register(V0), Some(1));
         let (result, _) = call(&mut bios, BiosVector::B0, 0x09, [0, 0, 0, 0], &mut memory).unwrap();
         assert_eq!(result.register(V0), Some(1));
+    }
+
+    #[test]
+    fn wait_event_stays_in_the_bios_until_a_ready_event_is_delivered() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 16]);
+        let (opened, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x08,
+            [0x1234, 0x20, 0x2000, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let handle = opened.register(V0).unwrap();
+        call(
+            &mut bios,
+            BiosVector::B0,
+            0x0c,
+            [handle, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+
+        let (waiting, outcome) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x0a,
+            [handle, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(outcome.action, HleAction::Wait);
+        assert_eq!(waiting.pc, 0x1000);
+
+        assert_eq!(bios.signal_event(0x1234, 0x20).unwrap(), 1);
+        let (resumed, outcome) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x0a,
+            [handle, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(outcome.action, HleAction::Return);
+        assert_eq!(resumed.pc, 0x2000);
+        assert_eq!(resumed.register(V0), Some(1));
     }
 
     #[test]
