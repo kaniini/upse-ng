@@ -169,7 +169,7 @@ impl Default for Voice {
 struct VoiceOutput {
     dry: i16,
     fetched: Option<usize>,
-    ended: bool,
+    loop_end: bool,
 }
 
 impl Voice {
@@ -198,6 +198,7 @@ impl Voice {
             return Ok(VoiceOutput::default());
         }
         let mut fetched = None;
+        let mut loop_end = false;
         let source = if let Some(noise) = noise {
             noise
         } else {
@@ -212,12 +213,13 @@ impl Voice {
             for _ in 0..step.whole_samples {
                 self.sample_index += 1;
                 if self.sample_index == self.decoded.len() {
-                    let ended = self.finish_block();
-                    if ended {
+                    loop_end |= self.decoded_flags.end;
+                    let stopped = self.finish_block();
+                    if stopped {
                         return Ok(VoiceOutput {
                             dry: self.apply_envelope(sample),
                             fetched,
-                            ended: true,
+                            loop_end,
                         });
                     }
                     fetched = Some(self.decode_current(ram)?);
@@ -228,7 +230,7 @@ impl Voice {
         Ok(VoiceOutput {
             dry: self.apply_envelope(source),
             fetched,
-            ended: false,
+            loop_end,
         })
     }
 
@@ -578,9 +580,8 @@ impl Spu {
             if let Some(address) = result.fetched {
                 self.check_irq_fetch(address);
             }
-            if result.ended {
+            if result.loop_end {
                 self.endx |= bit;
-                self.reverb_mask &= !bit;
             }
             previous = result.dry;
             let voice_left = apply_volume(result.dry, self.voices[index].volume_left);
@@ -875,6 +876,7 @@ mod tests {
         spu.write_register(MAIN_VOLUME_RIGHT, 0x3fff).unwrap();
         spu.write_register(PITCH_MOD_LOW, 0xfffe).unwrap();
         spu.write_register(NOISE_LOW, 1 << 1).unwrap();
+        spu.write_register(REVERB_ON_LOW, u16::MAX).unwrap();
         spu.write_register(CONTROL, CONTROL_ENABLE).unwrap();
         spu.write_register(KEY_ON_LOW, u16::MAX).unwrap();
         spu.write_register(super::KEY_ON_HIGH, 0xff).unwrap();
@@ -882,7 +884,8 @@ mod tests {
         spu.render(40, &mut output).unwrap();
         assert!(output.iter().any(|&sample| sample >= 32_760));
         assert_ne!(spu.read_register(ENDX_LOW).unwrap() & 1, 0);
-        assert_eq!(spu.read_register(ENDX_LOW).unwrap() & !1, 0);
+        assert_eq!(spu.read_register(ENDX_LOW).unwrap(), 0xfffd);
+        assert_eq!(spu.read_register(REVERB_ON_LOW).unwrap(), u16::MAX);
         assert_eq!(spu.read_register(SPU_BASE + 12).unwrap(), 0);
         spu.write_register(KEY_OFF_LOW, 2).unwrap();
         let mut tail = [0_i16; 8];
