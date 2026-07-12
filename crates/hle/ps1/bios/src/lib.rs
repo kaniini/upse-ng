@@ -24,6 +24,7 @@ const CALLBACK_RETURN_PC: u32 = 0xffff_ff00;
 const TTY_FORMAT_BYTES: u32 = 4096;
 const TTY_STRING_BYTES: u32 = 4096;
 const RESIDENT_FILE_DESCRIPTOR: u32 = 3;
+const RAM_SIZE_ADDRESS: u32 = 0x0000_0060;
 
 /// BIOS call-table vector intercepted by the machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,6 +390,7 @@ impl BiosHle {
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
             (BiosVector::A0, 0x39) | (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
+            (BiosVector::A0, 0x9f) => Self::set_memory_size(context, memory)?,
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
             (BiosVector::B0, 0x09) => self.close_event(context),
@@ -644,6 +646,21 @@ impl BiosHle {
         }
         context.return_value(destination);
         Ok(memory_cycles(size))
+    }
+
+    fn set_memory_size<M: GuestMemory>(
+        context: &CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        for (offset, byte) in context.argument(0).to_le_bytes().into_iter().enumerate() {
+            write_byte(
+                memory,
+                RAM_SIZE_ADDRESS,
+                u32::try_from(offset).map_err(|_| BiosError::AddressOverflow)?,
+                byte,
+            )?;
+        }
+        Ok(12)
     }
 
     fn open<M: GuestMemory>(
@@ -1607,6 +1624,22 @@ mod tests {
         call(&mut bios, BiosVector::A0, 0x30, [7, 0, 0, 0], &mut memory).unwrap();
         let (random, _) = call(&mut bios, BiosVector::A0, 0x2f, [0; 4], &mut memory).unwrap();
         assert_eq!(random.register(V0), Some(19_564));
+    }
+
+    #[test]
+    fn set_mem_records_the_guest_visible_ram_size() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 128]);
+        let (context, outcome) =
+            call(&mut bios, BiosVector::A0, 0x9f, [2, 0, 0, 0], &mut memory).unwrap();
+
+        assert_eq!(
+            u32::from_le_bytes(memory.0[0x60..0x64].try_into().unwrap()),
+            2
+        );
+        assert_eq!(context.pc, 0x2000);
+        assert_eq!(outcome.cycles, 12);
+        assert_eq!(outcome.action, HleAction::Return);
     }
 
     fn open_event(bios: &mut BiosHle, memory: &mut Memory, class: u32, callback: u32) -> u32 {
