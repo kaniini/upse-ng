@@ -25,6 +25,8 @@ const TTY_FORMAT_BYTES: u32 = 4096;
 const TTY_STRING_BYTES: u32 = 4096;
 const RESIDENT_FILE_DESCRIPTOR: u32 = 3;
 const RAM_SIZE_ADDRESS: u32 = 0x0000_0060;
+const STRTOK_BUFFER_ADDRESS: u32 = 0x0000_c000;
+const STRTOK_BUFFER_SIZE: u32 = 256;
 
 /// BIOS call-table vector intercepted by the machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,6 +155,8 @@ impl CpuContext {
 pub enum HleAction {
     /// Resume at the guest return address.
     Return,
+    /// Enter a guest callback owned by a suspended HLE routine.
+    Call,
     /// Keep the guest at the BIOS vector until a kernel event is delivered.
     Wait,
     /// Resume after restoring the machine's exception frame.
@@ -184,6 +188,8 @@ pub struct HleLimits {
     pub pending_callbacks: usize,
     /// Maximum nested callback contexts.
     pub callback_depth: usize,
+    /// Maximum guest comparisons performed by one libc search or sort call.
+    pub libc_callback_calls: u32,
 }
 
 impl Default for HleLimits {
@@ -192,6 +198,7 @@ impl Default for HleLimits {
             memory_operation_bytes: 2 * 1024 * 1024,
             pending_callbacks: 64,
             callback_depth: 16,
+            libc_callback_calls: 1_000_000,
         }
     }
 }
@@ -226,6 +233,12 @@ pub enum BiosError {
     /// Callback return sentinel was observed without a saved context.
     #[error("PS1 HLE callback stack is empty")]
     CallbackStackEmpty,
+    /// A libc search or sort exceeded the configured guest-comparison bound.
+    #[error("PS1 HLE libc callback operation exceeds limit {limit}")]
+    LibcCallbackLimit {
+        /// Configured maximum comparator calls.
+        limit: u32,
+    },
     /// Guest memory service length exceeds its configured bound.
     #[error("PS1 HLE memory operation of {size} bytes exceeds limit {limit}")]
     MemoryOperationLimit {
@@ -290,14 +303,62 @@ impl EventSlot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeapBlock {
+    address: u32,
+    size: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Heap {
+    base: u32,
     end: u32,
-    next: u32,
+    blocks: Vec<HeapBlock>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResidentFile {
     position: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedInteger {
+    value: u32,
+    end: u32,
+    bytes_read: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LibcOperationKind {
+    Qsort {
+        base: u32,
+        elements: u32,
+        width: u32,
+        outer: u32,
+        inner: u32,
+    },
+    Lsearch {
+        key: u32,
+        base: u32,
+        elements: u32,
+        width: u32,
+        index: u32,
+    },
+    Bsearch {
+        key: u32,
+        base: u32,
+        width: u32,
+        low: u32,
+        high: u32,
+        middle: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LibcOperation {
+    saved_context: CpuContext,
+    callback: u32,
+    calls: u32,
+    kind: LibcOperationKind,
 }
 
 /// Instance-owned HLE kernel state with bounded resources.
@@ -309,6 +370,8 @@ pub struct BiosHle {
     callback_stack: Vec<CpuContext>,
     heap: Option<Heap>,
     resident_file: Option<ResidentFile>,
+    strtok_next: Option<u32>,
+    libc_operation: Option<LibcOperation>,
     random_state: u32,
     critical_depth: u32,
     interrupt_hook: Option<u32>,
@@ -333,6 +396,8 @@ impl BiosHle {
             callback_stack: Vec::new(),
             heap: None,
             resident_file: None,
+            strtok_next: None,
+            libc_operation: None,
             random_state: 1,
             critical_depth: 0,
             interrupt_hook: None,
@@ -347,6 +412,7 @@ impl BiosHle {
     ///
     /// Returns [`BiosError`] for unknown calls, invalid resources, guest memory
     /// failures, arithmetic overflow, or configured-bound violations.
+    #[allow(clippy::too_many_lines)]
     pub fn dispatch<M: GuestMemory>(
         &mut self,
         vector: BiosVector,
@@ -361,14 +427,42 @@ impl BiosHle {
             (BiosVector::A0, 0x01) | (BiosVector::B0, 0x33) => self.lseek(context)?,
             (BiosVector::A0, 0x02) | (BiosVector::B0, 0x34) => self.read(context),
             (BiosVector::A0, 0x04) | (BiosVector::B0, 0x36) => self.close(context),
+            (BiosVector::A0, 0x0a) => Self::to_digit(context),
             (BiosVector::A0, 0x0c) => self.strtoul(context, memory)?,
+            (BiosVector::A0, 0x0d) => self.strtol(context, memory)?,
+            (BiosVector::A0, 0x0e | 0x0f) => Self::absolute_value(context),
+            (BiosVector::A0, 0x10 | 0x11) => self.atoi(context, memory)?,
+            (BiosVector::A0, 0x12) => self.atob(context, memory)?,
             (BiosVector::A0, 0x13) => self.setjmp(context, memory)?,
+            (BiosVector::A0, 0x14) => self.longjmp(context, memory)?,
             (BiosVector::A0, 0x15) => self.strcat(context, memory)?,
+            (BiosVector::A0, 0x16) => self.strncat(context, memory)?,
+            (BiosVector::A0, 0x17) => self.string_compare(context, memory, None)?,
+            (BiosVector::A0, 0x18) => {
+                self.string_compare(context, memory, Some(context.argument(2)))?
+            }
+            (BiosVector::A0, 0x19) => self.string_copy(context, memory, None)?,
+            (BiosVector::A0, 0x1a) => {
+                self.string_copy(context, memory, Some(context.argument(2)))?
+            }
+            (BiosVector::A0, 0x1b) => self.string_length(context, memory)?,
+            (BiosVector::A0, 0x1c | 0x1e) => self.string_character(context, memory, false)?,
+            (BiosVector::A0, 0x1d | 0x1f) => self.string_character(context, memory, true)?,
+            (BiosVector::A0, 0x20) => self.string_pbrk(context, memory)?,
+            (BiosVector::A0, 0x21) => self.string_span(context, memory, true)?,
+            (BiosVector::A0, 0x22) => self.string_span(context, memory, false)?,
+            (BiosVector::A0, 0x23) => self.string_token(context, memory)?,
+            (BiosVector::A0, 0x24) => self.string_string(context, memory)?,
+            (BiosVector::A0, 0x25) => Self::change_case(context, true),
+            (BiosVector::A0, 0x26) => Self::change_case(context, false),
+            (BiosVector::A0, 0x27) => self.bcopy(context, memory)?,
+            (BiosVector::A0, 0x28) => self.bzero(context, memory)?,
+            (BiosVector::A0, 0x29 | 0x2d) => self.memory_compare(context, memory)?,
             (BiosVector::A0, 0x72) => 10,
             (BiosVector::A0, 0x2a) => self.memory_copy(context, memory, false)?,
             (BiosVector::A0, 0x2b) => self.memory_set(context, memory)?,
             (BiosVector::A0, 0x2c) => self.memory_copy(context, memory, true)?,
-            (BiosVector::A0, 0x2d) => self.memory_compare(context, memory)?,
+            (BiosVector::A0, 0x2e) => self.memory_character(context, memory)?,
             (BiosVector::A0, 0x2f) => {
                 self.random_state = self
                     .random_state
@@ -382,13 +476,33 @@ impl BiosHle {
                 context.return_value(0);
                 6
             }
+            (BiosVector::A0, 0x31) => {
+                if self.start_qsort(context)? {
+                    action = HleAction::Call;
+                }
+                12
+            }
             (BiosVector::A0, 0x33) => self.malloc(context)?,
-            (BiosVector::A0, 0x34) => {
-                context.return_value(0);
-                4
+            (BiosVector::A0, 0x34) => self.free(context),
+            (BiosVector::A0, 0x35) => {
+                if self.start_lsearch(context, memory)? {
+                    action = HleAction::Call;
+                }
+                12
+            }
+            (BiosVector::A0, 0x36) => {
+                if self.start_bsearch(context, memory)? {
+                    action = HleAction::Call;
+                }
+                12
             }
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
+            (BiosVector::A0, 0x38) => self.realloc(context, memory)?,
             (BiosVector::A0, 0x39) | (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
+            (BiosVector::A0, 0x3b) | (BiosVector::B0, 0x3c) => Self::getchar(context),
+            (BiosVector::A0, 0x3c) | (BiosVector::B0, 0x3d) => Self::putchar(context),
+            (BiosVector::A0, 0x3d) | (BiosVector::B0, 0x3e) => Self::gets(context, memory)?,
+            (BiosVector::A0, 0x3e) | (BiosVector::B0, 0x3f) => self.puts(context, memory)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
             (BiosVector::A0, 0x9f) => Self::set_memory_size(context, memory)?,
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
@@ -535,7 +649,118 @@ impl BiosHle {
     /// Reports whether guest code is currently executing in callback context.
     #[must_use]
     pub fn callback_active(&self) -> bool {
-        !self.callback_stack.is_empty()
+        !self.callback_stack.is_empty() || self.libc_operation.is_some()
+    }
+
+    /// Reports whether a guest comparator is servicing a libc HLE routine.
+    #[must_use]
+    pub const fn libc_callback_active(&self) -> bool {
+        self.libc_operation.is_some()
+    }
+
+    /// Consumes a guest comparator result and either schedules the next
+    /// comparison or completes the suspended libc operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BiosError`] for an unmatched callback, an operation bound,
+    /// address arithmetic, or guest-memory failure.
+    pub fn resume_libc_callback<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<HleOutcome, BiosError> {
+        let result = i32::from_ne_bytes(context.registers[V0].to_ne_bytes());
+        let Some(mut operation) = self.libc_operation.take() else {
+            return Err(BiosError::CallbackStackEmpty);
+        };
+        let mut completed_result = None;
+        match &mut operation.kind {
+            LibcOperationKind::Qsort {
+                base,
+                elements,
+                width,
+                outer,
+                inner,
+            } => {
+                if result > 0 {
+                    let left = element_address(*base, inner.saturating_sub(1), *width)?;
+                    let right = element_address(*base, *inner, *width)?;
+                    for offset in 0..*width {
+                        let left_value = read_byte(memory, left, offset)?;
+                        let right_value = read_byte(memory, right, offset)?;
+                        write_byte(memory, left, offset, right_value)?;
+                        write_byte(memory, right, offset, left_value)?;
+                    }
+                    *inner = inner.saturating_sub(1);
+                }
+                if result <= 0 || *inner == 0 {
+                    *outer = outer.saturating_add(1);
+                    *inner = *outer;
+                }
+                if *outer >= *elements {
+                    completed_result = Some(None);
+                }
+            }
+            LibcOperationKind::Lsearch {
+                key: _,
+                base,
+                elements,
+                width,
+                index,
+            } => {
+                if result == 0 {
+                    completed_result = Some(Some(element_address(*base, *index, *width)?));
+                } else {
+                    *index = index.saturating_add(1);
+                    if *index >= *elements {
+                        completed_result = Some(Some(0));
+                    }
+                }
+            }
+            LibcOperationKind::Bsearch {
+                key: _,
+                base,
+                width,
+                low,
+                high,
+                middle,
+            } => {
+                if result == 0 {
+                    completed_result = Some(Some(element_address(*base, *middle, *width)?));
+                } else {
+                    if result < 0 {
+                        *high = *middle;
+                    } else {
+                        *low = middle.saturating_add(1);
+                    }
+                    if *low >= *high {
+                        completed_result = Some(Some(0));
+                    } else {
+                        *middle = *low + (*high - *low) / 2;
+                    }
+                }
+            }
+        }
+
+        if let Some(return_value) = completed_result {
+            *context = operation.saved_context;
+            if let Some(return_value) = return_value {
+                context.return_value(return_value);
+            }
+            context.return_to_caller();
+            return Ok(HleOutcome {
+                cycles: 10,
+                action: HleAction::Return,
+            });
+        }
+
+        self.prepare_libc_comparison(&mut operation, context)?;
+        self.libc_operation = Some(operation);
+        Ok(HleOutcome {
+            cycles: 10,
+            action: HleAction::Call,
+        })
     }
 
     /// Delivers one kernel event raised by an emulated hardware source.
@@ -648,6 +873,38 @@ impl BiosHle {
         Ok(memory_cycles(size))
     }
 
+    fn bcopy<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        let destination = context.argument(1);
+        let size = context.argument(2);
+        self.check_memory_size(size)?;
+        for offset in 0..size {
+            let value = read_byte(memory, source, offset)?;
+            write_byte(memory, destination, offset, value)?;
+        }
+        context.return_value(source);
+        Ok(memory_cycles(size))
+    }
+
+    fn bzero<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let destination = context.argument(0);
+        let size = context.argument(1);
+        self.check_memory_size(size)?;
+        for offset in 0..size {
+            write_byte(memory, destination, offset, 0)?;
+        }
+        context.return_value(destination);
+        Ok(memory_cycles(size))
+    }
+
     fn set_memory_size<M: GuestMemory>(
         context: &CpuContext,
         memory: &mut M,
@@ -661,6 +918,158 @@ impl BiosHle {
             )?;
         }
         Ok(12)
+    }
+
+    fn start_qsort(&mut self, context: &mut CpuContext) -> Result<bool, BiosError> {
+        let base = context.argument(0);
+        let elements = context.argument(1);
+        let width = context.argument(2);
+        self.check_array(base, elements, width)?;
+        if elements < 2 || width == 0 {
+            return Ok(false);
+        }
+        let callback = context.argument(3);
+        self.start_libc_operation(
+            context,
+            callback,
+            LibcOperationKind::Qsort {
+                base,
+                elements,
+                width,
+                outer: 1,
+                inner: 1,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn start_lsearch<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<bool, BiosError> {
+        let key = context.argument(0);
+        let base = context.argument(1);
+        let elements = context.argument(2);
+        let width = context.argument(3);
+        self.check_array(base, elements, width)?;
+        if elements == 0 || width == 0 {
+            context.return_value(0);
+            return Ok(false);
+        }
+        let callback = read_word(memory, context.registers[SP], 16)?;
+        self.start_libc_operation(
+            context,
+            callback,
+            LibcOperationKind::Lsearch {
+                key,
+                base,
+                elements,
+                width,
+                index: 0,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn start_bsearch<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<bool, BiosError> {
+        let key = context.argument(0);
+        let base = context.argument(1);
+        let elements = context.argument(2);
+        let width = context.argument(3);
+        self.check_array(base, elements, width)?;
+        if elements == 0 || width == 0 {
+            context.return_value(0);
+            return Ok(false);
+        }
+        let callback = read_word(memory, context.registers[SP], 16)?;
+        self.start_libc_operation(
+            context,
+            callback,
+            LibcOperationKind::Bsearch {
+                key,
+                base,
+                width,
+                low: 0,
+                high: elements,
+                middle: elements / 2,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn start_libc_operation(
+        &mut self,
+        context: &mut CpuContext,
+        callback: u32,
+        kind: LibcOperationKind,
+    ) -> Result<(), BiosError> {
+        if self.libc_operation.is_some() {
+            return Err(BiosError::CallbackDepth);
+        }
+        let mut operation = LibcOperation {
+            saved_context: context.clone(),
+            callback,
+            calls: 0,
+            kind,
+        };
+        self.prepare_libc_comparison(&mut operation, context)?;
+        self.libc_operation = Some(operation);
+        Ok(())
+    }
+
+    fn prepare_libc_comparison(
+        &self,
+        operation: &mut LibcOperation,
+        context: &mut CpuContext,
+    ) -> Result<(), BiosError> {
+        if operation.calls >= self.limits.libc_callback_calls {
+            return Err(BiosError::LibcCallbackLimit {
+                limit: self.limits.libc_callback_calls,
+            });
+        }
+        operation.calls += 1;
+        let (left, right) = match operation.kind {
+            LibcOperationKind::Qsort {
+                base, width, inner, ..
+            } => (
+                element_address(base, inner.saturating_sub(1), width)?,
+                element_address(base, inner, width)?,
+            ),
+            LibcOperationKind::Lsearch {
+                key,
+                base,
+                width,
+                index,
+                ..
+            } => (key, element_address(base, index, width)?),
+            LibcOperationKind::Bsearch {
+                key,
+                base,
+                width,
+                middle,
+                ..
+            } => (key, element_address(base, middle, width)?),
+        };
+        *context = operation.saved_context.clone();
+        context.pc = operation.callback;
+        context.registers[A0] = left;
+        context.registers[A0 + 1] = right;
+        context.registers[RA] = CALLBACK_RETURN_PC;
+        Ok(())
+    }
+
+    fn check_array(&self, base: u32, elements: u32, width: u32) -> Result<(), BiosError> {
+        let size = elements
+            .checked_mul(width)
+            .ok_or(BiosError::AddressOverflow)?;
+        self.check_memory_size(size)?;
+        base.checked_add(size).ok_or(BiosError::AddressOverflow)?;
+        Ok(())
     }
 
     fn open<M: GuestMemory>(
@@ -747,9 +1156,73 @@ impl BiosHle {
             context.return_value(0);
             return Ok(6);
         }
+        let parsed = self.parse_integer(memory, source, context.argument(2), false, false)?;
+        if context.argument(1) != 0 {
+            write_word(memory, context.argument(1), 0, parsed.end)?;
+        }
+        context.return_value(parsed.value);
+        Ok(memory_cycles(parsed.bytes_read).saturating_add(8))
+    }
 
-        let end_pointer = context.argument(1);
-        let requested_base = context.argument(2);
+    fn strtol<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(6);
+        }
+        let parsed = self.parse_integer(memory, source, context.argument(2), true, false)?;
+        if context.argument(1) != 0 {
+            write_word(memory, context.argument(1), 0, parsed.end)?;
+        }
+        context.return_value(parsed.value);
+        Ok(memory_cycles(parsed.bytes_read).saturating_add(8))
+    }
+
+    fn atoi<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(6);
+        }
+        let parsed = self.parse_integer(memory, source, 10, true, true)?;
+        context.return_value(parsed.value);
+        Ok(memory_cycles(parsed.bytes_read).saturating_add(8))
+    }
+
+    fn atob<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(6);
+        }
+        let parsed = self.parse_integer(memory, source, 10, true, false)?;
+        if context.argument(1) != 0 {
+            write_word(memory, context.argument(1), 0, parsed.value)?;
+        }
+        context.return_value(parsed.end);
+        Ok(memory_cycles(parsed.bytes_read).saturating_add(10))
+    }
+
+    fn parse_integer<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        source: u32,
+        requested_base: u32,
+        signed: bool,
+        zero_octal: bool,
+    ) -> Result<ParsedInteger, BiosError> {
         let mut base = if (2..=36).contains(&requested_base) {
             requested_base
         } else {
@@ -763,6 +1236,10 @@ impl BiosHle {
             offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
         }
 
+        let negative = signed && self.read_string_byte(memory, source, offset)? == b'-';
+        if negative {
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
         let first = self.read_string_byte(memory, source, offset)?;
         let second = if first == b'0' {
             Some(self.read_string_byte(
@@ -779,7 +1256,7 @@ impl BiosHle {
         } else if matches!(second, Some(b'x' | b'X')) {
             base = 16;
             offset = offset.checked_add(2).ok_or(BiosError::AddressOverflow)?;
-        } else if matches!(first, b'o' | b'O') {
+        } else if (zero_octal && first == b'0') || matches!(first, b'o' | b'O') {
             base = 8;
             offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
         }
@@ -797,27 +1274,64 @@ impl BiosHle {
             offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
         }
 
-        if end_pointer != 0 {
-            let end = source
+        let value = if negative {
+            0_u32.wrapping_sub(result)
+        } else {
+            result
+        };
+        Ok(ParsedInteger {
+            value,
+            end: source
                 .checked_add(offset)
-                .ok_or(BiosError::AddressOverflow)?;
-            for (byte_offset, byte) in end.to_le_bytes().into_iter().enumerate() {
-                write_byte(
-                    memory,
-                    end_pointer,
-                    u32::try_from(byte_offset).map_err(|_| BiosError::AddressOverflow)?,
-                    byte,
-                )?;
-            }
+                .ok_or(BiosError::AddressOverflow)?,
+            bytes_read: offset.saturating_add(1),
+        })
+    }
+
+    fn to_digit(context: &mut CpuContext) -> u32 {
+        let byte = context.argument(0).to_le_bytes()[0];
+        context.return_value(ascii_digit(byte).unwrap_or(9_999_999));
+        6
+    }
+
+    fn absolute_value(context: &mut CpuContext) -> u32 {
+        let value = i32::from_ne_bytes(context.argument(0).to_ne_bytes());
+        context.return_value(u32::from_ne_bytes(value.wrapping_abs().to_ne_bytes()));
+        4
+    }
+
+    fn change_case(context: &mut CpuContext, uppercase: bool) -> u32 {
+        let mut byte = context.argument(0).to_le_bytes()[0];
+        if uppercase && byte.is_ascii_lowercase() {
+            byte = byte.to_ascii_uppercase();
+        } else if !uppercase && byte.is_ascii_uppercase() {
+            byte = byte.to_ascii_lowercase();
         }
-        context.return_value(result);
-        Ok(memory_cycles(offset.saturating_add(1)).saturating_add(8))
+        context.return_value(u32::from(byte));
+        4
     }
 
     fn strcat<M: GuestMemory>(
         &self,
         context: &mut CpuContext,
         memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        self.string_concat(context, memory, None)
+    }
+
+    fn strncat<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        self.string_concat(context, memory, Some(context.argument(2)))
+    }
+
+    fn string_concat<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+        maximum: Option<u32>,
     ) -> Result<u32, BiosError> {
         let destination = context.argument(0);
         let source = context.argument(1);
@@ -835,6 +1349,16 @@ impl BiosHle {
 
         let mut source_offset = 0_u32;
         loop {
+            if maximum.is_some_and(|maximum| source_offset >= maximum) {
+                let size = destination_length
+                    .checked_add(source_offset)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(BiosError::AddressOverflow)?;
+                self.check_memory_size(size)?;
+                write_byte(memory, destination, destination_length + source_offset, 0)?;
+                context.return_value(destination);
+                return Ok(memory_cycles(size));
+            }
             let size = destination_length
                 .checked_add(source_offset)
                 .and_then(|value| value.checked_add(1))
@@ -857,6 +1381,316 @@ impl BiosHle {
         }
     }
 
+    fn string_compare<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+        maximum: Option<u32>,
+    ) -> Result<u32, BiosError> {
+        let left = context.argument(0);
+        let right = context.argument(1);
+        let null_result = match (left == 0, right == 0) {
+            (true, true) => Some(0_i32),
+            (true, false) => Some(-1),
+            (false, true) => Some(1),
+            (false, false) => None,
+        };
+        if let Some(result) = null_result {
+            context.return_value(u32::from_ne_bytes(result.to_ne_bytes()));
+            return Ok(6);
+        }
+
+        let mut offset = 0_u32;
+        let result = loop {
+            if maximum.is_some_and(|maximum| offset >= maximum) {
+                break 0_i32;
+            }
+            let left_byte = self.read_string_byte(memory, left, offset)?;
+            let right_byte = self.read_string_byte(memory, right, offset)?;
+            if left_byte != right_byte {
+                break i32::from(i8::from_ne_bytes([left_byte]))
+                    - i32::from(i8::from_ne_bytes([right_byte]));
+            }
+            if left_byte == 0 {
+                break 0_i32;
+            }
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        };
+        context.return_value(u32::from_ne_bytes(result.to_ne_bytes()));
+        Ok(memory_cycles(offset.saturating_add(1)))
+    }
+
+    fn string_copy<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+        maximum: Option<u32>,
+    ) -> Result<u32, BiosError> {
+        let destination = context.argument(0);
+        let source = context.argument(1);
+        if destination == 0 || source == 0 {
+            context.return_value(0);
+            return Ok(6);
+        }
+        let limit = maximum.unwrap_or(self.limits.memory_operation_bytes);
+        self.check_memory_size(limit)?;
+        let mut terminated = false;
+        for offset in 0..limit {
+            let value = if terminated {
+                0
+            } else {
+                let value = self.read_string_byte(memory, source, offset)?;
+                terminated = value == 0;
+                value
+            };
+            write_byte(memory, destination, offset, value)?;
+            if maximum.is_none() && terminated {
+                context.return_value(destination);
+                return Ok(memory_cycles(offset.saturating_add(1)));
+            }
+        }
+        if maximum.is_none() {
+            return Err(BiosError::MemoryOperationLimit { size: limit, limit });
+        }
+        context.return_value(destination);
+        Ok(memory_cycles(limit))
+    }
+
+    fn string_length<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(4);
+        }
+        let mut length = 0_u32;
+        while self.read_string_byte(memory, source, length)? != 0 {
+            length = length.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+        context.return_value(length);
+        Ok(memory_cycles(length.saturating_add(1)))
+    }
+
+    fn string_character<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+        reverse: bool,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(4);
+        }
+        let target = context.argument(1).to_le_bytes()[0];
+        let mut offset = 0_u32;
+        let mut found = None;
+        loop {
+            let value = self.read_string_byte(memory, source, offset)?;
+            if value == target {
+                found = Some(
+                    source
+                        .checked_add(offset)
+                        .ok_or(BiosError::AddressOverflow)?,
+                );
+                if !reverse {
+                    break;
+                }
+            }
+            if value == 0 {
+                break;
+            }
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+        context.return_value(found.unwrap_or(0));
+        Ok(memory_cycles(offset.saturating_add(1)))
+    }
+
+    fn string_pbrk<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        let list = context.argument(1);
+        if source == 0 || list == 0 {
+            context.return_value(0);
+            return Ok(4);
+        }
+        let mut offset = 0_u32;
+        loop {
+            let value = self.read_string_byte(memory, source, offset)?;
+            if value == 0 {
+                context.return_value(0);
+                break;
+            }
+            if self.string_contains(memory, list, value)? {
+                context.return_value(
+                    source
+                        .checked_add(offset)
+                        .ok_or(BiosError::AddressOverflow)?,
+                );
+                break;
+            }
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+        Ok(memory_cycles(offset.saturating_add(1)))
+    }
+
+    fn string_span<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+        accept: bool,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        let list = context.argument(1);
+        if source == 0 {
+            context.return_value(0);
+            return Ok(4);
+        }
+        let mut offset = 0_u32;
+        loop {
+            let value = self.read_string_byte(memory, source, offset)?;
+            if value == 0 || self.string_contains(memory, list, value)? != accept {
+                break;
+            }
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+        context.return_value(offset);
+        Ok(memory_cycles(offset.saturating_add(1)))
+    }
+
+    fn string_token<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        let delimiters = context.argument(1);
+        if delimiters == 0 {
+            context.return_value(0);
+            return Ok(4);
+        }
+        if source != 0 {
+            let input = self.read_tty_string(memory, source, STRTOK_BUFFER_SIZE)?;
+            for (offset, value) in input.iter().copied().chain(std::iter::once(0)).enumerate() {
+                write_byte(
+                    memory,
+                    STRTOK_BUFFER_ADDRESS,
+                    u32::try_from(offset).map_err(|_| BiosError::AddressOverflow)?,
+                    value,
+                )?;
+            }
+            self.strtok_next = Some(STRTOK_BUFFER_ADDRESS);
+        }
+        let Some(mut cursor) = self.strtok_next else {
+            context.return_value(0);
+            return Ok(6);
+        };
+        let mut scanned = 0_u32;
+        loop {
+            let value = self.read_string_byte(memory, cursor, 0)?;
+            if value == 0 {
+                self.strtok_next = None;
+                context.return_value(0);
+                return Ok(memory_cycles(scanned.saturating_add(1)));
+            }
+            if !self.string_contains(memory, delimiters, value)? {
+                break;
+            }
+            cursor = cursor.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+            scanned = scanned.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+        let token = cursor;
+        loop {
+            let value = self.read_string_byte(memory, cursor, 0)?;
+            if value == 0 {
+                self.strtok_next = None;
+                break;
+            }
+            if self.string_contains(memory, delimiters, value)? {
+                write_byte(memory, cursor, 0, 0)?;
+                self.strtok_next = Some(cursor.checked_add(1).ok_or(BiosError::AddressOverflow)?);
+                break;
+            }
+            cursor = cursor.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+            scanned = scanned.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+            self.check_memory_size(scanned)?;
+        }
+        context.return_value(token);
+        Ok(memory_cycles(scanned.saturating_add(1)))
+    }
+
+    fn string_string<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let haystack = context.argument(0);
+        let needle_address = context.argument(1);
+        if haystack == 0 || needle_address == 0 {
+            context.return_value(0);
+            return Ok(4);
+        }
+        let needle =
+            self.read_tty_string(memory, needle_address, self.limits.memory_operation_bytes)?;
+        if needle.is_empty() {
+            context.return_value(haystack);
+            return Ok(4);
+        }
+        let mut offset = 0_u32;
+        'search: loop {
+            if self.read_string_byte(memory, haystack, offset)? == 0 {
+                context.return_value(0);
+                break;
+            }
+            for (needle_offset, expected) in needle.iter().copied().enumerate() {
+                let needle_offset =
+                    u32::try_from(needle_offset).map_err(|_| BiosError::AddressOverflow)?;
+                let candidate_offset = offset
+                    .checked_add(needle_offset)
+                    .ok_or(BiosError::AddressOverflow)?;
+                if self.read_string_byte(memory, haystack, candidate_offset)? != expected {
+                    offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+                    continue 'search;
+                }
+            }
+            context.return_value(
+                haystack
+                    .checked_add(offset)
+                    .ok_or(BiosError::AddressOverflow)?,
+            );
+            break;
+        }
+        Ok(memory_cycles(offset.saturating_add(1)))
+    }
+
+    fn string_contains<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        list: u32,
+        target: u8,
+    ) -> Result<bool, BiosError> {
+        if list == 0 {
+            return Ok(false);
+        }
+        let mut offset = 0_u32;
+        loop {
+            let value = self.read_string_byte(memory, list, offset)?;
+            if value == 0 {
+                return Ok(false);
+            }
+            if value == target {
+                return Ok(true);
+            }
+            offset = offset.checked_add(1).ok_or(BiosError::AddressOverflow)?;
+        }
+    }
+
     fn read_string_byte<M: GuestMemory>(
         &self,
         memory: &mut M,
@@ -870,6 +1704,53 @@ impl BiosHle {
             });
         }
         read_byte(memory, source, offset)
+    }
+
+    fn getchar(context: &mut CpuContext) -> u32 {
+        context.return_value(u32::MAX);
+        8
+    }
+
+    fn putchar(context: &mut CpuContext) -> u32 {
+        let value = context.argument(0).to_le_bytes()[0];
+        if value == b'\n' {
+            eprintln!("[PS1 BIOS TTY]");
+        } else if value.is_ascii_graphic() || value == b' ' || value == b'\t' {
+            eprintln!("[PS1 BIOS TTY] {}", char::from(value));
+        } else {
+            eprintln!("[PS1 BIOS TTY] <{value:02x}>");
+        }
+        context.return_value(u32::from(value));
+        8
+    }
+
+    fn gets<M: GuestMemory>(context: &mut CpuContext, memory: &mut M) -> Result<u32, BiosError> {
+        let destination = context.argument(0);
+        if destination != 0 {
+            write_byte(memory, destination, 0, 0)?;
+        }
+        context.return_value(destination);
+        Ok(8)
+    }
+
+    fn puts<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        let output = if source == 0 {
+            b"<NULL>".to_vec()
+        } else {
+            self.read_tty_string(memory, source, TTY_STRING_BYTES)?
+        };
+        if !output.is_empty() {
+            eprintln!("[PS1 BIOS TTY] {}", String::from_utf8_lossy(&output));
+        }
+        context.return_value(u32::try_from(output.len()).unwrap_or(u32::MAX));
+        Ok(memory_cycles(
+            u32::try_from(output.len()).unwrap_or(u32::MAX),
+        ))
     }
 
     fn printf<M: GuestMemory>(
@@ -1019,6 +1900,33 @@ impl BiosHle {
         Ok(memory_cycles(BUFFER_SIZE))
     }
 
+    fn longjmp<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        const BUFFER_SIZE: u32 = 48;
+
+        self.check_memory_size(BUFFER_SIZE)?;
+        let buffer = context.argument(0);
+        let value = context.argument(1);
+        let mut saved = [0_u32; 12];
+        for (index, word) in saved.iter_mut().enumerate() {
+            let offset = u32::try_from(index)
+                .map_err(|_| BiosError::AddressOverflow)?
+                .checked_mul(4)
+                .ok_or(BiosError::AddressOverflow)?;
+            *word = read_word(memory, buffer, offset)?;
+        }
+        context.registers[RA] = saved[0];
+        context.registers[SP] = saved[1];
+        context.registers[FP] = saved[2];
+        context.registers[S0..S0 + 8].copy_from_slice(&saved[3..11]);
+        context.registers[GP] = saved[11];
+        context.return_value(value);
+        Ok(memory_cycles(BUFFER_SIZE))
+    }
+
     fn memory_set<M: GuestMemory>(
         &self,
         context: &mut CpuContext,
@@ -1057,6 +1965,28 @@ impl BiosHle {
         Ok(memory_cycles(size))
     }
 
+    fn memory_character<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let source = context.argument(0);
+        let target = context.argument(1).to_le_bytes()[0];
+        let size = context.argument(2);
+        self.check_memory_size(size)?;
+        let mut result = 0_u32;
+        for offset in 0..size {
+            if read_byte(memory, source, offset)? == target {
+                result = source
+                    .checked_add(offset)
+                    .ok_or(BiosError::AddressOverflow)?;
+                break;
+            }
+        }
+        context.return_value(result);
+        Ok(memory_cycles(size))
+    }
+
     fn check_memory_size(&self, size: u32) -> Result<(), BiosError> {
         if size > self.limits.memory_operation_bytes {
             return Err(BiosError::MemoryOperationLimit {
@@ -1078,25 +2008,67 @@ impl BiosHle {
                 size: context.argument(1),
             });
         }
-        self.heap = Some(Heap { end, next: base });
+        self.heap = Some(Heap {
+            base,
+            end,
+            blocks: Vec::new(),
+        });
         context.return_value(base);
         Ok(20)
     }
 
     fn malloc(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
         let size = context.argument(0);
+        let address = self.allocate(size)?;
+        context.return_value(address);
+        Ok(12)
+    }
+
+    fn allocate(&mut self, size: u32) -> Result<u32, BiosError> {
+        let allocation_size = align_up(size.max(1), 8)?;
         let heap = self.heap.as_mut().ok_or(BiosError::HeapUnavailable)?;
-        let start = heap.next;
-        let next = align_up(
-            start.checked_add(size).ok_or(BiosError::AddressOverflow)?,
-            8,
-        )?;
-        if next > heap.end {
+        let mut address = heap.base;
+        let mut insertion = heap.blocks.len();
+        for (index, block) in heap.blocks.iter().copied().enumerate() {
+            let candidate_end = address
+                .checked_add(allocation_size)
+                .ok_or(BiosError::AddressOverflow)?;
+            if candidate_end <= block.address {
+                insertion = index;
+                break;
+            }
+            address = block
+                .address
+                .checked_add(block.size)
+                .ok_or(BiosError::AddressOverflow)?;
+        }
+        let allocation_end = address
+            .checked_add(allocation_size)
+            .ok_or(BiosError::AddressOverflow)?;
+        if allocation_end > heap.end {
             return Err(BiosError::OutOfMemory { size });
         }
-        heap.next = next;
-        context.return_value(start);
-        Ok(12)
+        heap.blocks.insert(
+            insertion,
+            HeapBlock {
+                address,
+                size: allocation_size,
+            },
+        );
+        Ok(address)
+    }
+
+    fn free(&mut self, context: &mut CpuContext) -> u32 {
+        let address = context.argument(0);
+        if let Some(heap) = self.heap.as_mut()
+            && let Some(index) = heap
+                .blocks
+                .iter()
+                .position(|block| block.address == address)
+        {
+            heap.blocks.remove(index);
+        }
+        6
     }
 
     fn calloc<M: GuestMemory>(
@@ -1118,6 +2090,71 @@ impl BiosHle {
         }
         context.return_value(destination);
         Ok(memory_cycles(size).saturating_add(12))
+    }
+
+    fn realloc<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let old_address = context.argument(0);
+        let new_size = context.argument(1);
+        self.check_memory_size(new_size)?;
+        if old_address == 0 {
+            let address = self.allocate(new_size)?;
+            context.return_value(address);
+            return Ok(12);
+        }
+        if new_size == 0 {
+            self.free(context);
+            context.return_value(0);
+            return Ok(8);
+        }
+
+        let new_allocation_size = align_up(new_size.max(1), 8)?;
+        let (index, old_size, following_address) = {
+            let heap = self.heap.as_ref().ok_or(BiosError::HeapUnavailable)?;
+            let Some(index) = heap
+                .blocks
+                .iter()
+                .position(|block| block.address == old_address)
+            else {
+                context.return_value(0);
+                return Ok(8);
+            };
+            let following_address = heap
+                .blocks
+                .get(index + 1)
+                .map_or(heap.end, |block| block.address);
+            (index, heap.blocks[index].size, following_address)
+        };
+        if old_address
+            .checked_add(new_allocation_size)
+            .ok_or(BiosError::AddressOverflow)?
+            <= following_address
+        {
+            let heap = self.heap.as_mut().ok_or(BiosError::HeapUnavailable)?;
+            heap.blocks[index].size = new_allocation_size;
+            context.return_value(old_address);
+            return Ok(10);
+        }
+
+        let new_address = self.allocate(new_size)?;
+        let copied = old_size.min(new_size);
+        for offset in 0..copied {
+            let value = read_byte(memory, old_address, offset)?;
+            write_byte(memory, new_address, offset, value)?;
+        }
+        if let Some(heap) = self.heap.as_mut()
+            && let Some(index) = heap
+                .blocks
+                .iter()
+                .position(|block| block.address == old_address)
+        {
+            heap.blocks.remove(index);
+        }
+        context.return_value(new_address);
+        Ok(memory_cycles(copied).saturating_add(16))
     }
 
     fn open_event(&mut self, context: &mut CpuContext) -> u32 {
@@ -1293,6 +2330,19 @@ fn read_word<M: GuestMemory>(memory: &mut M, base: u32, offset: u32) -> Result<u
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn write_word<M: GuestMemory>(
+    memory: &mut M,
+    base: u32,
+    offset: u32,
+    value: u32,
+) -> Result<(), BiosError> {
+    for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+        let byte_offset = u32::try_from(index).map_err(|_| BiosError::AddressOverflow)?;
+        write_byte(memory, base, offset + byte_offset, byte)?;
+    }
+    Ok(())
+}
+
 fn printf_argument<M: GuestMemory>(
     context: &CpuContext,
     memory: &mut M,
@@ -1332,6 +2382,11 @@ fn memory_cycles(size: u32) -> u32 {
     8_u32.saturating_add(size.saturating_mul(2))
 }
 
+fn element_address(base: u32, index: u32, width: u32) -> Result<u32, BiosError> {
+    base.checked_add(index.checked_mul(width).ok_or(BiosError::AddressOverflow)?)
+        .ok_or(BiosError::AddressOverflow)
+}
+
 fn ascii_digit(byte: u8) -> Option<u32> {
     match byte {
         b'0'..=b'9' => Some(u32::from(byte - b'0')),
@@ -1352,7 +2407,7 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, BiosError> {
 mod tests {
     use super::{
         A0, BiosError, BiosHle, BiosVector, CpuContext, FP, GP, GuestMemory, GuestMemoryError,
-        HleAction, HleLimits, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP, T1, V0,
+        HleAction, HleLimits, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP, STRTOK_BUFFER_ADDRESS, T1, V0,
     };
 
     struct Memory(Vec<u8>);
@@ -1576,6 +2631,91 @@ mod tests {
     }
 
     #[test]
+    fn signed_integer_and_character_conversions_match_the_bios_contract() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 160]);
+        memory.0[16..24].copy_from_slice(b" -0x2a!\0");
+        let (signed, _) =
+            call(&mut bios, BiosVector::A0, 0x0d, [16, 8, 10, 0], &mut memory).unwrap();
+        assert_eq!(
+            signed.register(V0),
+            Some(u32::from_ne_bytes((-42_i32).to_ne_bytes()))
+        );
+        assert_eq!(u32::from_le_bytes(memory.0[8..12].try_into().unwrap()), 22);
+
+        memory.0[32..36].copy_from_slice(b"077\0");
+        let (decimal, _) =
+            call(&mut bios, BiosVector::A0, 0x10, [32, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(decimal.register(V0), Some(63));
+
+        memory.0[48..53].copy_from_slice(b"123z\0");
+        let (converted, _) =
+            call(&mut bios, BiosVector::A0, 0x12, [48, 80, 0, 0], &mut memory).unwrap();
+        assert_eq!(converted.register(V0), Some(51));
+        assert_eq!(
+            u32::from_le_bytes(memory.0[80..84].try_into().unwrap()),
+            123
+        );
+
+        let (digit, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x0a,
+            [u32::from(b'Z'), 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(digit.register(V0), Some(35));
+        let (upper, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x25,
+            [u32::from(b'q'), 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(upper.register(V0), Some(u32::from(b'Q')));
+        let (absolute, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x0e,
+            [u32::from_ne_bytes((-19_i32).to_ne_bytes()), 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(absolute.register(V0), Some(19));
+    }
+
+    #[test]
+    fn longjmp_restores_the_saved_context_and_exact_value() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 128]);
+        let mut saved = CpuContext::reset(0x00a0, 0x1111_2222);
+        saved.set_register(A0, 64);
+        saved.set_register(T1, 0x13);
+        saved.set_register(RA, 0x3333_4444);
+        saved.set_register(FP, 0x5555_6666);
+        saved.set_register(GP, 0x7777_8888);
+        saved.set_register(S0 + 3, 0x9999_aaaa);
+        bios.dispatch(BiosVector::A0, &mut saved, &mut memory)
+            .unwrap();
+
+        let mut restored = CpuContext::reset(0x00a0, 0xbbbb_cccc);
+        restored.set_register(A0, 64);
+        restored.set_register(A0 + 1, 7);
+        restored.set_register(T1, 0x14);
+        restored.set_register(RA, 0xdddd_eeee);
+        bios.dispatch(BiosVector::A0, &mut restored, &mut memory)
+            .unwrap();
+        assert_eq!(restored.pc, 0x3333_4444);
+        assert_eq!(restored.register(V0), Some(7));
+        assert_eq!(restored.register(SP), Some(0x1111_2222));
+        assert_eq!(restored.register(FP), Some(0x5555_6666));
+        assert_eq!(restored.register(GP), Some(0x7777_8888));
+        assert_eq!(restored.register(S0 + 3), Some(0x9999_aaaa));
+    }
+
+    #[test]
     fn strcat_appends_the_terminator_and_returns_the_destination() {
         let mut bios = BiosHle::default();
         let mut memory = Memory(vec![0; 64]);
@@ -1589,6 +2729,132 @@ mod tests {
         let (context, _) =
             call(&mut bios, BiosVector::A0, 0x15, [0, 32, 0, 0], &mut memory).unwrap();
         assert_eq!(context.register(V0), Some(0));
+    }
+
+    #[test]
+    fn bounded_string_copy_compare_search_and_span_are_complete() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0xaa; 1024]);
+        memory.0[32..38].copy_from_slice(b"alpha\0");
+        memory.0[64..69].copy_from_slice(b"bet!\0");
+        call(&mut bios, BiosVector::A0, 0x16, [32, 64, 3, 0], &mut memory).unwrap();
+        assert_eq!(&memory.0[32..41], b"alphabet\0");
+
+        memory.0[96..102].copy_from_slice(b"alpha\0");
+        let (equal, _) =
+            call(&mut bios, BiosVector::A0, 0x18, [32, 96, 5, 0], &mut memory).unwrap();
+        assert_eq!(equal.register(V0), Some(0));
+        let (ordered, _) =
+            call(&mut bios, BiosVector::A0, 0x17, [32, 96, 0, 0], &mut memory).unwrap();
+        assert!(i32::from_ne_bytes(ordered.register(V0).unwrap().to_ne_bytes()) > 0);
+
+        call(
+            &mut bios,
+            BiosVector::A0,
+            0x1a,
+            [128, 96, 8, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(&memory.0[128..136], b"alpha\0\0\0");
+        let (length, _) =
+            call(&mut bios, BiosVector::A0, 0x1b, [32, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(length.register(V0), Some(8));
+
+        let (first, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x1c,
+            [32, u32::from(b'a'), 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let (last, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x1f,
+            [32, u32::from(b'a'), 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(first.register(V0), Some(32));
+        assert_eq!(last.register(V0), Some(36));
+
+        memory.0[160..164].copy_from_slice(b"xyz\0");
+        let (pbrk, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x20,
+            [32, 160, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(pbrk.register(V0), Some(0));
+        memory.0[176..180].copy_from_slice(b"alp\0");
+        let (span, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x21,
+            [32, 176, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(span.register(V0), Some(3));
+        let (complement, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x22,
+            [32, 160, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(complement.register(V0), Some(8));
+
+        memory.0[192..196].copy_from_slice(b"bet\0");
+        let (substring, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x24,
+            [32, 192, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(substring.register(V0), Some(37));
+    }
+
+    #[test]
+    fn strtok_uses_bounded_guest_visible_storage() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 0xc200]);
+        memory.0[64..79].copy_from_slice(b"  one,two,,end\0");
+        memory.0[32..35].copy_from_slice(b" ,\0");
+        let mut tokens = Vec::new();
+        let mut source = 64;
+        loop {
+            let (context, _) = call(
+                &mut bios,
+                BiosVector::A0,
+                0x23,
+                [source, 32, 0, 0],
+                &mut memory,
+            )
+            .unwrap();
+            source = 0;
+            let address = context.register(V0).unwrap();
+            if address == 0 {
+                break;
+            }
+            let start = usize::try_from(address).unwrap();
+            let end = memory.0[start..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|length| start + length)
+                .unwrap();
+            tokens.push(memory.0[start..end].to_vec());
+        }
+        assert_eq!(tokens, [b"one".to_vec(), b"two".to_vec(), b"end".to_vec()]);
+        assert_eq!(STRTOK_BUFFER_ADDRESS, 0xc000);
+        assert_eq!(&memory.0[64..79], b"  one,two,,end\0");
     }
 
     #[test]
@@ -1624,6 +2890,171 @@ mod tests {
         call(&mut bios, BiosVector::A0, 0x30, [7, 0, 0, 0], &mut memory).unwrap();
         let (random, _) = call(&mut bios, BiosVector::A0, 0x2f, [0; 4], &mut memory).unwrap();
         assert_eq!(random.register(V0), Some(19_564));
+    }
+
+    #[test]
+    fn legacy_memory_aliases_and_realloc_are_functional() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0xaa; 512]);
+        memory.0[16..24].copy_from_slice(b"abcdefgh");
+        let (copied, _) =
+            call(&mut bios, BiosVector::A0, 0x27, [16, 32, 8, 0], &mut memory).unwrap();
+        assert_eq!(copied.register(V0), Some(16));
+        assert_eq!(&memory.0[32..40], b"abcdefgh");
+        call(&mut bios, BiosVector::A0, 0x28, [34, 3, 0, 0], &mut memory).unwrap();
+        assert_eq!(&memory.0[32..40], b"ab\0\0\0fgh");
+        let (found, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x2e,
+            [32, u32::from(b'f'), 8, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(found.register(V0), Some(37));
+
+        call(
+            &mut bios,
+            BiosVector::A0,
+            0x39,
+            [0x100, 0x100, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let (first, _) = call(&mut bios, BiosVector::A0, 0x33, [16, 0, 0, 0], &mut memory).unwrap();
+        let (second, _) =
+            call(&mut bios, BiosVector::A0, 0x33, [16, 0, 0, 0], &mut memory).unwrap();
+        let (third, _) = call(&mut bios, BiosVector::A0, 0x33, [16, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(first.register(V0), Some(0x100));
+        assert_eq!(second.register(V0), Some(0x110));
+        assert_eq!(third.register(V0), Some(0x120));
+        memory.0[0x110..0x120].copy_from_slice(b"preserved bytes!");
+        let (moved, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x38,
+            [0x110, 24, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(moved.register(V0), Some(0x130));
+        assert_eq!(&memory.0[0x130..0x140], b"preserved bytes!");
+        call(
+            &mut bios,
+            BiosVector::A0,
+            0x34,
+            [0x100, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let (reused, _) = call(&mut bios, BiosVector::A0, 0x33, [8, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(reused.register(V0), Some(0x100));
+    }
+
+    fn finish_byte_comparisons(
+        bios: &mut BiosHle,
+        memory: &mut Memory,
+        mut context: CpuContext,
+        mut outcome: super::HleOutcome,
+    ) -> CpuContext {
+        while outcome.action == HleAction::Call {
+            let left = usize::try_from(context.register(A0).unwrap()).unwrap();
+            let right = usize::try_from(context.register(A0 + 1).unwrap()).unwrap();
+            let result = i32::from(memory.0[left]) - i32::from(memory.0[right]);
+            context.set_register(V0, u32::from_ne_bytes(result.to_ne_bytes()));
+            outcome = bios.resume_libc_callback(&mut context, memory).unwrap();
+        }
+        context
+    }
+
+    #[test]
+    fn callback_backed_sort_and_search_resume_to_the_original_caller() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 0x8020]);
+        memory.0[0x100..0x105].copy_from_slice(&[4, 1, 3, 2, 5]);
+        let (context, outcome) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x31,
+            [0x100, 5, 1, 0x3000],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(context.pc, 0x3000);
+        assert_eq!(context.register(RA), Some(BiosHle::callback_return_pc()));
+        let context = finish_byte_comparisons(&mut bios, &mut memory, context, outcome);
+        assert_eq!(&memory.0[0x100..0x105], &[1, 2, 3, 4, 5]);
+        assert_eq!(context.pc, 0x2000);
+
+        memory.0[0x80] = 3;
+        memory.0[0x8010..0x8014].copy_from_slice(&0x3000_u32.to_le_bytes());
+        let (context, outcome) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x35,
+            [0x80, 0x100, 5, 1],
+            &mut memory,
+        )
+        .unwrap();
+        let context = finish_byte_comparisons(&mut bios, &mut memory, context, outcome);
+        assert_eq!(context.register(V0), Some(0x102));
+        assert_eq!(context.pc, 0x2000);
+
+        memory.0[0x80] = 6;
+        let (context, outcome) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x36,
+            [0x80, 0x100, 5, 1],
+            &mut memory,
+        )
+        .unwrap();
+        let context = finish_byte_comparisons(&mut bios, &mut memory, context, outcome);
+        assert_eq!(context.register(V0), Some(0));
+        assert_eq!(context.pc, 0x2000);
+    }
+
+    #[test]
+    fn libc_aliases_and_tty_fallbacks_dispatch_without_firmware() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 0x8020]);
+        memory.0[32..38].copy_from_slice(b"hello\0");
+        let (copied, _) =
+            call(&mut bios, BiosVector::A0, 0x19, [64, 32, 0, 0], &mut memory).unwrap();
+        assert_eq!(copied.register(V0), Some(64));
+        assert_eq!(&memory.0[64..70], b"hello\0");
+        for function in [0x1c, 0x1e] {
+            let (found, _) = call(
+                &mut bios,
+                BiosVector::A0,
+                function,
+                [64, u32::from(b'e'), 0, 0],
+                &mut memory,
+            )
+            .unwrap();
+            assert_eq!(found.register(V0), Some(65));
+        }
+        let (lower, _) = call(
+            &mut bios,
+            BiosVector::A0,
+            0x26,
+            [u32::from(b'K'), 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(lower.register(V0), Some(u32::from(b'k')));
+        let (compared, _) =
+            call(&mut bios, BiosVector::A0, 0x29, [32, 64, 6, 0], &mut memory).unwrap();
+        assert_eq!(compared.register(V0), Some(0));
+
+        let (input, _) = call(&mut bios, BiosVector::A0, 0x3b, [0; 4], &mut memory).unwrap();
+        assert_eq!(input.register(V0), Some(u32::MAX));
+        let (line, _) = call(&mut bios, BiosVector::A0, 0x3d, [96, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(line.register(V0), Some(96));
+        assert_eq!(memory.0[96], 0);
+        let (output, _) =
+            call(&mut bios, BiosVector::B0, 0x3f, [32, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(output.register(V0), Some(5));
     }
 
     #[test]
@@ -1843,6 +3274,18 @@ mod tests {
             call(&mut bios, BiosVector::A0, 0xff, [0; 4], &mut memory),
             Err(BiosError::UnsupportedCall { .. })
         ));
+        for broken_cop1_function in [0x0b, 0x32] {
+            assert!(matches!(
+                call(
+                    &mut bios,
+                    BiosVector::A0,
+                    broken_cop1_function,
+                    [0; 4],
+                    &mut memory
+                ),
+                Err(BiosError::UnsupportedCall { .. })
+            ));
+        }
         let mut context = CpuContext::reset(0x1234, 0);
         assert_eq!(
             bios.dispatch_syscall(99, &mut context),

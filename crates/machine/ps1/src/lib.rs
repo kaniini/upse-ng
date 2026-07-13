@@ -81,6 +81,8 @@ pub enum MachineStepKind {
     Syscall(u32),
     /// One deferred event callback context was restored.
     CallbackReturn,
+    /// One comparator callback resumed or completed a libc HLE routine.
+    LibcCallback,
     /// One default BIOS hardware interrupt handler returned from exception.
     Interrupt(InterruptSource),
     /// A side-effect-free guest idle loop advanced emulated time.
@@ -198,6 +200,7 @@ struct MachineState {
     deferred_device_ticks: u64,
     pending_audio: VecDeque<i16>,
     callback_cpu: Option<Cpu>,
+    libc_cpu: Option<Cpu>,
     interrupt_cpu: Option<Cpu>,
     trace_events: bool,
     event_log: Vec<MachineEvent>,
@@ -255,6 +258,7 @@ impl Ps1Machine {
             deferred_device_ticks: 0,
             pending_audio: VecDeque::new(),
             callback_cpu: None,
+            libc_cpu: None,
             interrupt_cpu: None,
             trace_events: config.trace_events,
             event_log: Vec::new(),
@@ -304,6 +308,29 @@ impl Ps1Machine {
 
     fn step_inner(&mut self, synchronize_devices: bool) -> Result<MachineStep, MachineError> {
         if self.state.cpu.pc() == BiosHle::callback_return_pc() {
+            if self.state.bios.libc_callback_active() {
+                let mut context = cpu_context(&self.state.cpu);
+                let outcome = {
+                    let mut memory = BiosMemory(&mut self.state.memory);
+                    self.state
+                        .bios
+                        .resume_libc_callback(&mut context, &mut memory)?
+                };
+                self.state.cpu = self
+                    .state
+                    .libc_cpu
+                    .clone()
+                    .ok_or(MachineError::CallbackCpuState)?;
+                apply_context(&mut self.state.cpu, &context);
+                if outcome.action != HleAction::Call {
+                    self.state.libc_cpu = None;
+                }
+                self.advance_devices(outcome.cycles, synchronize_devices)?;
+                return Ok(MachineStep {
+                    cycles: outcome.cycles,
+                    kind: MachineStepKind::LibcCallback,
+                });
+            }
             let mut context = cpu_context(&self.state.cpu);
             self.state.bios.return_from_callback(&mut context)?;
             self.state.cpu = self
@@ -319,6 +346,7 @@ impl Ps1Machine {
         }
         if self.state.interrupt_cpu.is_none()
             && self.state.callback_cpu.is_none()
+            && self.state.libc_cpu.is_none()
             && self.state.bios.interrupts_enabled()
             && self.state.irq.pending()
         {
@@ -465,6 +493,7 @@ impl Ps1Machine {
     }
 
     fn step_bios(&mut self, vector: BiosVector) -> Result<MachineStep, MachineError> {
+        let saved_cpu = self.state.cpu.clone();
         let mut context = cpu_context(&self.state.cpu);
         let function = context.register(9).unwrap_or(0).to_le_bytes()[0];
         let arguments: [u32; 4] =
@@ -485,7 +514,10 @@ impl Ps1Machine {
                     source,
                 })?
         };
-        if outcome.action == HleAction::ReturnFromException {
+        if outcome.action == HleAction::Call {
+            self.state.libc_cpu = Some(saved_cpu);
+            apply_context(&mut self.state.cpu, &context);
+        } else if outcome.action == HleAction::ReturnFromException {
             if let Some(saved_cpu) = self.state.interrupt_cpu.take() {
                 self.state.cpu = saved_cpu;
             } else {
@@ -1143,6 +1175,64 @@ mod tests {
         assert_eq!(outcome.kind, MachineStepKind::Syscall(2));
         assert_eq!(machine.pc(), 0x8001_0200);
         assert!(machine.state.bios.interrupts_enabled());
+    }
+
+    #[test]
+    fn libc_comparator_callbacks_execute_as_guest_code_and_resume_hle() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let callback = 0x8001_0200;
+        let caller = 0x8001_0300;
+        let array = 0x8001_0400;
+        let callback_words = [
+            (0x24 << 26) | (4 << 21) | (2 << 16),
+            (0x24 << 26) | (5 << 21) | (3 << 16),
+            (2 << 21) | (3 << 16) | (2 << 11) | 0x23,
+            (31 << 21) | 8,
+            0,
+        ];
+        for (index, word) in callback_words.into_iter().enumerate() {
+            machine
+                .state
+                .memory
+                .write_u32(callback + u32::try_from(index * 4).unwrap(), word)
+                .unwrap();
+        }
+        for (offset, value) in [4, 1, 3, 2].into_iter().enumerate() {
+            machine
+                .state
+                .memory
+                .write_u8(array + u32::try_from(offset).unwrap(), value)
+                .unwrap();
+        }
+        machine.state.cpu.set_register(4, array);
+        machine.state.cpu.set_register(5, 4);
+        machine.state.cpu.set_register(6, 1);
+        machine.state.cpu.set_register(7, callback);
+        machine.state.cpu.set_register(9, 0x31);
+        machine.state.cpu.set_register(31, caller);
+        machine.state.cpu.set_pc(0x0000_00a0);
+
+        assert_eq!(
+            machine.step().unwrap().kind,
+            MachineStepKind::Bios(super::BiosVector::A0)
+        );
+        assert_eq!(machine.pc(), callback);
+        let mut resumed = 0;
+        for _ in 0..100 {
+            if machine.pc() == caller {
+                break;
+            }
+            if machine.step().unwrap().kind == MachineStepKind::LibcCallback {
+                resumed += 1;
+            }
+        }
+        assert_eq!(machine.pc(), caller);
+        assert!(resumed > 0);
+        let sorted: Vec<u8> = (0..4)
+            .map(|offset| machine.state.memory.read_u8(array + offset).unwrap())
+            .collect();
+        assert_eq!(sorted, [1, 2, 3, 4]);
     }
 
     #[test]
