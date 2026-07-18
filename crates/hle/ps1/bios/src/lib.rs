@@ -27,6 +27,18 @@ const RESIDENT_FILE_DESCRIPTOR: u32 = 3;
 const RAM_SIZE_ADDRESS: u32 = 0x0000_0060;
 const STRTOK_BUFFER_ADDRESS: u32 = 0x0000_c000;
 const STRTOK_BUFFER_SIZE: u32 = 256;
+const B0_TABLE_ADDRESS: u32 = 0x0000_0500;
+const C0_TABLE_ADDRESS: u32 = 0x0000_0900;
+const B0_STUB_ADDRESS: u32 = 0x0000_1000;
+const C0_STUB_ADDRESS: u32 = 0x0000_1c00;
+// Games inspect and patch these two routines by fixed offsets. Keep their
+// writable synthetic bodies separate from the generic HLE jump stubs and from
+// user RAM, which begins at 0x10000.
+const C0_EXCEPTION_STUB_ADDRESS: u32 = 0x0000_4000;
+const B0_CHANGE_CLEAR_PAD_STUB_ADDRESS: u32 = 0x0000_5000;
+const BIOS_PATCH_SCRATCH_ADDRESS: u32 = 0x0000_df80;
+const BIOS_TABLE_ENTRIES: u32 = 256;
+const BIOS_STUB_BYTES: u32 = 12;
 
 /// BIOS call-table vector intercepted by the machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +334,15 @@ struct ResidentFile {
     position: u32,
 }
 
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CardState {
+    initialized: bool,
+    started: bool,
+    pad_enabled: bool,
+    backup_unit_initialized: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParsedInteger {
     value: u32,
@@ -372,10 +393,13 @@ pub struct BiosHle {
     callback_stack: Vec<CpuContext>,
     heap: Option<Heap>,
     resident_file: Option<ResidentFile>,
+    card: CardState,
+    b0_table_installed: bool,
+    c0_table_installed: bool,
     strtok_next: Option<u32>,
     libc_operation: Option<LibcOperation>,
     random_state: u32,
-    critical_depth: u32,
+    interrupts_enabled: bool,
     interrupt_hook: Option<u32>,
     interrupt_queues: [u32; INTERRUPT_PRIORITIES],
     clear_root_counter: [bool; 4],
@@ -398,10 +422,13 @@ impl BiosHle {
             callback_stack: Vec::new(),
             heap: None,
             resident_file: None,
+            card: CardState::default(),
+            b0_table_installed: false,
+            c0_table_installed: false,
             strtok_next: None,
             libc_operation: None,
             random_state: 1,
-            critical_depth: 0,
+            interrupts_enabled: true,
             interrupt_hook: None,
             interrupt_queues: [0; INTERRUPT_PRIORITIES],
             clear_root_counter: [true; 4],
@@ -469,6 +496,7 @@ impl BiosHle {
             (BiosVector::A0, 0x27) => self.bcopy(context, memory)?,
             (BiosVector::A0, 0x28) => self.bzero(context, memory)?,
             (BiosVector::A0, 0x29 | 0x2d) => self.memory_compare(context, memory)?,
+            (BiosVector::A0, 0x55 | 0x70) => self.initialize_backup_unit(),
             (BiosVector::A0, 0x72) => 10,
             (BiosVector::A0, 0x2a) => self.memory_copy(context, memory, false)?,
             (BiosVector::A0, 0x2b) => self.memory_set(context, memory)?,
@@ -519,6 +547,7 @@ impl BiosHle {
             (BiosVector::A0, 0x3d) | (BiosVector::B0, 0x3e) => Self::gets(context, memory)?,
             (BiosVector::A0, 0x3e) | (BiosVector::B0, 0x3f) => self.puts(context, memory)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
+            (BiosVector::A0, 0x44) => 12,
             (BiosVector::A0, 0x9f) => Self::set_memory_size(context, memory)?,
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
@@ -549,6 +578,11 @@ impl BiosHle {
                 8
             }
             (BiosVector::B0, 0x20) => self.undeliver_event(context),
+            (BiosVector::B0, 0x4a) => self.initialize_card(context),
+            (BiosVector::B0, 0x4b) => self.start_card(),
+            (BiosVector::B0, 0x4c) => self.stop_card(),
+            (BiosVector::B0, 0x56) => self.get_function_table(context, memory, BiosVector::C0)?,
+            (BiosVector::B0, 0x57) => self.get_function_table(context, memory, BiosVector::B0)?,
             (BiosVector::B0, 0x5b) => 6,
             (BiosVector::C0, 0x02) => self.enqueue_interrupt(context)?,
             (BiosVector::C0, 0x03) => self.dequeue_interrupt(context)?,
@@ -579,16 +613,13 @@ impl BiosHle {
     ) -> Result<HleOutcome, BiosError> {
         let cycles = match number {
             1 => {
-                let was_enabled = self.critical_depth == 0;
-                self.critical_depth = self.critical_depth.saturating_add(1);
+                let was_enabled = self.interrupts_enabled;
+                self.interrupts_enabled = false;
                 context.return_value(u32::from(was_enabled));
                 6
             }
             2 => {
-                if self.critical_depth != 0 {
-                    self.critical_depth -= 1;
-                }
-                context.return_value(1);
+                self.interrupts_enabled = true;
                 6
             }
             _ => {
@@ -608,7 +639,7 @@ impl BiosHle {
     /// Reports whether HLE critical sections permit interrupt dispatch.
     #[must_use]
     pub const fn interrupts_enabled(&self) -> bool {
-        self.critical_depth == 0
+        self.interrupts_enabled
     }
 
     /// Returns the installed exception-entry hook address.
@@ -1206,6 +1237,107 @@ impl BiosHle {
             context.return_value(u32::MAX);
         }
         6
+    }
+
+    fn initialize_card(&mut self, context: &CpuContext) -> u32 {
+        self.card = CardState {
+            initialized: true,
+            started: false,
+            pad_enabled: context.argument(0) != 0,
+            backup_unit_initialized: false,
+        };
+        40
+    }
+
+    fn start_card(&mut self) -> u32 {
+        if self.card.initialized {
+            self.card.started = true;
+        }
+        16
+    }
+
+    fn stop_card(&mut self) -> u32 {
+        self.card.started = false;
+        12
+    }
+
+    fn initialize_backup_unit(&mut self) -> u32 {
+        if self.card.initialized {
+            self.card.backup_unit_initialized = true;
+        }
+        24
+    }
+
+    fn get_function_table<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+        vector: BiosVector,
+    ) -> Result<u32, BiosError> {
+        let (table_address, stub_address, installed, vector_address) = match vector {
+            BiosVector::B0 => (
+                B0_TABLE_ADDRESS,
+                B0_STUB_ADDRESS,
+                self.b0_table_installed,
+                0x0000_00b0,
+            ),
+            BiosVector::C0 => (
+                C0_TABLE_ADDRESS,
+                C0_STUB_ADDRESS,
+                self.c0_table_installed,
+                0x0000_00c0,
+            ),
+            BiosVector::A0 => unreachable!("the BIOS does not expose its A0 table"),
+        };
+        if !installed {
+            self.check_memory_size(BIOS_TABLE_ENTRIES * (4 + BIOS_STUB_BYTES))?;
+            for function in 0..BIOS_TABLE_ENTRIES {
+                let table_offset = function.checked_mul(4).ok_or(BiosError::AddressOverflow)?;
+                let stub_offset = function
+                    .checked_mul(BIOS_STUB_BYTES)
+                    .ok_or(BiosError::AddressOverflow)?;
+                let stub = stub_address
+                    .checked_add(stub_offset)
+                    .ok_or(BiosError::AddressOverflow)?;
+                write_word(memory, table_address, table_offset, stub)?;
+                write_hle_stub(memory, stub, function, vector_address)?;
+            }
+            match vector {
+                BiosVector::B0 => {
+                    write_word(
+                        memory,
+                        table_address,
+                        0x5b * 4,
+                        B0_CHANGE_CLEAR_PAD_STUB_ADDRESS,
+                    )?;
+                    write_hle_stub(
+                        memory,
+                        B0_CHANGE_CLEAR_PAD_STUB_ADDRESS,
+                        0x5b,
+                        vector_address,
+                    )?;
+                }
+                BiosVector::C0 => {
+                    write_word(memory, table_address, 0x06 * 4, C0_EXCEPTION_STUB_ADDRESS)?;
+                    write_hle_stub(memory, C0_EXCEPTION_STUB_ADDRESS, 0x06, vector_address)?;
+                    write_word(memory, C0_EXCEPTION_STUB_ADDRESS, 0x70, 0)?;
+                    write_word(
+                        memory,
+                        C0_EXCEPTION_STUB_ADDRESS,
+                        0x74,
+                        BIOS_PATCH_SCRATCH_ADDRESS - 0x28,
+                    )?;
+                }
+                BiosVector::A0 => unreachable!("the BIOS does not expose its A0 table"),
+            }
+            match vector {
+                BiosVector::B0 => self.b0_table_installed = true,
+                BiosVector::C0 => self.c0_table_installed = true,
+                BiosVector::A0 => unreachable!("the BIOS does not expose its A0 table"),
+            }
+        }
+        context.return_value(table_address);
+        Ok(if installed { 8 } else { 4096 })
     }
 
     fn strtoul<M: GuestMemory>(
@@ -2405,6 +2537,22 @@ fn write_word<M: GuestMemory>(
     Ok(())
 }
 
+fn write_hle_stub<M: GuestMemory>(
+    memory: &mut M,
+    address: u32,
+    function: u32,
+    vector_address: u32,
+) -> Result<(), BiosError> {
+    write_word(memory, address, 0, 0x2409_0000 | function)?;
+    write_word(
+        memory,
+        address,
+        4,
+        0x0800_0000 | ((vector_address >> 2) & 0x03ff_ffff),
+    )?;
+    write_word(memory, address, 8, 0)
+}
+
 fn printf_argument<M: GuestMemory>(
     context: &CpuContext,
     memory: &mut M,
@@ -2468,8 +2616,11 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, BiosError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        A0, BiosError, BiosHle, BiosVector, CpuContext, FP, GP, GuestMemory, GuestMemoryError,
-        HleAction, HleLimits, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP, STRTOK_BUFFER_ADDRESS, T1, V0,
+        A0, B0_CHANGE_CLEAR_PAD_STUB_ADDRESS, B0_STUB_ADDRESS, B0_TABLE_ADDRESS,
+        BIOS_PATCH_SCRATCH_ADDRESS, BIOS_STUB_BYTES, BiosError, BiosHle, BiosVector,
+        C0_EXCEPTION_STUB_ADDRESS, C0_STUB_ADDRESS, C0_TABLE_ADDRESS, CpuContext, FP, GP,
+        GuestMemory, GuestMemoryError, HleAction, HleLimits, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP,
+        STRTOK_BUFFER_ADDRESS, T1, V0,
     };
 
     struct Memory(Vec<u8>);
@@ -2596,6 +2747,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(closed.register(V0), Some(0));
+    }
+
+    #[test]
+    fn card_initialization_tracks_lifecycle_without_media() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 16]);
+        call(&mut bios, BiosVector::B0, 0x4a, [0, 0, 0, 0], &mut memory).unwrap();
+        assert!(bios.card.initialized);
+        assert!(!bios.card.started);
+        assert!(!bios.card.pad_enabled);
+
+        call(&mut bios, BiosVector::B0, 0x4b, [0; 4], &mut memory).unwrap();
+        call(&mut bios, BiosVector::A0, 0x70, [0; 4], &mut memory).unwrap();
+        assert!(bios.card.started);
+        assert!(bios.card.backup_unit_initialized);
+
+        call(&mut bios, BiosVector::B0, 0x4c, [0; 4], &mut memory).unwrap();
+        assert!(!bios.card.started);
+    }
+
+    #[test]
+    fn exposed_b0_and_c0_tables_contain_callable_hle_stubs() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 0x10000]);
+        for (function, table, stubs, vector) in [
+            (0x57, B0_TABLE_ADDRESS, B0_STUB_ADDRESS, 0x0000_00b0),
+            (0x56, C0_TABLE_ADDRESS, C0_STUB_ADDRESS, 0x0000_00c0),
+        ] {
+            let (context, _) =
+                call(&mut bios, BiosVector::B0, function, [0; 4], &mut memory).unwrap();
+            assert_eq!(context.register(V0), Some(table));
+            let entry = 0x4a_u32;
+            let table_offset = usize::try_from(table + entry * 4).unwrap();
+            let stub = stubs + entry * BIOS_STUB_BYTES;
+            assert_eq!(
+                u32::from_le_bytes(memory.0[table_offset..table_offset + 4].try_into().unwrap()),
+                stub
+            );
+            let stub = usize::try_from(stub).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(memory.0[stub..stub + 4].try_into().unwrap()),
+                0x2409_004a
+            );
+            assert_eq!(
+                u32::from_le_bytes(memory.0[stub + 4..stub + 8].try_into().unwrap()),
+                0x0800_0000 | (vector >> 2)
+            );
+        }
+
+        let b0_patch_entry = usize::try_from(B0_TABLE_ADDRESS + 0x5b * 4).unwrap();
+        let b0_patch_address = u32::from_le_bytes(
+            memory.0[b0_patch_entry..b0_patch_entry + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(b0_patch_address, B0_CHANGE_CLEAR_PAD_STUB_ADDRESS);
+        assert!(b0_patch_address + 0x1988 < 0x10000);
+
+        let c0_exception_entry = usize::try_from(C0_TABLE_ADDRESS + 0x06 * 4).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                memory.0[c0_exception_entry..c0_exception_entry + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            C0_EXCEPTION_STUB_ADDRESS
+        );
+        let upper = usize::try_from(C0_EXCEPTION_STUB_ADDRESS + 0x70).unwrap();
+        let lower = usize::try_from(C0_EXCEPTION_STUB_ADDRESS + 0x74).unwrap();
+        let upper = u32::from_le_bytes(memory.0[upper..upper + 4].try_into().unwrap()) & 0xffff;
+        let lower = u32::from_le_bytes(memory.0[lower..lower + 4].try_into().unwrap()) & 0xffff;
+        assert_eq!((upper << 16) + lower + 0x28, BIOS_PATCH_SCRATCH_ADDRESS);
     }
 
     #[test]
@@ -3291,8 +3514,10 @@ mod tests {
         context.pc = 0x100;
         bios.dispatch_syscall(1, &mut context).unwrap();
         assert_eq!(context.register(V0), Some(0));
+        context.set_register(V0, 0xfeed_beef);
         bios.dispatch_syscall(2, &mut context).unwrap();
-        assert!(!bios.interrupts_enabled());
+        assert!(bios.interrupts_enabled());
+        assert_eq!(context.register(V0), Some(0xfeed_beef));
         bios.dispatch_syscall(2, &mut context).unwrap();
         assert!(bios.interrupts_enabled());
 
