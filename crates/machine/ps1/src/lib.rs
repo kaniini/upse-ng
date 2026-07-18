@@ -83,6 +83,8 @@ pub enum MachineStepKind {
     CallbackReturn,
     /// One comparator callback resumed or completed a libc HLE routine.
     LibcCallback,
+    /// Guest execution is halted while devices continue advancing.
+    Halt,
     /// One default BIOS hardware interrupt handler returned from exception.
     Interrupt(InterruptSource),
     /// A side-effect-free guest idle loop advanced emulated time.
@@ -202,6 +204,7 @@ struct MachineState {
     callback_cpu: Option<Cpu>,
     libc_cpu: Option<Cpu>,
     interrupt_cpu: Option<Cpu>,
+    halted: bool,
     trace_events: bool,
     event_log: Vec<MachineEvent>,
 }
@@ -260,6 +263,7 @@ impl Ps1Machine {
             callback_cpu: None,
             libc_cpu: None,
             interrupt_cpu: None,
+            halted: false,
             trace_events: config.trace_events,
             event_log: Vec::new(),
         };
@@ -307,6 +311,13 @@ impl Ps1Machine {
     }
 
     fn step_inner(&mut self, synchronize_devices: bool) -> Result<MachineStep, MachineError> {
+        if self.state.halted {
+            self.advance_devices(IDLE_ADVANCE_CYCLES, true)?;
+            return Ok(MachineStep {
+                cycles: IDLE_ADVANCE_CYCLES,
+                kind: MachineStepKind::Halt,
+            });
+        }
         if self.state.cpu.pc() == BiosHle::callback_return_pc() {
             if self.state.bios.libc_callback_active() {
                 let mut context = cpu_context(&self.state.cpu);
@@ -516,6 +527,9 @@ impl Ps1Machine {
         };
         if outcome.action == HleAction::Call {
             self.state.libc_cpu = Some(saved_cpu);
+            apply_context(&mut self.state.cpu, &context);
+        } else if outcome.action == HleAction::Halt {
+            self.state.halted = true;
             apply_context(&mut self.state.cpu, &context);
         } else if outcome.action == HleAction::ReturnFromException {
             if let Some(saved_cpu) = self.state.interrupt_cpu.take() {
@@ -1233,6 +1247,26 @@ mod tests {
             .map(|offset| machine.state.memory.read_u8(array + offset).unwrap())
             .collect();
         assert_eq!(sorted, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn libc_exit_halts_the_cpu_but_keeps_machine_time_advancing() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        machine.state.cpu.set_register(9, 0x3a);
+        machine.state.cpu.set_pc(0x0000_00a0);
+
+        assert_eq!(
+            machine.step().unwrap().kind,
+            MachineStepKind::Bios(super::BiosVector::A0)
+        );
+        assert!(machine.state.halted);
+        let before = machine.now();
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Halt);
+        assert_eq!(outcome.cycles, IDLE_ADVANCE_CYCLES);
+        assert!(machine.now() > before);
+        assert_eq!(machine.pc(), 0x0000_00a0);
     }
 
     #[test]

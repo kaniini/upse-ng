@@ -157,6 +157,8 @@ pub enum HleAction {
     Return,
     /// Enter a guest callback owned by a suspended HLE routine.
     Call,
+    /// Stop guest CPU execution while emulated devices continue advancing.
+    Halt,
     /// Keep the guest at the BIOS vector until a kernel event is delivered.
     Wait,
     /// Resume after restoring the machine's exception frame.
@@ -426,7 +428,16 @@ impl BiosHle {
             (BiosVector::A0, 0x00) | (BiosVector::B0, 0x32) => self.open(context, memory)?,
             (BiosVector::A0, 0x01) | (BiosVector::B0, 0x33) => self.lseek(context)?,
             (BiosVector::A0, 0x02) | (BiosVector::B0, 0x34) => self.read(context),
+            (BiosVector::A0, 0x03) | (BiosVector::B0, 0x35) => self.write(context, memory)?,
             (BiosVector::A0, 0x04) | (BiosVector::B0, 0x36) => self.close(context),
+            (BiosVector::A0, 0x05) | (BiosVector::B0, 0x37) => Self::ioctl(context),
+            (BiosVector::A0, 0x06) | (BiosVector::B0, 0x38) => {
+                action = HleAction::Halt;
+                10
+            }
+            (BiosVector::A0, 0x07) | (BiosVector::B0, 0x39) => Self::isatty(context),
+            (BiosVector::A0, 0x08) | (BiosVector::B0, 0x3a) => Self::getc(context),
+            (BiosVector::A0, 0x09) | (BiosVector::B0, 0x3b) => Self::putc(context),
             (BiosVector::A0, 0x0a) => Self::to_digit(context),
             (BiosVector::A0, 0x0c) => self.strtoul(context, memory)?,
             (BiosVector::A0, 0x0d) => self.strtol(context, memory)?,
@@ -499,6 +510,10 @@ impl BiosHle {
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
             (BiosVector::A0, 0x38) => self.realloc(context, memory)?,
             (BiosVector::A0, 0x39) | (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
+            (BiosVector::A0, 0x3a) => {
+                action = HleAction::Halt;
+                6
+            }
             (BiosVector::A0, 0x3b) | (BiosVector::B0, 0x3c) => Self::getchar(context),
             (BiosVector::A0, 0x3c) | (BiosVector::B0, 0x3d) => Self::putchar(context),
             (BiosVector::A0, 0x3d) | (BiosVector::B0, 0x3e) => Self::gets(context, memory)?,
@@ -1135,6 +1150,53 @@ impl BiosHle {
         file.position = file.position.saturating_add(size);
         context.return_value(size);
         memory_cycles(size)
+    }
+
+    fn write<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let descriptor = context.argument(0);
+        let source = context.argument(1);
+        let size = context.argument(2);
+        if !matches!(descriptor, 1 | 2) {
+            context.return_value(u32::MAX);
+            return Ok(6);
+        }
+        self.check_memory_size(size)?;
+        let mut output = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        for offset in 0..size {
+            output.push(read_byte(memory, source, offset)?);
+        }
+        if !output.is_empty() {
+            eprintln!("[PS1 BIOS TTY] {}", String::from_utf8_lossy(&output));
+        }
+        context.return_value(size);
+        Ok(memory_cycles(size))
+    }
+
+    fn ioctl(context: &mut CpuContext) -> u32 {
+        context.return_value(u32::MAX);
+        6
+    }
+
+    fn isatty(context: &mut CpuContext) -> u32 {
+        context.return_value(u32::from(matches!(context.argument(0), 0..=2)));
+        4
+    }
+
+    fn getc(context: &mut CpuContext) -> u32 {
+        context.return_value(u32::MAX);
+        8
+    }
+
+    fn putc(context: &mut CpuContext) -> u32 {
+        if !matches!(context.argument(1), 1 | 2) {
+            context.return_value(u32::MAX);
+            return 6;
+        }
+        Self::putchar(context)
     }
 
     fn close(&mut self, context: &mut CpuContext) -> u32 {
@@ -3055,6 +3117,25 @@ mod tests {
         let (output, _) =
             call(&mut bios, BiosVector::B0, 0x3f, [32, 0, 0, 0], &mut memory).unwrap();
         assert_eq!(output.register(V0), Some(5));
+
+        let (written, _) =
+            call(&mut bios, BiosVector::A0, 0x03, [1, 32, 5, 0], &mut memory).unwrap();
+        assert_eq!(written.register(V0), Some(5));
+        let (terminal, _) =
+            call(&mut bios, BiosVector::A0, 0x07, [2, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(terminal.register(V0), Some(1));
+        let (character, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x3b,
+            [u32::from(b'!'), 1, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(character.register(V0), Some(u32::from(b'!')));
+        let (halted, outcome) = call(&mut bios, BiosVector::A0, 0x3a, [0; 4], &mut memory).unwrap();
+        assert_eq!(outcome.action, HleAction::Halt);
+        assert_eq!(halted.pc, 0x1000);
     }
 
     #[test]
