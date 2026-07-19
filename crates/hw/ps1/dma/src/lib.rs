@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! PS1 DMA channel 4 with checked RAM access and scheduled completion.
+//! PS1 DMA registers with channel 4 transfers and inert non-audio channels.
 
 use thiserror::Error;
 use upse_clock::{ClockError, Deadline, Ticks};
@@ -7,6 +7,14 @@ use upse_ps1_irq::{InterruptController, InterruptSource};
 use upse_ps1_memory::Ps1Memory;
 use upse_scheduler::{DueEvent, EventId, Scheduler, SchedulerError};
 
+/// First DMA channel register.
+pub const DMA_CHANNEL_START: u32 = 0x1f80_1080;
+/// Last DMA channel register (channel 6 CHCR).
+pub const DMA_CHANNEL_END: u32 = 0x1f80_10e8;
+/// Last DMA channel halfword address (high half of channel 6 CHCR).
+pub const DMA_CHANNEL_HALFWORD_END: u32 = DMA_CHANNEL_END + 2;
+/// Last DMA global-control halfword address.
+pub const DMA_CONTROL_END: u32 = 0x1f80_10f6;
 /// Channel 4 memory address register.
 pub const D4_MADR: u32 = 0x1f80_10c0;
 /// Channel 4 block control register.
@@ -41,6 +49,10 @@ const DICR_CHANNEL4_FLAG: u32 = 1 << 28;
 const RAM_ADDRESS_MASK: u32 = 0x00ff_fffc;
 const CYCLES_PER_WORD: u64 = 4;
 const MAX_RAM_WORDS: u64 = (2 * 1024 * 1024) / 4;
+const CHANNEL_COUNT: usize = 7;
+const CHANNEL_STRIDE: u32 = 0x10;
+const CHANNEL_REGISTER_COUNT: usize = 3;
+const CHANNEL4: usize = 4;
 
 /// Sound-device port consumed by DMA channel 4.
 pub trait SoundDmaEndpoint {
@@ -165,6 +177,7 @@ pub struct DmaController {
     madr: u32,
     bcr: u32,
     chcr: u32,
+    register_only_channels: [[u32; CHANNEL_REGISTER_COUNT]; CHANNEL_COUNT],
     dpcr: u32,
     dicr_control: u32,
     dicr_flags: u32,
@@ -185,6 +198,7 @@ impl DmaController {
             madr: 0,
             bcr: 0,
             chcr: 0,
+            register_only_channels: [[0; CHANNEL_REGISTER_COUNT]; CHANNEL_COUNT],
             dpcr: DPCR_RESET,
             dicr_control: 0,
             dicr_flags: 0,
@@ -205,13 +219,17 @@ impl DmaController {
     ///
     /// # Errors
     ///
-    /// Returns [`DmaError::InvalidRegister`] for registers outside channel 4,
-    /// `DPCR`, and `DICR`.
+    /// Returns [`DmaError::InvalidRegister`] for addresses outside the seven
+    /// channel register triplets, `DPCR`, and `DICR`.
     pub fn read(&self, address: u32) -> Result<u32, DmaError> {
+        if let Some((channel, register)) = channel_register(address) {
+            return Ok(if channel == CHANNEL4 {
+                [self.madr, self.bcr, self.chcr][register]
+            } else {
+                self.register_only_channels[channel][register]
+            });
+        }
         match address {
-            D4_MADR => Ok(self.madr),
-            D4_BCR => Ok(self.bcr),
-            D4_CHCR => Ok(self.chcr),
             DPCR => Ok(self.dpcr),
             DICR => Ok(self.dicr()),
             _ => Err(DmaError::InvalidRegister { address }),
@@ -236,13 +254,31 @@ impl DmaController {
         scheduler: &mut Scheduler,
         sink: &mut S,
     ) -> Result<(), DmaError> {
-        match address {
-            D4_MADR => self.madr = value & RAM_ADDRESS_MASK,
-            D4_BCR => self.bcr = value,
-            D4_CHCR => {
-                self.chcr = value & CHCR_WRITABLE;
-                self.reschedule(now, scheduler)?;
+        if let Some((channel, register)) = channel_register(address) {
+            if channel == CHANNEL4 {
+                match register {
+                    0 => self.madr = value & RAM_ADDRESS_MASK,
+                    1 => self.bcr = value,
+                    2 => {
+                        self.chcr = value & CHCR_WRITABLE;
+                        self.reschedule(now, scheduler)?;
+                    }
+                    _ => unreachable!("validated DMA register index"),
+                }
+            } else {
+                self.register_only_channels[channel][register] = match register {
+                    0 => value & RAM_ADDRESS_MASK,
+                    1 => value,
+                    // Non-audio channels have no machine-visible endpoint in
+                    // the PSF profile. Complete starts immediately so game
+                    // initialization cannot block while polling CHCR.
+                    2 => value & !(CHCR_START | CHCR_TRIGGER),
+                    _ => unreachable!("validated DMA register index"),
+                };
             }
+            return Ok(());
+        }
+        match address {
             DPCR => {
                 self.dpcr = value;
                 self.reschedule(now, scheduler)?;
@@ -368,6 +404,19 @@ impl DmaController {
     }
 }
 
+fn channel_register(address: u32) -> Option<(usize, usize)> {
+    let offset = address.checked_sub(DMA_CHANNEL_START)?;
+    let channel = usize::try_from(offset / CHANNEL_STRIDE).ok()?;
+    if channel >= CHANNEL_COUNT {
+        return None;
+    }
+    let register = usize::try_from((offset % CHANNEL_STRIDE) / 4).ok()?;
+    if offset % 4 != 0 || register >= CHANNEL_REGISTER_COUNT {
+        return None;
+    }
+    Some((channel, register))
+}
+
 fn sync_mode(chcr: u32) -> u8 {
     let bits = (chcr & CHCR_SYNC_MASK) >> 9;
     u8::try_from(bits).expect("two-bit DMA sync mode")
@@ -459,8 +508,8 @@ mod tests {
     use super::{
         CHANNEL4_ENABLE, CHCR_DECREMENT, CHCR_DIRECTION_FROM_RAM, CHCR_START, CHCR_TRIGGER, D4_BCR,
         D4_CHCR, D4_MADR, DICR, DICR_CHANNEL4_FLAG, DICR_CHANNEL4_MASK, DICR_MASTER_ENABLE,
-        DICR_MASTER_FLAG, DPCR, DmaController, DmaError, EndpointError, InterruptSink,
-        SoundDmaEndpoint,
+        DICR_MASTER_FLAG, DMA_CHANNEL_START, DPCR, DmaController, DmaError, EndpointError,
+        InterruptSink, SoundDmaEndpoint,
     };
 
     #[derive(Default)]
@@ -551,6 +600,26 @@ mod tests {
         assert_ne!(dma.read(DICR).unwrap() & DICR_CHANNEL4_FLAG, 0);
         assert_ne!(dma.read(DICR).unwrap() & DICR_MASTER_FLAG, 0);
         assert_eq!(irq.status(), InterruptSource::Dma.bit());
+    }
+
+    #[test]
+    fn non_audio_channel_registers_read_back_without_remaining_busy() {
+        let mut dma = DmaController::new();
+        let mut scheduler = Scheduler::new();
+        let mut log = Log::default();
+        let gpu_madr = DMA_CHANNEL_START + 2 * 0x10;
+        let gpu_bcr = gpu_madr + 4;
+        let gpu_chcr = gpu_madr + 8;
+
+        write(&mut dma, gpu_madr, 0x8012_3457, &mut scheduler, &mut log).unwrap();
+        write(&mut dma, gpu_bcr, 0x1234_5678, &mut scheduler, &mut log).unwrap();
+        write(&mut dma, gpu_chcr, 0x1100_0401, &mut scheduler, &mut log).unwrap();
+
+        assert_eq!(dma.read(gpu_madr).unwrap(), 0x0012_3454);
+        assert_eq!(dma.read(gpu_bcr).unwrap(), 0x1234_5678);
+        assert_eq!(dma.read(gpu_chcr).unwrap(), 0x0000_0401);
+        assert!(scheduler.is_empty());
+        assert!(log.0.is_empty());
     }
 
     #[test]

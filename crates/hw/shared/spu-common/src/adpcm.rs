@@ -66,19 +66,14 @@ pub enum AdpcmError {
         /// Four-bit header value.
         shift: u8,
     },
-    /// Predictor filter exceeds the defined 0 through 4 range.
-    #[error("invalid PlayStation ADPCM filter {filter}")]
-    InvalidFilter {
-        /// Four-bit header value.
-        filter: u8,
-    },
 }
 
 /// Decodes one 16-byte ADPCM block and updates predictor history.
 ///
 /// # Errors
 ///
-/// Returns [`AdpcmError`] for undefined shift or filter header values.
+/// Returns [`AdpcmError`] for undefined shift header values. Reserved predictor
+/// selectors 5 through 15 use the hardware's zero-coefficient behavior.
 pub fn decode_block(
     block: &[u8; 16],
     history: &mut AdpcmHistory,
@@ -88,9 +83,8 @@ pub fn decode_block(
     if shift > 12 {
         return Err(AdpcmError::InvalidShift { shift });
     }
-    let Some(&(positive, negative)) = FILTERS.get(usize::from(filter)) else {
-        return Err(AdpcmError::InvalidFilter { filter });
-    };
+    // Hardware treats the reserved predictor selectors as filter zero.
+    let (positive, negative) = FILTERS.get(usize::from(filter)).copied().unwrap_or((0, 0));
     let mut samples = [0_i16; 28];
     for (index, output) in samples.iter_mut().enumerate() {
         let packed = block[2 + index / 2];
@@ -167,17 +161,25 @@ mod tests {
     }
 
     #[test]
-    fn invalid_headers_do_not_mutate_history() {
+    fn invalid_shift_does_not_mutate_history() {
         let original = AdpcmHistory::new(12, -4);
-        for (header, expected) in [
-            (13, AdpcmError::InvalidShift { shift: 13 }),
-            (0x50, AdpcmError::InvalidFilter { filter: 5 }),
-        ] {
-            let mut history = original;
-            let mut block = [0_u8; 16];
-            block[0] = header;
-            assert_eq!(decode_block(&block, &mut history), Err(expected));
-            assert_eq!(history, original);
-        }
+        let mut history = original;
+        let mut block = [0_u8; 16];
+        block[0] = 13;
+        assert_eq!(
+            decode_block(&block, &mut history),
+            Err(AdpcmError::InvalidShift { shift: 13 })
+        );
+        assert_eq!(history, original);
+    }
+
+    #[test]
+    fn reserved_predictors_decode_with_zero_coefficients() {
+        let mut block = [0_u8; 16];
+        block[0] = 0xac;
+        block[2] = 0xf1;
+        let mut history = AdpcmHistory::new(12_000, -8_000);
+        let decoded = decode_block(&block, &mut history).unwrap();
+        assert_eq!(&decoded.samples[..4], &[1, -1, 0, 0]);
     }
 }

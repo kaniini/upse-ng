@@ -12,8 +12,8 @@ use upse_ps1_bios::{
 };
 use upse_ps1_cdrom::{CDROM_BASE, CDROM_END, CdRom};
 use upse_ps1_dma::{
-    D4_BCR, D4_CHCR, D4_MADR, DICR, DPCR, DmaController, DmaError,
-    InterruptSink as DmaInterruptSink,
+    DICR, DMA_CHANNEL_END, DMA_CHANNEL_HALFWORD_END, DMA_CHANNEL_START, DMA_CONTROL_END, DPCR,
+    DmaController, DmaError, InterruptSink as DmaInterruptSink,
 };
 use upse_ps1_gpu::{GP0, GP1, Gpu};
 use upse_ps1_irq::{I_MASK, I_STAT, InterruptController, InterruptSource};
@@ -758,9 +758,18 @@ impl MachineBus<'_> {
             }
             I_STAT | I_MASK => self.irq.read(address).map(low_half).map_err(bus_fault),
             TIMER_BASE..=TIMER_END => self.timers.read(address).map(low_half).map_err(bus_fault),
-            D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => {
-                self.dma.read(address).map(low_half).map_err(bus_fault)
-            }
+            DMA_CHANNEL_START..=DMA_CHANNEL_HALFWORD_END | DPCR..=DMA_CONTROL_END => self
+                .dma
+                .read(address & !3)
+                .map(|value| {
+                    let bytes = value.to_le_bytes();
+                    if address & 2 == 0 {
+                        u16::from_le_bytes([bytes[0], bytes[1]])
+                    } else {
+                        u16::from_le_bytes([bytes[2], bytes[3]])
+                    }
+                })
+                .map_err(bus_fault),
             SPU_BASE..=SPU_END => self.spu.read_register(address).map_err(bus_fault),
             _ => Err(BusFault::new(format!(
                 "unmodeled PS1 MMIO read at {address:#010x}"
@@ -792,11 +801,16 @@ impl MachineBus<'_> {
                 .timers
                 .write(address, u32::from(value))
                 .map_err(bus_fault),
-            D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => {
-                let old = self.dma.read(address).map_err(bus_fault)?;
-                let merged = (old & 0xffff_0000) | u32::from(value);
+            DMA_CHANNEL_START..=DMA_CHANNEL_HALFWORD_END | DPCR..=DMA_CONTROL_END => {
+                let aligned = address & !3;
+                let old = self.dma.read(aligned).map_err(bus_fault)?;
+                let merged = if address & 2 == 0 {
+                    (old & 0xffff_0000) | u32::from(value)
+                } else {
+                    (old & 0x0000_ffff) | (u32::from(value) << 16)
+                };
                 self.dma
-                    .write(address, merged, self.now, self.scheduler, self.irq)
+                    .write(aligned, merged, self.now, self.scheduler, self.irq)
                     .map_err(bus_fault)
             }
             SPU_BASE..=SPU_END => self.spu.write_register(address, value).map_err(bus_fault),
@@ -842,7 +856,7 @@ impl Bus for MachineBus<'_> {
                 }
                 I_STAT | I_MASK => self.irq.read(physical).map_err(bus_fault),
                 TIMER_BASE..=TIMER_END => self.timers.read(physical).map_err(bus_fault),
-                D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => {
+                DMA_CHANNEL_START..=DMA_CHANNEL_END | DPCR | DICR => {
                     self.dma.read(physical).map_err(bus_fault)
                 }
                 GP0 | GP1 => self.gpu.read_register(physical).map_err(bus_fault),
@@ -901,7 +915,7 @@ impl Bus for MachineBus<'_> {
                     .map_err(bus_fault),
                 I_STAT | I_MASK => self.irq.write(physical, value).map_err(bus_fault),
                 TIMER_BASE..=TIMER_END => self.timers.write(physical, value).map_err(bus_fault),
-                D4_MADR | D4_BCR | D4_CHCR | DPCR | DICR => self
+                DMA_CHANNEL_START..=DMA_CHANNEL_END | DPCR | DICR => self
                     .dma
                     .write(physical, value, self.now, self.scheduler, self.irq)
                     .map_err(bus_fault),

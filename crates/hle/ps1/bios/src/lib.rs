@@ -24,6 +24,7 @@ const CALLBACK_RETURN_PC: u32 = 0xffff_ff00;
 const TTY_FORMAT_BYTES: u32 = 4096;
 const TTY_STRING_BYTES: u32 = 4096;
 const RESIDENT_FILE_DESCRIPTOR: u32 = 3;
+const NULL_CALL_STUB_ADDRESS: u32 = 0x0000_0000;
 const RAM_SIZE_ADDRESS: u32 = 0x0000_0060;
 const STRTOK_BUFFER_ADDRESS: u32 = 0x0000_c000;
 const STRTOK_BUFFER_SIZE: u32 = 256;
@@ -475,6 +476,12 @@ impl BiosHle {
         if self.tables.a0 {
             return Ok(());
         }
+        // PSF minidrivers commonly disable optional game subsystems by
+        // clearing their indirect callback slots. Keep null calls benign in
+        // the HLE profile instead of letting execution fall through kernel
+        // low memory and into an unrelated BIOS vector.
+        write_word(memory, NULL_CALL_STUB_ADDRESS, 0, 0x03e0_0008)?;
+        write_word(memory, NULL_CALL_STUB_ADDRESS, 4, 0)?;
         for function in 0..A0_TABLE_ENTRIES {
             let table_offset = function.checked_mul(4).ok_or(BiosError::AddressOverflow)?;
             let stub_offset = function
@@ -2761,8 +2768,8 @@ mod tests {
         BIOS_PATCH_SCRATCH_ADDRESS, BIOS_STUB_BYTES, BiosError, BiosHle, BiosVector,
         C0_EXCEPTION_STUB_ADDRESS, C0_STUB_ADDRESS, C0_TABLE_ADDRESS, CpuContext, FP, GP,
         GuestMemory, GuestMemoryError, HleAction, HleLimits, KERNEL_CONFIG_ADDRESS,
-        KERNEL_MEMORY_ADDRESS, KERNEL_MEMORY_SIZE, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP,
-        STRTOK_BUFFER_ADDRESS, T1, V0,
+        KERNEL_MEMORY_ADDRESS, KERNEL_MEMORY_SIZE, NULL_CALL_STUB_ADDRESS, RA,
+        RESIDENT_FILE_DESCRIPTOR, S0, SP, STRTOK_BUFFER_ADDRESS, T1, V0,
     };
 
     struct Memory(Vec<u8>);
@@ -2968,6 +2975,16 @@ mod tests {
         let mut bios = BiosHle::default();
         let mut memory = Memory(vec![0; 0xc000]);
         bios.initialize_boot_memory(&mut memory).unwrap();
+
+        let null_stub = usize::try_from(NULL_CALL_STUB_ADDRESS).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(memory.0[null_stub..null_stub + 4].try_into().unwrap()),
+            0x03e0_0008
+        );
+        assert_eq!(
+            u32::from_le_bytes(memory.0[null_stub + 4..null_stub + 8].try_into().unwrap()),
+            0
+        );
 
         let generic_entry = usize::try_from(A0_TABLE_ADDRESS + 0x44 * 4).unwrap();
         assert_eq!(
