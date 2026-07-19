@@ -9,7 +9,7 @@ use thiserror::Error;
 use upse_ps1_dma::{EndpointError, SoundDmaEndpoint};
 use upse_ps1_irq::{InterruptController, InterruptSource};
 use upse_spu_common::{
-    AdpcmError, AdpcmFlags, AdpcmHistory, Envelope, EnvelopeConfig, EnvelopePhase,
+    AdpcmError, AdpcmFlags, AdpcmHistory, DecodedBlock, Envelope, EnvelopeConfig, EnvelopePhase,
     GaussianInterpolator, NoiseGenerator, PitchCounter, clamp_i16,
 };
 
@@ -117,6 +117,13 @@ pub enum SpuError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedBlock {
+    address: usize,
+    decoded: DecodedBlock,
+    history_before: AdpcmHistory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Voice {
     volume_left: u16,
     volume_right: u16,
@@ -132,6 +139,8 @@ struct Voice {
     pitch_counter: PitchCounter,
     decoded: [i16; 28],
     decoded_flags: AdpcmFlags,
+    previous_sample: i16,
+    prepared: Option<PreparedBlock>,
     sample_index: usize,
     decoded_valid: bool,
     active: bool,
@@ -158,6 +167,8 @@ impl Default for Voice {
                 repeat: false,
                 loop_start: false,
             },
+            previous_sample: 0,
+            prepared: None,
             sample_index: 0,
             decoded_valid: false,
             active: false,
@@ -179,6 +190,8 @@ impl Voice {
         self.envelope.key_on();
         self.history = AdpcmHistory::default();
         self.pitch_counter.reset();
+        self.previous_sample = 0;
+        self.prepared = None;
         self.sample_index = 0;
         self.decoded_valid = false;
         self.active = true;
@@ -205,6 +218,13 @@ impl Voice {
             if !self.decoded_valid {
                 fetched = Some(self.decode_current(ram)?);
             }
+            // The four-tap interpolation window reaches two samples beyond
+            // the current position, including into the following block.
+            if self.sample_index + 2 >= self.decoded.len()
+                && let Some(address) = self.prepare_next(ram)?
+            {
+                fetched = Some(address);
+            }
             let phase = self.pitch_counter.phase() >> 4;
             let phase = phase.to_le_bytes()[0];
             let samples = self.interpolation_window();
@@ -222,7 +242,9 @@ impl Voice {
                             loop_end,
                         });
                     }
-                    fetched = Some(self.decode_current(ram)?);
+                    if !self.decoded_valid {
+                        fetched = Some(self.decode_current(ram)?);
+                    }
                 }
             }
             sample
@@ -246,49 +268,109 @@ impl Voice {
 
     fn interpolation_window(&self) -> [i16; 4] {
         let sample = |relative: isize| {
-            let index = self.sample_index.saturating_add_signed(relative);
-            self.decoded[index.min(self.decoded.len() - 1)]
+            let index = isize::try_from(self.sample_index).unwrap_or(0) + relative;
+            if index < 0 {
+                return self.previous_sample;
+            }
+            let index = usize::try_from(index).unwrap_or(0);
+            if let Some(sample) = self.decoded.get(index) {
+                return *sample;
+            }
+            self.prepared
+                .as_ref()
+                .and_then(|prepared| prepared.decoded.samples.get(index - self.decoded.len()))
+                .copied()
+                .unwrap_or(self.decoded[self.decoded.len() - 1])
         };
         [sample(-1), sample(0), sample(1), sample(2)]
     }
 
     fn decode_current(&mut self, ram: &[u8]) -> Result<usize, (usize, AdpcmError)> {
         let address = self.current_address & RAM_MASK;
-        let mut block = [0_u8; 16];
-        for (index, output) in block.iter_mut().enumerate() {
-            *output = ram[(address + index) & RAM_MASK];
+        let decoded = decode_block_at(ram, address, &mut self.history)?;
+        self.install_block(address, decoded);
+        Ok(address)
+    }
+
+    fn prepare_next(&mut self, ram: &[u8]) -> Result<Option<usize>, (usize, AdpcmError)> {
+        if self.prepared.is_some() {
+            return Ok(None);
         }
-        let decoded = upse_spu_common::decode_block(&block, &mut self.history)
-            .map_err(|error| (address, error))?;
+        let Some(address) = self.next_block_address() else {
+            return Ok(None);
+        };
+        let history_before = self.history;
+        let decoded = decode_block_at(ram, address, &mut self.history)?;
+        self.prepared = Some(PreparedBlock {
+            address,
+            decoded,
+            history_before,
+        });
+        Ok(Some(address))
+    }
+
+    fn next_block_address(&self) -> Option<usize> {
+        if self.decoded_flags.end {
+            self.decoded_flags
+                .repeat
+                .then_some(usize::from(self.repeat_address) * 8)
+        } else {
+            Some((self.current_block_address + 16) & RAM_MASK)
+        }
+    }
+
+    fn install_block(&mut self, address: usize, decoded: DecodedBlock) {
         self.decoded = decoded.samples;
         self.decoded_flags = decoded.flags;
         self.current_block_address = address;
+        self.current_address = address;
         if decoded.flags.loop_start {
             self.repeat_address =
                 u16::try_from(address / 8).expect("sound RAM address fits repeat register");
         }
         self.sample_index = 0;
         self.decoded_valid = true;
-        Ok(address)
     }
 
     fn finish_block(&mut self) -> bool {
         let flags = self.decoded_flags;
+        self.previous_sample = self.decoded[self.decoded.len() - 1];
         self.decoded_valid = false;
         self.sample_index = 0;
-        if flags.end {
+        let next_address = if flags.end {
             if flags.repeat {
-                self.current_address = usize::from(self.repeat_address) * 8;
+                usize::from(self.repeat_address) * 8
             } else {
                 self.envelope = Envelope::new();
                 self.active = false;
+                self.prepared = None;
                 return true;
             }
         } else {
-            self.current_address = (self.current_block_address + 16) & RAM_MASK;
+            (self.current_block_address + 16) & RAM_MASK
+        };
+        self.current_address = next_address;
+        if let Some(prepared) = self.prepared.take() {
+            if prepared.address == next_address {
+                self.install_block(prepared.address, prepared.decoded);
+            } else {
+                self.history = prepared.history_before;
+            }
         }
         false
     }
+}
+
+fn decode_block_at(
+    ram: &[u8],
+    address: usize,
+    history: &mut AdpcmHistory,
+) -> Result<DecodedBlock, (usize, AdpcmError)> {
+    let mut block = [0_u8; 16];
+    for (index, output) in block.iter_mut().enumerate() {
+        *output = ram[(address + index) & RAM_MASK];
+    }
+    upse_spu_common::decode_block(&block, history).map_err(|error| (address, error))
 }
 
 /// Standalone 24-voice PS1 SPU.
@@ -753,6 +835,7 @@ mod tests {
         REVERB_BASE, REVERB_ON_HIGH, REVERB_ON_LOW, REVERB_REGISTERS_START, REVERB_VOLUME_LEFT,
         REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE, STATUS, STATUS_IRQ, Spu, SpuError,
         TRANSFER_ADDRESS, TRANSFER_CONTROL, UNKNOWN_DA0, UNKNOWN_DBC, UNKNOWN_DBE, VOICE_COUNT,
+        Voice,
     };
 
     const ROOM_REVERB: [u16; 32] = [
@@ -816,9 +899,28 @@ mod tests {
         assert_eq!(
             output,
             [
-                1_790, 1_790, 3_582, 3_582, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093,
+                1_491, 1_491, 3_582, 3_582, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093,
                 4_093, 4_093, 4_093, 4_093
             ]
+        );
+    }
+
+    #[test]
+    fn interpolation_window_crosses_adpcm_block_boundaries() {
+        let mut ram = vec![0_u8; SOUND_RAM_SIZE];
+        ram[..16].copy_from_slice(&constant_block(1, 0));
+        ram[16..32].copy_from_slice(&constant_block(7, 3));
+        let mut voice = Voice::default();
+        voice.decode_current(&ram).unwrap();
+        voice.sample_index = 27;
+
+        assert_eq!(voice.prepare_next(&ram).unwrap(), Some(16));
+        assert_eq!(voice.interpolation_window(), [4_096, 4_096, 28_672, 28_672]);
+
+        assert!(!voice.finish_block());
+        assert_eq!(
+            voice.interpolation_window(),
+            [4_096, 28_672, 28_672, 28_672]
         );
     }
 
