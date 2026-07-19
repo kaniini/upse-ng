@@ -225,7 +225,9 @@ impl Ps1Machine {
     /// or clock initialization fails.
     pub fn from_plan(plan: &Psf1LoadPlan, config: MachineConfig) -> Result<Self, MachineError> {
         let image = ExecutableImage::from_plan(plan)?;
-        let memory = Ps1Memory::from_image(&image, config.open_bus)?;
+        let mut memory = Ps1Memory::from_image(&image, config.open_bus)?;
+        let mut bios = BiosHle::default();
+        bios.initialize_boot_memory(&mut BiosMemory(&mut memory))?;
         let standard = match image.refresh {
             RefreshRate::Hz50 => VideoStandard::Pal,
             RefreshRate::Hz60 => VideoStandard::Ntsc,
@@ -253,7 +255,7 @@ impl Ps1Machine {
             timers: RootCounters::new(),
             refresh: VBlankClock::new(standard),
             dma: DmaController::new(),
-            bios: BiosHle::default(),
+            bios,
             spu: Spu::new(),
             scheduler: Scheduler::new(),
             now: Deadline::ZERO,

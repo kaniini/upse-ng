@@ -27,6 +27,9 @@ const RESIDENT_FILE_DESCRIPTOR: u32 = 3;
 const RAM_SIZE_ADDRESS: u32 = 0x0000_0060;
 const STRTOK_BUFFER_ADDRESS: u32 = 0x0000_c000;
 const STRTOK_BUFFER_SIZE: u32 = 256;
+const KERNEL_MEMORY_ADDRESS: u32 = 0xa000_e000;
+const KERNEL_MEMORY_SIZE: u32 = 0x2000;
+const A0_TABLE_ADDRESS: u32 = 0x0000_0200;
 const B0_TABLE_ADDRESS: u32 = 0x0000_0500;
 const C0_TABLE_ADDRESS: u32 = 0x0000_0900;
 const B0_STUB_ADDRESS: u32 = 0x0000_1000;
@@ -36,7 +39,11 @@ const C0_STUB_ADDRESS: u32 = 0x0000_1c00;
 // user RAM, which begins at 0x10000.
 const C0_EXCEPTION_STUB_ADDRESS: u32 = 0x0000_4000;
 const B0_CHANGE_CLEAR_PAD_STUB_ADDRESS: u32 = 0x0000_5000;
+const A0_STUB_ADDRESS: u32 = 0x0000_7000;
+const A0_GET_CONF_STUB_ADDRESS: u32 = 0x0000_a000;
+const KERNEL_CONFIG_ADDRESS: u32 = 0x0000_b000;
 const BIOS_PATCH_SCRATCH_ADDRESS: u32 = 0x0000_df80;
+const A0_TABLE_ENTRIES: u32 = 0xc0;
 const BIOS_TABLE_ENTRIES: u32 = 256;
 const BIOS_STUB_BYTES: u32 = 12;
 
@@ -343,6 +350,20 @@ struct CardState {
     backup_unit_initialized: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct KernelHandlerState {
+    timer_and_vblank: Option<u32>,
+    syscall: Option<u32>,
+    default_interrupt: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BiosTableState {
+    a0: bool,
+    b0: bool,
+    c0: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParsedInteger {
     value: u32,
@@ -392,10 +413,11 @@ pub struct BiosHle {
     pending_callbacks: VecDeque<CallbackRequest>,
     callback_stack: Vec<CpuContext>,
     heap: Option<Heap>,
+    kernel_heap: Heap,
+    kernel_handlers: KernelHandlerState,
     resident_file: Option<ResidentFile>,
     card: CardState,
-    b0_table_installed: bool,
-    c0_table_installed: bool,
+    tables: BiosTableState,
     strtok_next: Option<u32>,
     libc_operation: Option<LibcOperation>,
     random_state: u32,
@@ -421,10 +443,15 @@ impl BiosHle {
             pending_callbacks: VecDeque::new(),
             callback_stack: Vec::new(),
             heap: None,
+            kernel_heap: Heap {
+                base: KERNEL_MEMORY_ADDRESS,
+                end: KERNEL_MEMORY_ADDRESS + KERNEL_MEMORY_SIZE,
+                blocks: Vec::new(),
+            },
+            kernel_handlers: KernelHandlerState::default(),
             resident_file: None,
             card: CardState::default(),
-            b0_table_installed: false,
-            c0_table_installed: false,
+            tables: BiosTableState::default(),
             strtok_next: None,
             libc_operation: None,
             random_state: 1,
@@ -433,6 +460,56 @@ impl BiosHle {
             interrupt_queues: [0; INTERRUPT_PRIORITIES],
             clear_root_counter: [true; 4],
         }
+    }
+
+    /// Installs the fixed guest-visible A0 jump table used by software that
+    /// inspects or patches service entry points directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BiosError`] when guest RAM rejects the synthetic table.
+    pub fn initialize_boot_memory<M: GuestMemory>(
+        &mut self,
+        memory: &mut M,
+    ) -> Result<(), BiosError> {
+        if self.tables.a0 {
+            return Ok(());
+        }
+        for function in 0..A0_TABLE_ENTRIES {
+            let table_offset = function.checked_mul(4).ok_or(BiosError::AddressOverflow)?;
+            let stub_offset = function
+                .checked_mul(BIOS_STUB_BYTES)
+                .ok_or(BiosError::AddressOverflow)?;
+            let stub = A0_STUB_ADDRESS
+                .checked_add(stub_offset)
+                .ok_or(BiosError::AddressOverflow)?;
+            write_word(memory, A0_TABLE_ADDRESS, table_offset, stub)?;
+            write_hle_stub(memory, stub, function, 0x0000_00a0)?;
+        }
+
+        write_word(memory, A0_TABLE_ADDRESS, 0x9d * 4, A0_GET_CONF_STUB_ADDRESS)?;
+        // GetConf conventionally begins by loading the address of the kernel
+        // config. Some games decode these two immediates to find that storage.
+        let config_reference = KERNEL_CONFIG_ADDRESS + 8;
+        let config_upper = (config_reference + 0x8000) >> 16;
+        write_word(
+            memory,
+            A0_GET_CONF_STUB_ADDRESS,
+            0,
+            0x3c02_0000 | config_upper,
+        )?;
+        write_word(
+            memory,
+            A0_GET_CONF_STUB_ADDRESS,
+            4,
+            0x2442_0000 | (config_reference & 0xffff),
+        )?;
+        write_word(memory, A0_GET_CONF_STUB_ADDRESS, 8, 0x2409_009d)?;
+        write_word(memory, A0_GET_CONF_STUB_ADDRESS, 12, 0x0800_0028)?;
+        write_word(memory, A0_GET_CONF_STUB_ADDRESS, 16, 0)?;
+
+        self.tables.a0 = true;
+        Ok(())
     }
 
     /// Dispatches the function number in `t1` and returns to `ra`.
@@ -537,7 +614,7 @@ impl BiosHle {
             }
             (BiosVector::A0, 0x37) => self.calloc(context, memory)?,
             (BiosVector::A0, 0x38) => self.realloc(context, memory)?,
-            (BiosVector::A0, 0x39) | (BiosVector::C0, 0x08) => self.initialize_heap(context)?,
+            (BiosVector::A0, 0x39) => self.initialize_heap(context)?,
             (BiosVector::A0, 0x3a) => {
                 action = HleAction::Halt;
                 6
@@ -549,6 +626,8 @@ impl BiosHle {
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
             (BiosVector::A0, 0x44) => 12,
             (BiosVector::A0, 0x9f) => Self::set_memory_size(context, memory)?,
+            (BiosVector::B0, 0x00) => self.allocate_kernel_memory(context)?,
+            (BiosVector::B0, 0x01) => self.free_kernel_memory(context),
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
             (BiosVector::B0, 0x09) => self.close_event(context),
@@ -584,9 +663,13 @@ impl BiosHle {
             (BiosVector::B0, 0x56) => self.get_function_table(context, memory, BiosVector::C0)?,
             (BiosVector::B0, 0x57) => self.get_function_table(context, memory, BiosVector::B0)?,
             (BiosVector::B0, 0x5b) => 6,
+            (BiosVector::C0, 0x00) => self.initialize_timer_and_vblank_handlers(context),
+            (BiosVector::C0, 0x01) => self.initialize_syscall_handler(context),
             (BiosVector::C0, 0x02) => self.enqueue_interrupt(context)?,
             (BiosVector::C0, 0x03) => self.dequeue_interrupt(context)?,
+            (BiosVector::C0, 0x08) => self.initialize_kernel_heap(context)?,
             (BiosVector::C0, 0x0a) => self.change_clear_counter(context)?,
+            (BiosVector::C0, 0x0c) => self.initialize_default_interrupt_handler(context),
             _ => {
                 return Err(BiosError::UnsupportedCall {
                     vector,
@@ -1278,13 +1361,13 @@ impl BiosHle {
             BiosVector::B0 => (
                 B0_TABLE_ADDRESS,
                 B0_STUB_ADDRESS,
-                self.b0_table_installed,
+                self.tables.b0,
                 0x0000_00b0,
             ),
             BiosVector::C0 => (
                 C0_TABLE_ADDRESS,
                 C0_STUB_ADDRESS,
-                self.c0_table_installed,
+                self.tables.c0,
                 0x0000_00c0,
             ),
             BiosVector::A0 => unreachable!("the BIOS does not expose its A0 table"),
@@ -1331,8 +1414,8 @@ impl BiosHle {
                 BiosVector::A0 => unreachable!("the BIOS does not expose its A0 table"),
             }
             match vector {
-                BiosVector::B0 => self.b0_table_installed = true,
-                BiosVector::C0 => self.c0_table_installed = true,
+                BiosVector::B0 => self.tables.b0 = true,
+                BiosVector::C0 => self.tables.c0 = true,
                 BiosVector::A0 => unreachable!("the BIOS does not expose its A0 table"),
             }
         }
@@ -2218,49 +2301,63 @@ impl BiosHle {
         Ok(12)
     }
 
-    fn allocate(&mut self, size: u32) -> Result<u32, BiosError> {
-        let allocation_size = align_up(size.max(1), 8)?;
-        let heap = self.heap.as_mut().ok_or(BiosError::HeapUnavailable)?;
-        let mut address = heap.base;
-        let mut insertion = heap.blocks.len();
-        for (index, block) in heap.blocks.iter().copied().enumerate() {
-            let candidate_end = address
-                .checked_add(allocation_size)
-                .ok_or(BiosError::AddressOverflow)?;
-            if candidate_end <= block.address {
-                insertion = index;
-                break;
-            }
-            address = block
-                .address
-                .checked_add(block.size)
-                .ok_or(BiosError::AddressOverflow)?;
+    fn allocate_kernel_memory(&mut self, context: &mut CpuContext) -> Result<u32, BiosError> {
+        match allocate_from_heap(&mut self.kernel_heap, context.argument(0)) {
+            Ok(address) => context.return_value(address),
+            Err(BiosError::OutOfMemory { .. }) => context.return_value(u32::MAX),
+            Err(error) => return Err(error),
         }
-        let allocation_end = address
-            .checked_add(allocation_size)
+        Ok(12)
+    }
+
+    fn free_kernel_memory(&mut self, context: &CpuContext) -> u32 {
+        free_from_heap(&mut self.kernel_heap, context.argument(0));
+        6
+    }
+
+    fn initialize_kernel_heap(&mut self, context: &CpuContext) -> Result<u32, BiosError> {
+        let base = align_up(context.argument(0), 8)?;
+        let end = context
+            .argument(0)
+            .checked_add(context.argument(1))
             .ok_or(BiosError::AddressOverflow)?;
-        if allocation_end > heap.end {
-            return Err(BiosError::OutOfMemory { size });
+        if base > end {
+            return Err(BiosError::OutOfMemory {
+                size: context.argument(1),
+            });
         }
-        heap.blocks.insert(
-            insertion,
-            HeapBlock {
-                address,
-                size: allocation_size,
-            },
-        );
-        Ok(address)
+        self.kernel_heap = Heap {
+            base,
+            end,
+            blocks: Vec::new(),
+        };
+        Ok(20)
+    }
+
+    fn initialize_timer_and_vblank_handlers(&mut self, context: &CpuContext) -> u32 {
+        self.kernel_handlers.timer_and_vblank = Some(context.argument(0));
+        12
+    }
+
+    fn initialize_syscall_handler(&mut self, context: &CpuContext) -> u32 {
+        self.kernel_handlers.syscall = Some(context.argument(0));
+        12
+    }
+
+    fn initialize_default_interrupt_handler(&mut self, context: &CpuContext) -> u32 {
+        self.kernel_handlers.default_interrupt = Some(context.argument(0));
+        12
+    }
+
+    fn allocate(&mut self, size: u32) -> Result<u32, BiosError> {
+        let heap = self.heap.as_mut().ok_or(BiosError::HeapUnavailable)?;
+        allocate_from_heap(heap, size)
     }
 
     fn free(&mut self, context: &mut CpuContext) -> u32 {
         let address = context.argument(0);
-        if let Some(heap) = self.heap.as_mut()
-            && let Some(index) = heap
-                .blocks
-                .iter()
-                .position(|block| block.address == address)
-        {
-            heap.blocks.remove(index);
+        if let Some(heap) = self.heap.as_mut() {
+            free_from_heap(heap, address);
         }
         6
     }
@@ -2613,13 +2710,58 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, BiosError> {
         .ok_or(BiosError::AddressOverflow)
 }
 
+fn allocate_from_heap(heap: &mut Heap, size: u32) -> Result<u32, BiosError> {
+    let allocation_size = align_up(size.max(1), 8)?;
+    let mut address = heap.base;
+    let mut insertion = heap.blocks.len();
+    for (index, block) in heap.blocks.iter().copied().enumerate() {
+        let candidate_end = address
+            .checked_add(allocation_size)
+            .ok_or(BiosError::AddressOverflow)?;
+        if candidate_end <= block.address {
+            insertion = index;
+            break;
+        }
+        address = block
+            .address
+            .checked_add(block.size)
+            .ok_or(BiosError::AddressOverflow)?;
+    }
+    let allocation_end = address
+        .checked_add(allocation_size)
+        .ok_or(BiosError::AddressOverflow)?;
+    if allocation_end > heap.end {
+        return Err(BiosError::OutOfMemory { size });
+    }
+    heap.blocks.insert(
+        insertion,
+        HeapBlock {
+            address,
+            size: allocation_size,
+        },
+    );
+    Ok(address)
+}
+
+fn free_from_heap(heap: &mut Heap, address: u32) {
+    if let Some(index) = heap
+        .blocks
+        .iter()
+        .position(|block| block.address == address)
+    {
+        heap.blocks.remove(index);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        A0, B0_CHANGE_CLEAR_PAD_STUB_ADDRESS, B0_STUB_ADDRESS, B0_TABLE_ADDRESS,
+        A0, A0_GET_CONF_STUB_ADDRESS, A0_STUB_ADDRESS, A0_TABLE_ADDRESS,
+        B0_CHANGE_CLEAR_PAD_STUB_ADDRESS, B0_STUB_ADDRESS, B0_TABLE_ADDRESS,
         BIOS_PATCH_SCRATCH_ADDRESS, BIOS_STUB_BYTES, BiosError, BiosHle, BiosVector,
         C0_EXCEPTION_STUB_ADDRESS, C0_STUB_ADDRESS, C0_TABLE_ADDRESS, CpuContext, FP, GP,
-        GuestMemory, GuestMemoryError, HleAction, HleLimits, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP,
+        GuestMemory, GuestMemoryError, HleAction, HleLimits, KERNEL_CONFIG_ADDRESS,
+        KERNEL_MEMORY_ADDRESS, KERNEL_MEMORY_SIZE, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP,
         STRTOK_BUFFER_ADDRESS, T1, V0,
     };
 
@@ -2819,6 +2961,40 @@ mod tests {
         let upper = u32::from_le_bytes(memory.0[upper..upper + 4].try_into().unwrap()) & 0xffff;
         let lower = u32::from_le_bytes(memory.0[lower..lower + 4].try_into().unwrap()) & 0xffff;
         assert_eq!((upper << 16) + lower + 0x28, BIOS_PATCH_SCRATCH_ADDRESS);
+    }
+
+    #[test]
+    fn boot_memory_exposes_fixed_a0_table_and_introspectable_getconf() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 0xc000]);
+        bios.initialize_boot_memory(&mut memory).unwrap();
+
+        let generic_entry = usize::try_from(A0_TABLE_ADDRESS + 0x44 * 4).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                memory.0[generic_entry..generic_entry + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            A0_STUB_ADDRESS + 0x44 * BIOS_STUB_BYTES
+        );
+        let getconf_entry = usize::try_from(A0_TABLE_ADDRESS + 0x9d * 4).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(
+                memory.0[getconf_entry..getconf_entry + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            A0_GET_CONF_STUB_ADDRESS
+        );
+
+        let stub = usize::try_from(A0_GET_CONF_STUB_ADDRESS).unwrap();
+        let upper = u32::from_le_bytes(memory.0[stub..stub + 4].try_into().unwrap()) & 0xffff;
+        let lower = i16::from_le_bytes(memory.0[stub + 4..stub + 6].try_into().unwrap());
+        let decoded = (upper << 16)
+            .wrapping_add(u32::from_ne_bytes(i32::from(lower).to_ne_bytes()))
+            .wrapping_sub(8);
+        assert_eq!(decoded, KERNEL_CONFIG_ADDRESS);
     }
 
     #[test]
@@ -3175,6 +3351,56 @@ mod tests {
         call(&mut bios, BiosVector::A0, 0x30, [7, 0, 0, 0], &mut memory).unwrap();
         let (random, _) = call(&mut bios, BiosVector::A0, 0x2f, [0; 4], &mut memory).unwrap();
         assert_eq!(random.register(V0), Some(19_564));
+    }
+
+    #[test]
+    fn kernel_memory_allocator_is_preinitialized_independent_and_reuses_freed_blocks() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 16]);
+        let (first, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x00,
+            [0x20, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let (second, _) = call(&mut bios, BiosVector::B0, 0x00, [1, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(first.register(V0), Some(KERNEL_MEMORY_ADDRESS));
+        assert_eq!(second.register(V0), Some(KERNEL_MEMORY_ADDRESS + 0x20));
+
+        call(
+            &mut bios,
+            BiosVector::B0,
+            0x01,
+            [KERNEL_MEMORY_ADDRESS, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let (reused, _) = call(&mut bios, BiosVector::B0, 0x00, [8, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(reused.register(V0), Some(KERNEL_MEMORY_ADDRESS));
+
+        let (exhausted, _) = call(
+            &mut BiosHle::default(),
+            BiosVector::B0,
+            0x00,
+            [KERNEL_MEMORY_SIZE + 1, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(exhausted.register(V0), Some(u32::MAX));
+
+        call(
+            &mut bios,
+            BiosVector::C0,
+            0x08,
+            [0xa000_e800, 0x1000, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let (reinitialized, _) =
+            call(&mut bios, BiosVector::B0, 0x00, [16, 0, 0, 0], &mut memory).unwrap();
+        assert_eq!(reinitialized.register(V0), Some(0xa000_e800));
     }
 
     #[test]
@@ -3539,6 +3765,18 @@ mod tests {
             .unwrap();
         assert_eq!(context.register(V0), Some(0xfeed_beef));
         assert_eq!(context.pc, 0x500);
+
+        for (function, priority) in [(0x00, 1), (0x01, 0), (0x0c, 3)] {
+            context.pc = 0x00c0;
+            context.set_register(RA, 0x500);
+            context.set_register(T1, function);
+            context.set_register(A0, priority);
+            bios.dispatch(BiosVector::C0, &mut context, &mut memory)
+                .unwrap();
+        }
+        assert_eq!(bios.kernel_handlers.timer_and_vblank, Some(1));
+        assert_eq!(bios.kernel_handlers.syscall, Some(0));
+        assert_eq!(bios.kernel_handlers.default_interrupt, Some(3));
 
         call(
             &mut bios,
