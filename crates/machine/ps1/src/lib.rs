@@ -40,6 +40,11 @@ const EVENT_SPEC_INTERRUPTED: u32 = 0x0000_0002;
 const EVENT_SPEC_COMMAND_COMPLETE: u32 = 0x0000_0020;
 const EVENT_SPEC_INTERRUPT: u32 = 0x0000_1000;
 const EVENT_CLASS_SPU: u32 = 0xf000_0009;
+const AKAO_DRIVER_EVENT_RETURN: u32 = 0x8005_b0d0;
+const AKAO_DRIVER_EVENT_HANDLE: u32 = 0xf100_0001;
+const AKAO_DRIVER_ARGUMENT_PRELOAD: u32 = 0x8009_80bc;
+const AKAO_DRIVER_SEQUENCE_CALL: u32 = 0x8009_80c0;
+const AKAO_DRIVER_SEQUENCE_DELAY: u32 = 0x8009_80c4;
 
 /// Machine construction and diagnostic policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -527,6 +532,7 @@ impl Ps1Machine {
                     source,
                 })?
         };
+        self.apply_driver_bios_return_quirks(vector, function, &mut context);
         if outcome.action == HleAction::Call {
             self.state.libc_cpu = Some(saved_cpu);
             apply_context(&mut self.state.cpu, &context);
@@ -549,6 +555,49 @@ impl Ps1Machine {
             cycles: outcome.cycles,
             kind: MachineStepKind::Bios(vector),
         })
+    }
+
+    fn apply_driver_bios_return_quirks(
+        &self,
+        vector: BiosVector,
+        function: u8,
+        context: &mut CpuContext,
+    ) {
+        // Work around CaitSith2's crappy Chocobo Racing rip:
+        // The PSF driver from that rip schedules the first sequence-bank
+        // pointer into a call delay slot before initializing its timer event.
+        // The event setup leaves its descriptor in a0, which the driver then
+        // mistakes for that pointer.
+        if vector == BiosVector::B0
+            && function == 0x0c
+            && context.register(31) == Some(AKAO_DRIVER_EVENT_RETURN)
+            && context.register(4) == Some(AKAO_DRIVER_EVENT_HANDLE)
+            && let Some(argument) = self.akao_driver_sequence_argument()
+        {
+            context.set_register(4, argument);
+        }
+    }
+
+    fn akao_driver_sequence_argument(&self) -> Option<u32> {
+        let preload = self
+            .state
+            .memory
+            .read_u32(AKAO_DRIVER_ARGUMENT_PRELOAD)
+            .ok()?;
+        let sequence_call = self.state.memory.read_u32(AKAO_DRIVER_SEQUENCE_CALL).ok()?;
+        let sequence_delay = self
+            .state
+            .memory
+            .read_u32(AKAO_DRIVER_SEQUENCE_DELAY)
+            .ok()?;
+        if preload & 0xffff_0000 == 0x3c04_0000
+            && sequence_call == 0x0220_f809
+            && sequence_delay == 0x2405_0001
+        {
+            Some((preload & 0xffff) << 16)
+        } else {
+            None
+        }
     }
 
     fn step_syscall(&mut self, cpu_cycles: u32) -> Result<MachineStep, MachineError> {
@@ -1205,6 +1254,39 @@ mod tests {
         assert_eq!(outcome.kind, MachineStepKind::Syscall(2));
         assert_eq!(machine.pc(), 0x8001_0200);
         assert!(machine.state.bios.interrupts_enabled());
+    }
+
+    #[test]
+    fn akao_driver_recovers_sequence_argument_after_event_initialization() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(super::AKAO_DRIVER_ARGUMENT_PRELOAD, 0x3c04_800a)
+            .unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(super::AKAO_DRIVER_SEQUENCE_CALL, 0x0220_f809)
+            .unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(super::AKAO_DRIVER_SEQUENCE_DELAY, 0x2405_0001)
+            .unwrap();
+        let mut context = super::CpuContext::reset(0, 0);
+        context.set_register(4, super::AKAO_DRIVER_EVENT_HANDLE);
+        context.set_register(31, super::AKAO_DRIVER_EVENT_RETURN);
+
+        machine.apply_driver_bios_return_quirks(super::BiosVector::B0, 0x0c, &mut context);
+
+        assert_eq!(context.register(4), Some(0x800a_0000));
+
+        context.set_register(4, super::AKAO_DRIVER_EVENT_HANDLE);
+        context.set_register(31, super::AKAO_DRIVER_EVENT_RETURN + 4);
+        machine.apply_driver_bios_return_quirks(super::BiosVector::B0, 0x0c, &mut context);
+        assert_eq!(context.register(4), Some(super::AKAO_DRIVER_EVENT_HANDLE));
     }
 
     #[test]
