@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 upse-psf = { path = "../crates/formats/shared/psf" }
 upse-psf2-vfs = { path = "../crates/formats/ps2/vfs" }
+upse-irx = { path = "../crates/formats/ps2/irx" }
 
 [[bin]]
 name = "psf_container"
@@ -24,6 +25,13 @@ bench = false
 [[bin]]
 name = "psf2_vfs"
 path = "fuzz_targets/psf2_vfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "irx"
+path = "fuzz_targets/irx.rs"
 test = false
 doc = false
 bench = false

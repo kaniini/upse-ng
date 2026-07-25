@@ -182,8 +182,16 @@ name = "upse-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "upse-irx",
  "upse-psf",
  "upse-psf2-vfs",
+]
+
+[[package]]
+name = "upse-irx"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
