@@ -183,6 +183,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "upse-psf",
+ "upse-psf2-vfs",
 ]
 
 [[package]]
@@ -192,4 +193,13 @@ dependencies = [
  "crc32fast",
  "flate2",
  "thiserror",
+]
+
+[[package]]
+name = "upse-psf2-vfs"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "thiserror",
+ "upse-psf",
 ]

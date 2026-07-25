@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-psf2-vfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+flate2.workspace = true
+thiserror.workspace = true
+upse-psf = { path = "../../shared/psf" }
+
+[lints]
+workspace = true

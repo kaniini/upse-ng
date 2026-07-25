@@ -242,6 +242,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-psf2-vfs"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "thiserror",
+ "upse-psf",
+]
+
+[[package]]
 name = "upse-psx-exe"
 version = "0.1.0"
 dependencies = [

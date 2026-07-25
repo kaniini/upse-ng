@@ -12,10 +12,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 upse-psf = { path = "../crates/formats/shared/psf" }
+upse-psf2-vfs = { path = "../crates/formats/ps2/vfs" }
 
 [[bin]]
 name = "psf_container"
 path = "fuzz_targets/psf_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "psf2_vfs"
+path = "fuzz_targets/psf2_vfs.rs"
 test = false
 doc = false
 bench = false
