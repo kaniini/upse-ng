@@ -145,6 +145,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-iop-irq"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "upse-iop-memory"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "upse-irx"
 version = "0.1.0"
 dependencies = [

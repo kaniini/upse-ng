@@ -20,6 +20,8 @@ members = [
     "crates/hw/ps1/timers",
     "crates/hw/ps1/dma",
     "crates/hw/ps1/spu",
+    "crates/hw/ps2/iop-memory",
+    "crates/hw/ps2/irq",
     "crates/hle/ps1/bios",
     "crates/machine/ps1",
     "crates/api/upse",
