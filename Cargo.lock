@@ -163,6 +163,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-iop-machine"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-clock",
+ "upse-iop-dma",
+ "upse-iop-irq",
+ "upse-iop-memory",
+ "upse-iop-timers",
+ "upse-r3000",
+ "upse-scheduler",
+]
+
+[[package]]
 name = "upse-iop-memory"
 version = "0.1.0"
 dependencies = [

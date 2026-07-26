@@ -165,11 +165,39 @@ pub trait Spu2DmaEndpoint {
     fn read_word(&mut self, channel: SoundDmaChannel) -> Result<u32, EndpointError>;
 }
 
+/// SPU2 register endpoint used by the IOP machine's sound MMIO router.
+pub trait Spu2MmioEndpoint {
+    /// Reads one aligned 16-bit SPU2 register.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError`] when the register is not implemented.
+    fn read_register(&mut self, address: u32) -> Result<u16, EndpointError>;
+
+    /// Writes one aligned 16-bit SPU2 register.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError`] when the register is not implemented.
+    fn write_register(&mut self, address: u32, value: u16) -> Result<(), EndpointError>;
+}
+
 /// Deterministic standalone SPU2 endpoint for DMA and machine tests.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MockSpu2Endpoint {
     written: [Vec<u32>; 2],
     readable: [VecDeque<u32>; 2],
+    registers: Vec<u16>,
+}
+
+impl Default for MockSpu2Endpoint {
+    fn default() -> Self {
+        Self {
+            written: [Vec::new(), Vec::new()],
+            readable: [VecDeque::new(), VecDeque::new()],
+            registers: vec![0; 0x400],
+        }
+    }
 }
 
 impl MockSpu2Endpoint {
@@ -205,6 +233,19 @@ impl Spu2DmaEndpoint for MockSpu2Endpoint {
         self.readable[channel.core()].pop_front().ok_or_else(|| {
             EndpointError::new(format!("SPU2 core {} DMA read underflow", channel.core()))
         })
+    }
+}
+
+impl Spu2MmioEndpoint for MockSpu2Endpoint {
+    fn read_register(&mut self, address: u32) -> Result<u16, EndpointError> {
+        let index = sound_register_index(address)?;
+        Ok(self.registers[index])
+    }
+
+    fn write_register(&mut self, address: u32, value: u16) -> Result<(), EndpointError> {
+        let index = sound_register_index(address)?;
+        self.registers[index] = value;
+        Ok(())
     }
 }
 
@@ -852,6 +893,16 @@ fn write_ram_word(ram: &mut [u8], offset: usize, value: u32) {
     ram[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn sound_register_index(address: u32) -> Result<usize, EndpointError> {
+    if address & 1 != 0 || !(0x1f90_0000..=0x1f90_07fe).contains(&address) {
+        return Err(EndpointError::new(format!(
+            "invalid SPU2 register address {address:#010x}"
+        )));
+    }
+    usize::try_from((address - 0x1f90_0000) / 2)
+        .map_err(|_| EndpointError::new(format!("SPU2 register address too wide: {address:#010x}")))
+}
+
 #[cfg(test)]
 mod tests {
     use upse_clock::Deadline;
@@ -862,7 +913,7 @@ mod tests {
     use super::{
         CHANNEL4_EVENT, CHANNEL7_EVENT, D4_BCR, D4_CHCR, D4_MADR, D7_BCR, D7_CHCR, D7_MADR, DICR1,
         DICR2, DPCR1, DPCR2, DmaController, DmaDirection, DmaError, DmaEvent, MockSpu2Endpoint,
-        SoundDmaChannel,
+        SoundDmaChannel, Spu2MmioEndpoint,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -1127,5 +1178,16 @@ mod tests {
         assert_eq!(CHANNEL4_EVENT.get(), 0x0204_0004);
         assert_eq!(CHANNEL7_EVENT.get(), 0x0207_0007);
         assert_eq!(DmaDirection::FromRam, DmaDirection::FromRam);
+    }
+
+    #[test]
+    fn mock_endpoint_routes_the_complete_spu2_register_window() {
+        let mut endpoint = MockSpu2Endpoint::new();
+        endpoint.write_register(0x1f90_0000, 0x1234).unwrap();
+        endpoint.write_register(0x1f90_07fe, 0xabcd).unwrap();
+        assert_eq!(endpoint.read_register(0x1f90_0000).unwrap(), 0x1234);
+        assert_eq!(endpoint.read_register(0x1f90_07fe).unwrap(), 0xabcd);
+        assert!(endpoint.read_register(0x1f90_0001).is_err());
+        assert!(endpoint.read_register(0x1f90_0800).is_err());
     }
 }
