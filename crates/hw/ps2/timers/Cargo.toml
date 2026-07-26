@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-iop-timers"
+description = "Composable PS2 IOP counters and refresh timing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-iop-irq = { path = "../irq" }
+
+[lints]
+workspace = true

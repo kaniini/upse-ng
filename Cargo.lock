@@ -145,6 +145,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-iop-dma"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-clock",
+ "upse-iop-irq",
+ "upse-iop-memory",
+ "upse-scheduler",
+]
+
+[[package]]
 name = "upse-iop-irq"
 version = "0.1.0"
 dependencies = [
@@ -156,6 +167,14 @@ name = "upse-iop-memory"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "upse-iop-timers"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-iop-irq",
 ]
 
 [[package]]

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-iop-dma"
+description = "Composable PS2 IOP SPU2 DMA channels and endpoint contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-clock = { path = "../../../support/clock" }
+upse-iop-irq = { path = "../irq" }
+upse-iop-memory = { path = "../iop-memory" }
+upse-scheduler = { path = "../../../support/scheduler" }
+
+[lints]
+workspace = true
