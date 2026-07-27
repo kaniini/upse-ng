@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps2-bios"
+description = "Independent high-level PS2 IOP BIOS and module services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-irx = { path = "../../../formats/ps2/irx" }
+
+[lints]
+workspace = true

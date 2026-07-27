@@ -25,6 +25,7 @@ members = [
     "crates/hw/ps2/timers",
     "crates/hw/ps2/dma",
     "crates/hle/ps1/bios",
+    "crates/hle/ps2/bios",
     "crates/machine/ps1",
     "crates/machine/ps2/iop",
     "crates/api/upse",
