@@ -291,7 +291,9 @@ name = "upse-ps2-bios"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "upse-clock",
  "upse-irx",
+ "upse-scheduler",
 ]
 
 [[package]]

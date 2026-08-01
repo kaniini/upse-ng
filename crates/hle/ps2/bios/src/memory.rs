@@ -47,10 +47,10 @@ impl GuestRange {
             || !alignment.is_power_of_two()
             || address % alignment != 0
         {
-            return Err(KernelError::IllegalAddress);
+            return Err(KernelError::IllegalObject);
         }
         if !self.contains(address, size) {
-            return Err(KernelError::IllegalAddress);
+            return Err(KernelError::IllegalObject);
         }
         Ok(())
     }

@@ -77,18 +77,99 @@ pub enum KernelError {
     /// A fixed-capacity table or memory arena is exhausted.
     #[error("not enough memory")]
     NoMemory = -400,
+    /// Kernel object attributes contain unsupported bits.
+    #[error("illegal attributes")]
+    IllegalAttribute = -401,
     /// Entry point or handler address is invalid.
     #[error("illegal entry")]
     IllegalEntry = -402,
-    /// Identifier is outside the supported range.
-    #[error("illegal identifier")]
-    IllegalId = -406,
-    /// Guest pointer is null, unaligned, or outside RAM.
-    #[error("illegal address")]
-    IllegalAddress = -429,
-    /// Allocation mode is not supported.
-    #[error("illegal memory allocation mode")]
-    IllegalMemoryMode = -431,
+    /// Thread priority is outside the IOP range.
+    #[error("illegal thread priority")]
+    IllegalPriority = -403,
+    /// Thread stack is smaller than the IOP minimum.
+    #[error("illegal thread stack size")]
+    IllegalStackSize = -404,
+    /// Wait or dispatch mode contains unsupported bits.
+    #[error("illegal mode")]
+    IllegalMode = -405,
+    /// Special or numeric thread identifier is invalid for the operation.
+    #[error("illegal thread identifier")]
+    IllegalThreadId = -406,
+    /// Thread handle is not present.
+    #[error("unknown thread identifier")]
+    UnknownThreadId = -407,
+    /// Semaphore handle is not present.
+    #[error("unknown semaphore identifier")]
+    UnknownSemaphoreId = -408,
+    /// Event-flag handle is not present.
+    #[error("unknown event-flag identifier")]
+    UnknownEventFlagId = -409,
+    /// Message-box handle is not present.
+    #[error("unknown message-box identifier")]
+    UnknownMessageBoxId = -410,
+    /// Variable-pool handle is not present.
+    #[error("unknown variable-pool identifier")]
+    UnknownVariablePoolId = -411,
+    /// Fixed-pool handle is not present.
+    #[error("unknown fixed-pool identifier")]
+    UnknownFixedPoolId = -412,
+    /// Thread is dormant.
+    #[error("thread is dormant")]
+    Dormant = -413,
+    /// Thread is not dormant.
+    #[error("thread is not dormant")]
+    NotDormant = -414,
+    /// Thread is not suspended.
+    #[error("thread is not suspended")]
+    NotSuspended = -415,
+    /// Thread is not waiting.
+    #[error("thread is not waiting")]
+    NotWaiting = -416,
+    /// Current context cannot block.
+    #[error("current context cannot wait")]
+    CannotWait = -417,
+    /// A wait was released by another thread.
+    #[error("wait was released")]
+    ReleaseWait = -418,
+    /// Semaphore has no available count.
+    #[error("semaphore count is zero")]
+    SemaphoreZero = -419,
+    /// Semaphore count would exceed its maximum.
+    #[error("semaphore count overflow")]
+    SemaphoreOverflow = -420,
+    /// Event-flag condition is not currently satisfied.
+    #[error("event-flag condition is false")]
+    EventFlagCondition = -421,
+    /// Single-waiter event flag already has a waiter.
+    #[error("event flag does not permit multiple waiters")]
+    EventFlagMultiple = -422,
+    /// Event-flag wait pattern is empty.
+    #[error("illegal event-flag pattern")]
+    EventFlagIllegalPattern = -423,
+    /// Message box contains no message.
+    #[error("message box contains no message")]
+    MessageBoxNoMessage = -424,
+    /// A waited-on kernel object was deleted.
+    #[error("waited-on object was deleted")]
+    WaitDeleted = -425,
+    /// Pool address is not an allocated block.
+    #[error("illegal memory block")]
+    IllegalMemoryBlock = -426,
+    /// Pool size or allocation size is invalid.
+    #[error("illegal memory size")]
+    IllegalMemorySize = -427,
+    /// Scratchpad address is invalid.
+    #[error("illegal scratchpad address")]
+    IllegalScratchpadAddress = -428,
+    /// Scratchpad allocation is already in use.
+    #[error("scratchpad is in use")]
+    ScratchpadInUse = -429,
+    /// Scratchpad allocation is not in use.
+    #[error("scratchpad is not in use")]
+    ScratchpadNotInUse = -430,
+    /// Allocation or object type is invalid.
+    #[error("illegal type")]
+    IllegalType = -431,
     /// A zero or overflowing size was supplied.
     #[error("illegal size")]
     IllegalSize = -432,
@@ -120,6 +201,12 @@ pub enum BiosError {
     /// IRX parsing, relocation, or target transfer failed.
     #[error("IOP module load failed: {0}")]
     Irx(#[from] upse_irx::IrxError),
+    /// Checked emulated-time arithmetic overflowed.
+    #[error("IOP kernel clock failed: {0}")]
+    Clock(#[from] upse_clock::ClockError),
+    /// Deterministic timed-event queue exhausted its insertion sequence.
+    #[error("IOP kernel event scheduling failed: {0}")]
+    Scheduler(#[from] upse_scheduler::SchedulerError),
     /// A BIOS operation returned a documented guest error.
     #[error("IOP kernel operation failed: {0}")]
     Kernel(#[from] KernelError),

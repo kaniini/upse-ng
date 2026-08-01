@@ -718,7 +718,7 @@ impl HandlerRegistry {
         let priority = usize::try_from(priority)
             .ok()
             .filter(|priority| *priority < VBLANK_HANDLER_COUNT)
-            .ok_or(KernelError::IllegalId)?;
+            .ok_or(KernelError::IllegalPriority)?;
         guest_range
             .validate(entry, 4, 4)
             .map_err(|_| KernelError::IllegalEntry)?;
@@ -743,7 +743,7 @@ impl HandlerRegistry {
         let priority = usize::try_from(priority)
             .ok()
             .filter(|priority| *priority < VBLANK_HANDLER_COUNT)
-            .ok_or(KernelError::IllegalId)?;
+            .ok_or(KernelError::IllegalPriority)?;
         let handler = self.vblank[phase][priority]
             .take()
             .ok_or(KernelError::HandlerNotFound)?;
@@ -754,7 +754,7 @@ impl HandlerRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::IllegalId`] for a phase other than start/end.
+    /// Returns [`KernelError::IllegalObject`] for a phase other than start/end.
     pub fn dispatch_vblank(&self, phase: u32) -> Result<Vec<CallbackRequest>, KernelError> {
         let phase_index = vblank_phase(phase)?;
         Ok(self.vblank[phase_index]
@@ -780,7 +780,7 @@ fn vblank_phase(phase: u32) -> Result<usize, KernelError> {
     usize::try_from(phase)
         .ok()
         .filter(|phase| *phase < 2)
-        .ok_or(KernelError::IllegalId)
+        .ok_or(KernelError::IllegalObject)
 }
 
 fn validate_library_name(name: &str) -> Result<(), KernelError> {
@@ -1022,8 +1022,8 @@ mod tests {
             (-400_i32).to_le_bytes()
         );
         assert_eq!(
-            KernelError::IllegalAddress.code().to_le_bytes(),
-            (-429_i32).to_le_bytes()
+            KernelError::IllegalObject.code().to_le_bytes(),
+            (-201_i32).to_le_bytes()
         );
         assert_eq!(
             KernelError::IllegalSize.code().to_le_bytes(),

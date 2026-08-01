@@ -10,6 +10,8 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 upse-irx = { path = "../../../formats/ps2/irx" }
+upse-clock = { path = "../../../support/clock" }
+upse-scheduler = { path = "../../../support/scheduler" }
 
 [lints]
 workspace = true

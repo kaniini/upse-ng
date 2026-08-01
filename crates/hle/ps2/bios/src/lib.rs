@@ -7,6 +7,7 @@
 mod allocator;
 mod dispatch;
 mod error;
+mod kernel;
 mod memory;
 mod module;
 mod table;
@@ -17,6 +18,10 @@ pub use dispatch::{
     HandlerRegistry, ImportCall, Trampoline,
 };
 pub use error::{BiosError, KernelError};
+pub use kernel::{
+    EventFlagSpec, FixedPoolSpec, Kernel, KernelEvent, MessageBoxSpec, RescheduleReason,
+    ScheduleAction, SemaphoreSpec, Thread, ThreadSpec, ThreadState, VariablePoolSpec, WaitReason,
+};
 pub use memory::{GuestMemory, GuestMemoryError, GuestRange};
 pub use module::{
     ExportRegistration, ModuleInfo, ModuleInvocation, ModuleRecord, ModuleRegistry, ModuleState,
@@ -36,11 +41,12 @@ pub const DEFAULT_MODULE_CAPACITY: usize = 64;
 pub const DEFAULT_LIBRARY_CAPACITY: usize = 256;
 
 /// Complete instance-owned PS2 IOP BIOS foundation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BiosHle {
     memory: SystemMemory,
     dispatch: DispatchBoundary,
     handlers: HandlerRegistry,
+    kernel: Kernel,
     modules: ModuleRegistry,
 }
 
@@ -55,6 +61,7 @@ impl BiosHle {
             memory: SystemMemory::new(DEFAULT_HEAP_START, DEFAULT_HEAP_END)?,
             dispatch: DispatchBoundary::new(),
             handlers: HandlerRegistry::new(),
+            kernel: Kernel::new(),
             modules: ModuleRegistry::new(),
         })
     }
@@ -68,6 +75,7 @@ impl BiosHle {
         self.memory.reset();
         self.dispatch.reset(guest)?;
         self.handlers.reset();
+        self.kernel.reset();
         self.modules.reset();
         Ok(())
     }
@@ -106,6 +114,18 @@ impl BiosHle {
     #[must_use]
     pub const fn handlers_mut(&mut self) -> &mut HandlerRegistry {
         &mut self.handlers
+    }
+
+    /// Returns thread and synchronization state.
+    #[must_use]
+    pub const fn kernel(&self) -> &Kernel {
+        &self.kernel
+    }
+
+    /// Returns mutable thread and synchronization state.
+    #[must_use]
+    pub const fn kernel_mut(&mut self) -> &mut Kernel {
+        &mut self.kernel
     }
 
     /// Returns the module registry.

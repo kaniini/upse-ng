@@ -71,11 +71,11 @@ impl<T, const N: usize> FixedTable<T, N> {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::IllegalId`] for an out-of-range or occupied slot.
+    /// Returns [`KernelError::IllegalObject`] for an out-of-range or occupied slot.
     pub fn insert_at(&mut self, id: u32, value: T) -> Result<(), KernelError> {
-        let index = self.index(id).ok_or(KernelError::IllegalId)?;
+        let index = self.index(id).ok_or(KernelError::IllegalObject)?;
         if self.entries[index].is_some() {
-            return Err(KernelError::IllegalId);
+            return Err(KernelError::IllegalObject);
         }
         self.entries[index] = Some(value);
         self.len += 1;

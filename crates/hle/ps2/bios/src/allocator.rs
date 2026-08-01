@@ -26,7 +26,7 @@ impl TryFrom<u32> for AllocationMode {
             0 => Ok(Self::First),
             1 => Ok(Self::Last),
             2 => Ok(Self::Address),
-            _ => Err(KernelError::IllegalMemoryMode),
+            _ => Err(KernelError::IllegalType),
         }
     }
 }
@@ -63,10 +63,10 @@ impl SystemMemory {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::IllegalAddress`] for an invalid arena.
+    /// Returns [`KernelError::IllegalObject`] for an invalid arena.
     pub fn new(start: u32, end: u32) -> Result<Self, KernelError> {
         if start == 0 || start >= end || start % SYSMEM_QUANTUM != 0 || end % SYSMEM_QUANTUM != 0 {
-            return Err(KernelError::IllegalAddress);
+            return Err(KernelError::IllegalObject);
         }
         Ok(Self {
             start,
@@ -118,7 +118,7 @@ impl SystemMemory {
             return Err(KernelError::IllegalSize);
         }
         if alignment < SYSMEM_QUANTUM || !alignment.is_power_of_two() {
-            return Err(KernelError::IllegalAddress);
+            return Err(KernelError::IllegalObject);
         }
         if self.allocations.next_id().is_none() {
             return Err(KernelError::NoMemory);
@@ -129,7 +129,7 @@ impl SystemMemory {
             AllocationMode::Last => self.find_last(reserved, alignment),
             AllocationMode::Address => {
                 if address % alignment != 0 {
-                    return Err(KernelError::IllegalAddress);
+                    return Err(KernelError::IllegalObject);
                 }
                 self.is_free(address, reserved).then_some(address)
             }
@@ -149,16 +149,16 @@ impl SystemMemory {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::IllegalAddress`] for an unknown block.
+    /// Returns [`KernelError::IllegalObject`] for an unknown block.
     pub fn free(&mut self, address: u32) -> Result<Allocation, KernelError> {
         let id = self
             .allocations
             .iter()
             .find_map(|(id, allocation)| (allocation.address == address).then_some(id))
-            .ok_or(KernelError::IllegalAddress)?;
+            .ok_or(KernelError::IllegalObject)?;
         self.allocations
             .remove(id)
-            .ok_or(KernelError::IllegalAddress)
+            .ok_or(KernelError::IllegalObject)
     }
 
     /// Returns the live block beginning at `address`.
@@ -304,7 +304,7 @@ mod tests {
         );
         assert_eq!(
             memory.allocate(AllocationMode::Address, 1, 0x1080),
-            Err(KernelError::IllegalAddress)
+            Err(KernelError::IllegalObject)
         );
         assert_eq!(
             memory.allocate(AllocationMode::Address, 0x2000, 0x1000),
