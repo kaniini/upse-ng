@@ -88,6 +88,8 @@ pub enum MachineStepKind {
     CallbackReturn,
     /// One comparator callback resumed or completed a libc HLE routine.
     LibcCallback,
+    /// A null indirect call returned without modifying guest low memory.
+    NullCall,
     /// Guest execution is halted while devices continue advancing.
     Halt,
     /// One default BIOS hardware interrupt handler returned from exception.
@@ -389,6 +391,18 @@ impl Ps1Machine {
             self.state.bios.enter_callback(&mut context, callback)?;
             self.state.callback_cpu = Some(saved_cpu);
             apply_context(&mut self.state.cpu, &context);
+        }
+        if self.state.cpu.pc() == 0
+            && self.state.memory.read_u32(0)? == 0
+            && self.state.memory.read_u32(4)? == 0
+        {
+            let return_pc = self.state.cpu.register(31).unwrap_or(0);
+            self.state.cpu.set_pc(return_pc);
+            self.advance_devices(2, synchronize_devices)?;
+            return Ok(MachineStep {
+                cycles: 2,
+                kind: MachineStepKind::NullCall,
+            });
         }
         if let Some(vector) = bios_vector(self.state.cpu.pc()) {
             return self.step_bios(vector);
@@ -1213,6 +1227,31 @@ mod tests {
         let mut reset = [0_i16; 32];
         machine.render(16, &mut reset).unwrap();
         assert_eq!(reset, golden);
+    }
+
+    #[test]
+    fn null_indirect_calls_return_without_claiming_low_ram() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        assert_eq!(machine.state.memory.read_u32(0).unwrap(), 0);
+        assert_eq!(machine.state.memory.read_u32(4).unwrap(), 0);
+
+        machine.state.cpu.set_register(31, 0x8001_0100);
+        machine.state.cpu.set_pc(0);
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::NullCall);
+        assert_eq!(outcome.cycles, 2);
+        assert_eq!(machine.pc(), 0x8001_0100);
+
+        machine
+            .state
+            .memory
+            .write_u32(0, instruction_addiu(2, 0, 7))
+            .unwrap();
+        machine.state.cpu.set_pc(0);
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Cpu(StepEvent::Instruction));
+        assert_eq!(machine.state.cpu.register(2), Some(7));
     }
 
     #[test]
