@@ -308,6 +308,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-ps2-spu2"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-iop-dma",
+ "upse-iop-irq",
+ "upse-spu-common",
+]
+
+[[package]]
 name = "upse-psf"
 version = "0.1.0"
 dependencies = [

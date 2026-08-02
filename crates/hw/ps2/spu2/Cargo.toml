@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps2-spu2"
+description = "Standalone two-core PlayStation 2 sound processing unit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-iop-dma = { path = "../dma" }
+upse-iop-irq = { path = "../irq" }
+upse-spu-common = { path = "../../shared/spu-common" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "reference_mixer"
+harness = false
