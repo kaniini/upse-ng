@@ -358,7 +358,7 @@ impl Kernel {
         spec: ThreadSpec,
         guest_range: GuestRange,
     ) -> Result<u32, KernelError> {
-        validate_attributes(spec.attributes)?;
+        validate_thread_attributes(spec.attributes)?;
         validate_priority(spec.priority)?;
         if spec.stack_size < MIN_STACK_SIZE {
             return Err(KernelError::IllegalStackSize);
@@ -726,7 +726,7 @@ impl Kernel {
     ///
     /// Returns an attribute or capacity error.
     pub fn create_event_flag(&mut self, spec: EventFlagSpec) -> Result<u32, KernelError> {
-        if spec.attributes & !0x3 != 0 {
+        if spec.attributes & !0x103 != 0 {
             return Err(KernelError::IllegalAttribute);
         }
         self.event_flags.insert(EventFlag {
@@ -1560,7 +1560,16 @@ fn validate_priority(priority: u32) -> Result<(), KernelError> {
 }
 
 fn validate_attributes(attributes: u32) -> Result<(), KernelError> {
-    if attributes <= 1 {
+    if attributes & !0x101 == 0 {
+        Ok(())
+    } else {
+        Err(KernelError::IllegalAttribute)
+    }
+}
+
+fn validate_thread_attributes(attributes: u32) -> Result<(), KernelError> {
+    const THREAD_ATTRIBUTE_MASK: u32 = 0x0330_0008;
+    if attributes & !THREAD_ATTRIBUTE_MASK == 0 {
         Ok(())
     } else {
         Err(KernelError::IllegalAttribute)

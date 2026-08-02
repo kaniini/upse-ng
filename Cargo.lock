@@ -184,6 +184,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "upse-iop-services"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "upse-clock",
+ "upse-irx",
+ "upse-ps2-bios",
+ "upse-psf2-vfs",
+]
+
+[[package]]
 name = "upse-iop-timers"
 version = "0.1.0"
 dependencies = [
