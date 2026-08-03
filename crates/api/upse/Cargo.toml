@@ -8,8 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["psf1"]
+default = ["psf1", "psf2"]
 psf1 = ["dep:upse-ps1-machine"]
+psf2 = ["dep:upse-ps2-machine"]
 
 [dependencies]
 thiserror.workspace = true
@@ -17,6 +18,7 @@ upse-audio = { path = "../../support/audio" }
 upse-audio-types = { path = "../../support/audio-types" }
 upse-psf = { path = "../../formats/shared/psf" }
 upse-ps1-machine = { path = "../../machine/ps1", optional = true }
+upse-ps2-machine = { path = "../../machine/ps2", optional = true }
 
 [lints]
 workspace = true

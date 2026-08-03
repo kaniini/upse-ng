@@ -36,7 +36,8 @@ c++ -std=c++17 -Wall -Wextra -Werror -pedantic $sanitizers $cflags \
     "$root/tests/c-api/test.cpp" -o "$binary_dir/test-cxx" $libs -pthread
 
 "$binary_dir/test-c" "$fixture_dir/synthetic.psf" \
-    "$fixture_dir/synthetic.minipsf" "$fixture_dir/library.psflib"
+    "$fixture_dir/synthetic.minipsf" "$fixture_dir/library.psflib" \
+    "$fixture_dir/synthetic.psf2"
 "$binary_dir/test-cxx" "$fixture_dir/synthetic.psf"
 
 make -C "$root/examples" clean
@@ -46,6 +47,7 @@ make -C "$root/examples"
     "$fixture_dir/synthetic.psf"
 "$root/examples/upse123" --driver null --seek 00:00:00.005 \
     "$fixture_dir/synthetic.psf"
+"$root/examples/upse123" --driver null "$fixture_dir/synthetic.psf2"
 if "$root/examples/upse123" --driver null --seek 00:60:00 \
     "$fixture_dir/synthetic.psf"; then
     echo "upse123 accepted an invalid seek time" >&2

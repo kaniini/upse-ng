@@ -14,8 +14,9 @@ mod table;
 
 pub use allocator::{Allocation, AllocationMode, SYSMEM_QUANTUM, SystemMemory};
 pub use dispatch::{
-    CallbackRequest, ControlBlock, CpuContext, DispatchBoundary, DispatchCall, ExceptionCode,
-    HandlerRegistry, ImportCall, Trampoline,
+    CallbackRequest, ControlBlock, CpuContext, DispatchBoundary, DispatchCall, EXCEPTION_ENTRY,
+    ExceptionCode, HandlerRegistry, IMPORT_ENTRY, INTERRUPT_ENTRY, ImportCall, RETURN_ENTRY,
+    SYSCALL_ENTRY, Trampoline,
 };
 pub use error::{BiosError, KernelError};
 pub use kernel::{
@@ -43,11 +44,11 @@ pub const DEFAULT_LIBRARY_CAPACITY: usize = 256;
 /// Complete instance-owned PS2 IOP BIOS foundation.
 #[derive(Clone, Debug)]
 pub struct BiosHle {
-    memory: SystemMemory,
-    dispatch: DispatchBoundary,
-    handlers: HandlerRegistry,
-    kernel: Kernel,
-    modules: ModuleRegistry,
+    memory: Box<SystemMemory>,
+    dispatch: Box<DispatchBoundary>,
+    handlers: Box<HandlerRegistry>,
+    kernel: Box<Kernel>,
+    modules: Box<ModuleRegistry>,
 }
 
 impl BiosHle {
@@ -58,11 +59,11 @@ impl BiosHle {
     /// Returns [`KernelError`] if the configured arena is invalid.
     pub fn new() -> Result<Self, KernelError> {
         Ok(Self {
-            memory: SystemMemory::new(DEFAULT_HEAP_START, DEFAULT_HEAP_END)?,
-            dispatch: DispatchBoundary::new(),
-            handlers: HandlerRegistry::new(),
-            kernel: Kernel::new(),
-            modules: ModuleRegistry::new(),
+            memory: Box::new(SystemMemory::new(DEFAULT_HEAP_START, DEFAULT_HEAP_END)?),
+            dispatch: Box::new(DispatchBoundary::new()),
+            handlers: Box::new(HandlerRegistry::new()),
+            kernel: Box::new(Kernel::new()),
+            modules: Box::new(ModuleRegistry::new()),
         })
     }
 
@@ -143,7 +144,7 @@ impl BiosHle {
     /// Returns the allocator and module registry as disjoint mutable parts.
     #[must_use]
     pub fn memory_and_modules_mut(&mut self) -> (&mut SystemMemory, &mut ModuleRegistry) {
-        (&mut self.memory, &mut self.modules)
+        (self.memory.as_mut(), self.modules.as_mut())
     }
 
     /// Relocates and registers one parsed IOP module.
@@ -156,7 +157,7 @@ impl BiosHle {
         irx: &upse_irx::IrxModule,
         guest: &mut M,
     ) -> Result<u32, BiosError> {
-        self.modules.load(irx, &mut self.memory, guest)
+        self.modules.load(irx, self.memory.as_mut(), guest)
     }
 
     /// Unloads a permitted module and releases all of its system memory.
@@ -169,7 +170,7 @@ impl BiosHle {
         id: u32,
         guest: &mut M,
     ) -> Result<ModuleRecord, BiosError> {
-        self.modules.unload(id, &mut self.memory, guest)
+        self.modules.unload(id, self.memory.as_mut(), guest)
     }
 }
 

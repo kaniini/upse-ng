@@ -112,6 +112,7 @@ dependencies = [
  "upse-audio",
  "upse-audio-types",
  "upse-ps1-machine",
+ "upse-ps2-machine",
  "upse-psf",
 ]
 
@@ -305,6 +306,25 @@ dependencies = [
  "upse-clock",
  "upse-irx",
  "upse-scheduler",
+]
+
+[[package]]
+name = "upse-ps2-machine"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "thiserror",
+ "upse-clock",
+ "upse-iop-machine",
+ "upse-iop-memory",
+ "upse-iop-services",
+ "upse-iop-timers",
+ "upse-irx",
+ "upse-ps2-bios",
+ "upse-ps2-spu2",
+ "upse-psf",
+ "upse-psf2-vfs",
+ "upse-r3000",
 ]
 
 [[package]]

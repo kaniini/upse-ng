@@ -31,6 +31,8 @@ pub enum ServiceFamily {
     Heap,
     /// Hardware timers.
     Timer,
+    /// SPU2 sound-driver services.
+    Sound,
     /// Vertical-blank services.
     VBlank,
     /// C runtime helpers.
@@ -116,6 +118,7 @@ fn library_description(name: &str) -> Option<Library> {
         "thvpool" => (ServiceFamily::VariablePool, 0x0101, 12),
         "heaplib" => (ServiceFamily::Heap, 0x0101, 17),
         "timrman" => (ServiceFamily::Timer, 0x0103, 28),
+        "libsd" => (ServiceFamily::Sound, 0x0105, 33),
         "vblank" => (ServiceFamily::VBlank, 0x0101, 9),
         "sysclib" => (ServiceFamily::Sysclib, 0x0101, 44),
         "stdio" => (ServiceFamily::Stdio, 0x0103, 14),
@@ -186,6 +189,7 @@ fn symbol(family: ServiceFamily, ordinal: u16) -> (&'static str, SupportLevel) {
         (Family::VariablePool, 3..=12) => ("VariablePool", Backend),
         (Family::Heap, 3..=15) => ("Heap", Backend),
         (Family::Timer, 3..=24) => ("TimerManager", Backend),
+        (Family::Sound, 3..=33) => ("SoundDriver", Backend),
         (Family::VBlank, 3..=9) => ("VBlank", Backend),
 
         (Family::Sysclib, 18) => ("prnt", Unsupported),

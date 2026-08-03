@@ -434,19 +434,31 @@ static void *thread_player(void *userdata) {
   return NULL;
 }
 
+static int player_thread_attributes(pthread_attr_t *attributes) {
+  return pthread_attr_init(attributes) == 0 &&
+         pthread_attr_setstacksize(attributes, 4U * 1024U * 1024U) == 0;
+}
+
 static int test_parallel_handles(const struct bytes *module) {
   struct thread_context first = {module, 0, 0};
   struct thread_context second = {module, 0, 0};
   pthread_t first_thread;
   pthread_t second_thread;
+  pthread_attr_t attributes;
 
-  if (pthread_create(&first_thread, NULL, thread_player, &first) != 0) {
+  if (!player_thread_attributes(&attributes)) {
+    return check(0, "pthread attributes");
+  }
+  if (pthread_create(&first_thread, &attributes, thread_player, &first) != 0) {
+    pthread_attr_destroy(&attributes);
     return check(0, "pthread create");
   }
-  if (pthread_create(&second_thread, NULL, thread_player, &second) != 0) {
+  if (pthread_create(&second_thread, &attributes, thread_player, &second) != 0) {
+    pthread_attr_destroy(&attributes);
     pthread_join(first_thread, NULL);
     return check(0, "pthread create");
   }
+  pthread_attr_destroy(&attributes);
   if (pthread_join(first_thread, NULL) != 0 ||
       pthread_join(second_thread, NULL) != 0) {
     return check(0, "pthread join");
@@ -455,33 +467,125 @@ static int test_parallel_handles(const struct bytes *module) {
          check(first.hash == second.hash, "parallel deterministic hash");
 }
 
+static int test_psf2(const struct bytes *module, const char *path) {
+  float samples[256];
+  struct collector collector = {samples, ARRAY_LENGTH(samples), 0, 0,
+                                UPSE_CALLBACK_CONTINUE};
+  upse_player *player = NULL;
+  upse_error *error = NULL;
+  upse_audio_format format = {sizeof(format), 0, 0};
+  upse_render_outcome outcome = {sizeof(outcome), 0, 0};
+  upse_config config;
+  uint64_t frames;
+  size_t index;
+  int audible = 0;
+
+  if (!check(upse_config_init(&config) == UPSE_RESULT_OK,
+             "PSF2 config init")) {
+    return 0;
+  }
+  config.callback_quantum = 64;
+  if (!check(upse_player_open_path(path, &config, &player, &error) ==
+                 UPSE_RESULT_OK &&
+             player != NULL,
+             "PSF2 path open") ||
+      !check(upse_player_audio_format(player, &format, &error) ==
+                     UPSE_RESULT_OK &&
+                 format.sample_rate == 48000 && format.channels == 2,
+             "PSF2 audio format") ||
+      !check(upse_player_length_frames(player, &frames) && frames == 960,
+             "PSF2 length frames") ||
+      !check(upse_player_set_callback(player, collect_audio, &collector,
+                                      &error) == UPSE_RESULT_OK,
+             "PSF2 callback") ||
+      !check(upse_player_render(player, 64, &outcome, &error) ==
+                     UPSE_RESULT_OK &&
+                 outcome.frames == 64,
+             "PSF2 render")) {
+    if (error != NULL) {
+      fprintf(stderr, "PSF2 diagnostic: %s\n", upse_error_message(error));
+    }
+    upse_error_free(error);
+    upse_player_free(player);
+    return 0;
+  }
+  for (index = 0; index < collector.count; ++index) {
+    if (collector.samples[index] != 0.0f) {
+      audible = 1;
+      break;
+    }
+  }
+  upse_error_free(error);
+  upse_player_free(player);
+  return check(audible, "PSF2 non-silent output") &&
+         check(module->size != 0, "PSF2 memory fixture");
+}
+
+static int test_parallel_formats(const struct bytes *psf1,
+                                 const struct bytes *psf2) {
+  struct thread_context first = {psf1, 0, 0};
+  struct thread_context second = {psf2, 0, 0};
+  pthread_t first_thread;
+  pthread_t second_thread;
+  pthread_attr_t attributes;
+
+  if (!player_thread_attributes(&attributes)) {
+    return check(0, "mixed-format pthread attributes");
+  }
+  if (pthread_create(&first_thread, &attributes, thread_player, &first) != 0) {
+    pthread_attr_destroy(&attributes);
+    return check(0, "mixed-format pthread create");
+  }
+  if (pthread_create(&second_thread, &attributes, thread_player, &second) != 0) {
+    pthread_attr_destroy(&attributes);
+    pthread_join(first_thread, NULL);
+    return check(0, "mixed-format pthread create");
+  }
+  pthread_attr_destroy(&attributes);
+  if (pthread_join(first_thread, NULL) != 0 ||
+      pthread_join(second_thread, NULL) != 0) {
+    return check(0, "mixed-format pthread join");
+  }
+  return check(!first.failed && !second.failed,
+               "parallel PSF1 and PSF2 render");
+}
+
 int main(int argc, char **argv) {
   struct bytes module;
   struct bytes root;
   struct bytes library;
+  struct bytes psf2_module;
   int passed;
 
-  if (argc != 4) {
-    fprintf(stderr, "usage: %s SYNTHETIC.psf SYNTHETIC.minipsf LIBRARY.psflib\n",
+  if (argc != 5) {
+    fprintf(stderr,
+            "usage: %s SYNTHETIC.psf SYNTHETIC.minipsf LIBRARY.psflib "
+            "SYNTHETIC.psf2\n",
             argv[0]);
     return EXIT_FAILURE;
   }
   module = read_file(argv[1]);
   root = read_file(argv[2]);
   library = read_file(argv[3]);
-  if (module.data == NULL || root.data == NULL || library.data == NULL) {
+  psf2_module = read_file(argv[4]);
+  if (module.data == NULL || root.data == NULL || library.data == NULL ||
+      psf2_module.data == NULL) {
     fprintf(stderr, "c-api test: cannot read generated fixtures\n");
     free(module.data);
     free(root.data);
     free(library.data);
+    free(psf2_module.data);
     return EXIT_FAILURE;
   }
   passed = test_success_and_callbacks(&module, argv[1]) &&
            test_nulls_and_sizes() && test_resolver_ownership(&root, &library) &&
-           test_seek_equivalence(&module) && test_parallel_handles(&module);
+           test_seek_equivalence(&module) && test_parallel_handles(&module) &&
+           test_psf2(&psf2_module, argv[4]) &&
+           test_parallel_formats(&module, &psf2_module);
   free(module.data);
   free(root.data);
   free(library.data);
+  free(psf2_module.data);
   if (!passed) {
     return EXIT_FAILURE;
   }

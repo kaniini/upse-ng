@@ -342,6 +342,12 @@ impl Cpu {
         self.lo
     }
 
+    /// Replaces the multiply/divide result registers for an HLE context switch.
+    pub fn set_hi_lo(&mut self, hi: u32, lo: u32) {
+        self.hi = hi;
+        self.lo = lo;
+    }
+
     /// Returns COP0 state.
     #[must_use]
     pub const fn cop0(&self) -> &Cop0 {

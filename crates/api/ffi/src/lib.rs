@@ -750,7 +750,9 @@ impl FfiError {
             PlayerError::Duration(_) => UPSE_RESULT_FORMAT,
             PlayerError::UnsupportedVersion => UPSE_RESULT_UNSUPPORTED,
             PlayerError::InvalidQuantum { .. } => UPSE_RESULT_LIMIT,
-            PlayerError::Machine(_) | PlayerError::PostMix(_) => UPSE_RESULT_EMULATION,
+            PlayerError::Psf1Machine(_) | PlayerError::Psf2Machine(_) | PlayerError::PostMix(_) => {
+                UPSE_RESULT_EMULATION
+            }
             PlayerError::Callback { .. } => UPSE_RESULT_CALLBACK_ERROR,
         };
         Self {

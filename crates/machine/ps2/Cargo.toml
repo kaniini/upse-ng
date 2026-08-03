@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps2-machine"
+description = "Complete IOP-only PSF2 playback machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-clock = { path = "../../support/clock" }
+upse-iop-machine = { path = "iop" }
+upse-iop-memory = { path = "../../hw/ps2/iop-memory" }
+upse-iop-services = { path = "../../hle/ps2/iop-services" }
+upse-iop-timers = { path = "../../hw/ps2/timers" }
+upse-irx = { path = "../../formats/ps2/irx" }
+upse-ps2-bios = { path = "../../hle/ps2/bios" }
+upse-ps2-spu2 = { path = "../../hw/ps2/spu2" }
+upse-psf = { path = "../../formats/shared/psf" }
+upse-psf2-vfs = { path = "../../formats/ps2/vfs" }
+upse-r3000 = { path = "../../hw/shared/r3000" }
+
+[dev-dependencies]
+flate2.workspace = true
+
+[lints]
+workspace = true

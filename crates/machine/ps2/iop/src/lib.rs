@@ -206,10 +206,25 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
         &mut self.memory
     }
 
+    /// Returns guest RAM and the sound endpoint as disjoint mutable parts.
+    ///
+    /// This is the composition boundary used by BIOS services which must copy
+    /// guest buffers while also operating the SPU2.
+    #[must_use]
+    pub fn memory_and_sound_mut(&mut self) -> (&mut IopMemory, &mut E) {
+        (&mut self.memory, &mut self.sound)
+    }
+
     /// Returns the interrupt controller.
     #[must_use]
     pub const fn interrupt_controller(&self) -> &InterruptController {
         &self.irq
+    }
+
+    /// Returns the interrupt controller mutably for an HLE interrupt boundary.
+    #[must_use]
+    pub const fn interrupt_controller_mut(&mut self) -> &mut InterruptController {
+        &mut self.irq
     }
 
     /// Returns the timer component.
@@ -236,6 +251,12 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
         &mut self.sound
     }
 
+    /// Returns the sound endpoint and interrupt controller as disjoint mutable parts.
+    #[must_use]
+    pub fn sound_and_interrupt_controller_mut(&mut self) -> (&mut E, &mut InterruptController) {
+        (&mut self.sound, &mut self.irq)
+    }
+
     /// Removes all timestamped hardware events accumulated since the last call.
     pub fn take_hardware_events(&mut self) -> Vec<HardwareEvent> {
         std::mem::take(&mut self.hardware_events)
@@ -248,6 +269,23 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
     ///
     /// Returns a structured CPU, DMA, timer, endpoint, or clock diagnostic.
     pub fn step(&mut self) -> Result<MachineStep, MachineError> {
+        self.step_inner(true)
+    }
+
+    /// Executes one instruction without letting the CPU enter a firmware
+    /// exception vector for the external interrupt line.
+    ///
+    /// A composed BIOS-HLE machine uses this form after routing pending device
+    /// interrupts through its own guarded callback boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured diagnostics as [`Self::step`].
+    pub fn step_without_external_interrupts(&mut self) -> Result<MachineStep, MachineError> {
+        self.step_inner(false)
+    }
+
+    fn step_inner(&mut self, sample_external_interrupt: bool) -> Result<MachineStep, MachineError> {
         let outcome = {
             let mut bus = MachineBus {
                 memory: &mut self.memory,
@@ -259,7 +297,11 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
                 now: self.now,
                 events: &mut self.hardware_events,
             };
-            self.cpu.step(&mut bus)?
+            if sample_external_interrupt {
+                self.cpu.step(&mut bus)?
+            } else {
+                self.cpu.step_without_external_interrupts(&mut bus)?
+            }
         };
         self.advance_devices(u64::from(outcome.cycles))?;
         Ok(MachineStep {

@@ -29,6 +29,7 @@ members = [
     "crates/hle/ps2/bios",
     "crates/hle/ps2/iop-services",
     "crates/machine/ps1",
+    "crates/machine/ps2",
     "crates/machine/ps2/iop",
     "crates/api/upse",
     "crates/api/ffi",

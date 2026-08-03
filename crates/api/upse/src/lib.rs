@@ -47,7 +47,13 @@ pub use upse_psf::{
 use upse_psf::{DurationError, FileResolver, LoadPlan, MemoryResolver, load_plan};
 
 #[cfg(feature = "psf1")]
-use upse_ps1_machine::{MachineConfig, MachineError, Ps1Machine};
+use upse_ps1_machine::{
+    MachineConfig as Ps1MachineConfig, MachineError as Ps1MachineError, Ps1Machine,
+};
+#[cfg(feature = "psf2")]
+use upse_ps2_machine::{
+    MachineConfig as Ps2MachineConfig, MachineError as Ps2MachineError, Ps2Machine,
+};
 
 const DEFAULT_QUANTUM: usize = 1024;
 const MAX_QUANTUM: usize = 65_536;
@@ -103,10 +109,14 @@ pub enum PlayerError {
         /// Configured maximum frames per callback.
         maximum: usize,
     },
-    /// End-to-end machine execution failed.
+    /// End-to-end PSF1 machine execution failed.
     #[cfg(feature = "psf1")]
     #[error("PSF1 machine failure: {0}")]
-    Machine(#[from] MachineError),
+    Psf1Machine(#[from] Ps1MachineError),
+    /// End-to-end PSF2 machine execution failed.
+    #[cfg(feature = "psf2")]
+    #[error("PSF2 machine failure: {0}")]
+    Psf2Machine(#[from] Ps2MachineError),
     /// Final sample conversion failed.
     #[error("audio post-mix failure: {0}")]
     PostMix(#[from] PostMixError),
@@ -242,24 +252,26 @@ pub struct Player {
     format: AudioFormat,
     post_mix: PostMixer,
     callback: Callback,
-    #[cfg(feature = "psf1")]
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
     quantum: usize,
-    #[cfg(feature = "psf1")]
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
     integer_buffer: Vec<i16>,
-    #[cfg(feature = "psf1")]
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
     float_buffer: Vec<f32>,
 }
 
 enum Machine {
     #[cfg(feature = "psf1")]
-    Psf1(Ps1Machine),
-    #[cfg(not(feature = "psf1"))]
+    Psf1(Box<Ps1Machine>),
+    #[cfg(feature = "psf2")]
+    Psf2(Box<Ps2Machine>),
+    #[cfg(not(any(feature = "psf1", feature = "psf2")))]
     #[allow(dead_code)]
     Disabled,
 }
 
 impl Player {
-    #[cfg(feature = "psf1")]
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
     fn from_plan(plan: LoadPlan, quantum: usize, callback: Callback) -> Result<Self, PlayerError> {
         match plan {
             #[cfg(feature = "psf1")]
@@ -271,9 +283,30 @@ impl Player {
                     .map(|duration| duration.to_frames_floor(format.sample_rate()))
                     .transpose()?;
                 let fade = metadata.fade.to_frames_floor(format.sample_rate())?;
-                let machine = Ps1Machine::from_plan(&plan, MachineConfig::default())?;
+                let machine = Ps1Machine::from_plan(&plan, Ps1MachineConfig::default())?;
                 Ok(Self {
-                    machine: Machine::Psf1(machine),
+                    machine: Machine::Psf1(Box::new(machine)),
+                    post_mix: PostMixer::new(metadata.volume, length, fade),
+                    metadata,
+                    format,
+                    callback,
+                    quantum,
+                    integer_buffer: vec![0; quantum * 2],
+                    float_buffer: vec![0.0; quantum * 2],
+                })
+            }
+            #[cfg(feature = "psf2")]
+            LoadPlan::Psf2(plan) => {
+                let metadata = plan.metadata.clone();
+                let format = AudioFormat::stereo(48_000);
+                let length = metadata
+                    .length
+                    .map(|duration| duration.to_frames_floor(format.sample_rate()))
+                    .transpose()?;
+                let fade = metadata.fade.to_frames_floor(format.sample_rate())?;
+                let machine = Ps2Machine::from_plan(&plan, Ps2MachineConfig::default())?;
+                Ok(Self {
+                    machine: Machine::Psf2(Box::new(machine)),
                     post_mix: PostMixer::new(metadata.volume, length, fade),
                     metadata,
                     format,
@@ -288,7 +321,7 @@ impl Player {
         }
     }
 
-    #[cfg(not(feature = "psf1"))]
+    #[cfg(not(any(feature = "psf1", feature = "psf2")))]
     fn from_plan(
         _plan: LoadPlan,
         _quantum: usize,
@@ -328,7 +361,9 @@ impl Player {
         match &mut self.machine {
             #[cfg(feature = "psf1")]
             Machine::Psf1(machine) => machine.reset(),
-            #[cfg(not(feature = "psf1"))]
+            #[cfg(feature = "psf2")]
+            Machine::Psf2(machine) => machine.reset(),
+            #[cfg(not(any(feature = "psf1", feature = "psf2")))]
             Machine::Disabled => {}
         }
         self.post_mix.reset();
@@ -345,7 +380,7 @@ impl Player {
     ///
     /// Returns [`PlayerError`] for emulation/post-mix failures or
     /// [`AudioAction::Error`].
-    #[cfg(feature = "psf1")]
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
     pub fn render(&mut self, max_frames: u64) -> Result<RenderOutcome, PlayerError> {
         let mut delivered = 0_u64;
         while delivered < max_frames {
@@ -368,7 +403,11 @@ impl Player {
                 Machine::Psf1(machine) => {
                     machine.render(frames_usize, &mut self.integer_buffer[..samples])?;
                 }
-                #[cfg(not(feature = "psf1"))]
+                #[cfg(feature = "psf2")]
+                Machine::Psf2(machine) => {
+                    machine.render(frames_usize, &mut self.integer_buffer[..samples])?;
+                }
+                #[cfg(not(any(feature = "psf1", feature = "psf2")))]
                 Machine::Disabled => return Err(PlayerError::UnsupportedVersion),
             }
             self.post_mix.process(
@@ -398,7 +437,7 @@ impl Player {
     /// # Errors
     ///
     /// Always returns [`PlayerError::UnsupportedVersion`].
-    #[cfg(not(feature = "psf1"))]
+    #[cfg(not(any(feature = "psf1", feature = "psf2")))]
     pub fn render(&mut self, _max_frames: u64) -> Result<RenderOutcome, PlayerError> {
         Err(PlayerError::UnsupportedVersion)
     }

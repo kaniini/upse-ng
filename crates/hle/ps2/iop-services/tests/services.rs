@@ -454,6 +454,7 @@ fn every_backend_family_preserves_import_context_and_registers() {
         ("thvpool", 0x0101, 4, ServiceFamily::VariablePool),
         ("heaplib", 0x0101, 4, ServiceFamily::Heap),
         ("timrman", 0x0101, 4, ServiceFamily::Timer),
+        ("libsd", 0x0105, 4, ServiceFamily::Sound),
         ("vblank", 0x0101, 8, ServiceFamily::VBlank),
     ];
     let mut services = IopServices::new(MockFs::default());
