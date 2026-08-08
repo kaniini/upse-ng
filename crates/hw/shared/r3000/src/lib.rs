@@ -259,7 +259,7 @@ pub struct Cpu {
     lo: u32,
     pc: u32,
     next_pc: u32,
-    in_delay_slot: bool,
+    delay_branch_pc: Option<u32>,
     pending_load: Option<(usize, u32)>,
     cop0: Cop0,
     profile: ResetProfile,
@@ -282,7 +282,7 @@ impl Cpu {
             lo: 0,
             pc: profile.pc,
             next_pc: profile.pc.wrapping_add(4),
-            in_delay_slot: false,
+            delay_branch_pc: None,
             pending_load: None,
             cop0: Cop0 {
                 status: profile.status,
@@ -326,7 +326,7 @@ impl Cpu {
     pub fn set_pc(&mut self, pc: u32) {
         self.pc = pc;
         self.next_pc = pc.wrapping_add(4);
-        self.in_delay_slot = false;
+        self.delay_branch_pc = None;
         self.pending_load = None;
     }
 
@@ -397,10 +397,10 @@ impl Cpu {
             self.update_interrupt_line(bus.interrupt_pending());
         }
         let current_pc = self.pc;
-        let in_delay_slot = self.in_delay_slot;
+        let delay_branch_pc = self.delay_branch_pc;
         if sample_external_interrupt && self.interrupt_enabled() {
             self.commit_old_load(None);
-            self.enter_exception(Exception::Interrupt, current_pc, in_delay_slot, None);
+            self.enter_exception(Exception::Interrupt, current_pc, delay_branch_pc, None);
             return Ok(StepOutcome {
                 pc: current_pc,
                 instruction: None,
@@ -413,7 +413,7 @@ impl Cpu {
             self.enter_exception(
                 Exception::AddressLoad,
                 current_pc,
-                in_delay_slot,
+                delay_branch_pc,
                 Some(current_pc),
             );
             return Ok(StepOutcome {
@@ -432,7 +432,7 @@ impl Cpu {
         let execution = self.execute(bus, current_pc, instruction)?;
         if let Some(exception) = execution.exception {
             self.commit_old_load(None);
-            self.enter_exception(exception, current_pc, in_delay_slot, execution.bad_vaddr);
+            self.enter_exception(exception, current_pc, delay_branch_pc, execution.bad_vaddr);
             return Ok(StepOutcome {
                 pc: current_pc,
                 instruction: Some(instruction),
@@ -456,7 +456,7 @@ impl Cpu {
         self.next_pc = execution
             .branch_target
             .unwrap_or_else(|| sequential.wrapping_add(4));
-        self.in_delay_slot = execution.is_branch;
+        self.delay_branch_pc = execution.is_branch.then_some(current_pc);
         self.registers[0] = 0;
         Ok(StepOutcome {
             pc: current_pc,
@@ -702,9 +702,6 @@ impl Cpu {
             }
             _ => result.exception = Some(Exception::ReservedInstruction),
         }
-        if self.in_delay_slot && result.is_branch {
-            result = Execution::exception(Exception::ReservedInstruction);
-        }
         Ok(result)
     }
 
@@ -770,13 +767,13 @@ impl Cpu {
         &mut self,
         exception: Exception,
         pc: u32,
-        in_delay_slot: bool,
+        delay_branch_pc: Option<u32>,
         bad_vaddr: Option<u32>,
     ) {
         self.cop0.cause = (self.cop0.cause & !(0x7c | CAUSE_BD)) | (exception.code() << 2);
-        if in_delay_slot {
+        if let Some(branch_pc) = delay_branch_pc {
             self.cop0.cause |= CAUSE_BD;
-            self.cop0.epc = pc.wrapping_sub(4);
+            self.cop0.epc = branch_pc;
         } else {
             self.cop0.epc = pc;
         }
@@ -791,7 +788,7 @@ impl Cpu {
         };
         self.pc = vector;
         self.next_pc = vector.wrapping_add(4);
-        self.in_delay_slot = false;
+        self.delay_branch_pc = None;
         self.pending_load = None;
     }
 
@@ -876,13 +873,6 @@ impl Default for Execution {
 }
 
 impl Execution {
-    fn exception(exception: Exception) -> Self {
-        Self {
-            exception: Some(exception),
-            ..Self::default()
-        }
-    }
-
     fn write(&mut self, register: usize, value: u32) {
         self.register_write = Some((register, value));
     }
@@ -1128,6 +1118,21 @@ mod tests {
         assert_eq!(cpu.register(1), Some(11));
         assert_eq!(cpu.register(2), Some(20));
         assert_eq!(cpu.register(31), Some(20));
+    }
+
+    #[test]
+    fn branch_in_delay_slot_preserves_both_pipeline_targets() {
+        let mut words = vec![0; 9];
+        words[0] = i(0x04, 0, 0, 3);
+        words[1] = 0x0800_0008;
+        words[4] = i(0x09, 0, 1, 11);
+        words[8] = i(0x09, 0, 2, 22);
+        let mut bus = TestBus::new(&words);
+        let mut cpu = Cpu::new(profile());
+        let pcs = std::array::from_fn::<_, 4, _>(|_| cpu.step(&mut bus).unwrap().pc);
+        assert_eq!(pcs, [0, 4, 16, 32]);
+        assert_eq!(cpu.register(1), Some(11));
+        assert_eq!(cpu.register(2), Some(22));
     }
 
     #[test]
