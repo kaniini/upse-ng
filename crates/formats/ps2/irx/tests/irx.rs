@@ -266,6 +266,23 @@ fn version_one_and_stripped_section_tables_are_identified() {
         IrxVariant::RelocatableV1
     );
 
+    put_u32(&mut v1, IOPMOD_OFFSET, u32::MAX);
+    v1[IOPMOD_OFFSET + 26] = 0;
+    put_u16(&mut v1, IOPMOD_OFFSET + 24, 0);
+    let legacy = IrxModule::parse("legacy.irx", &v1).unwrap();
+    assert_eq!(legacy.description().name, "legacy");
+    assert_eq!(legacy.description().version, 0);
+
+    put_u32(&mut v1, IOPMOD_OFFSET + 8, 0x8030);
+    let module = IrxModule::parse("legacy-gp.irx", &v1).unwrap();
+    let mut target = FixtureTarget::new(MemoryRange {
+        start: 0x9000,
+        end: 0x9000 + u32::try_from(MEMORY_SIZE).unwrap(),
+    });
+    let loaded = module.load_into(0x9000, &mut target).unwrap();
+    assert_eq!(loaded.global_pointer, 0x1_1030);
+    assert_eq!(target.writes, 1);
+
     let mut stripped = ps2sdk_irx_fixture();
     put_u32(&mut stripped, 32, 0);
     put_u16(&mut stripped, 46, 0);

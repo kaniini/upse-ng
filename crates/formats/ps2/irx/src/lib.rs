@@ -519,7 +519,6 @@ impl IrxModule {
                 .ok_or_else(|| self.error(0, IrxErrorKind::Overflow))?,
         })
         .contains(entry, 4)
-            || !target.range().contains(global_pointer, 1)
         {
             return Err(self.error(0, IrxErrorKind::TargetRange));
         }
@@ -802,12 +801,14 @@ impl<'a> Parser<'a> {
         )
         .map_err(|kind| self.error(header.offset as usize + 26, kind))?;
         let (module_id, name, version) = if module_id_raw == u32::MAX {
-            let Some(name) = header_name else {
-                return Err(self.error(
-                    header.offset as usize + 26,
-                    IrxErrorKind::InvalidModuleMetadata,
-                ));
-            };
+            let name = header_name
+                .or_else(|| fallback_module_name(self.origin, self.limits.max_name_bytes))
+                .ok_or_else(|| {
+                    self.error(
+                        header.offset as usize + 26,
+                        IrxErrorKind::InvalidModuleMetadata,
+                    )
+                })?;
             (None, name, header_version)
         } else {
             let module_offset = image_offset(module_id_raw, preferred_address, image.len())
@@ -1406,6 +1407,15 @@ fn parse_fixed_name(bytes: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8(bytes[..end].to_vec()).expect("ASCII library name"))
+}
+
+fn fallback_module_name(origin: &str, max: usize) -> Option<String> {
+    let leaf = origin.rsplit(['/', '\\']).next()?;
+    let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
+    if stem.is_empty() || stem.len() > max || !stem.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return None;
+    }
+    Some(stem.to_owned())
 }
 
 fn image_offset(address: u32, preferred_address: u32, image_size: usize) -> Option<usize> {
