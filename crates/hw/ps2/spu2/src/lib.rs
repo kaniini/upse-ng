@@ -107,6 +107,8 @@ const EFFECT_END_LOW: u32 = 0x33e;
 const ENDX_HIGH: u32 = 0x340;
 const ENDX_LOW: u32 = 0x342;
 const STATUS: u32 = 0x344;
+const STATUS_DMA_READY: u16 = 1 << 7;
+const CORE_ATTR_DMA_MASK: u16 = 3 << 4;
 
 /// One signed-integer stereo sample.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -946,6 +948,9 @@ impl Spu2 {
             MMIX => core.mix = value & 0x0fff,
             CORE_ATTR => {
                 core.attributes = value;
+                if value & CORE_ATTR_DMA_MASK != 0 {
+                    core.status &= !STATUS_DMA_READY;
+                }
                 if value & CORE_ATTR_IRQ_ENABLE == 0 {
                     core.irq_request = false;
                     self.irq_info &= !(1 << (core_index + 2));
@@ -1033,6 +1038,7 @@ impl Spu2DmaEndpoint for Spu2 {
         let bytes = value.to_le_bytes();
         core.write_transfer_halfword(&mut self.ram, u16::from_le_bytes([bytes[0], bytes[1]]));
         core.write_transfer_halfword(&mut self.ram, u16::from_le_bytes([bytes[2], bytes[3]]));
+        core.status |= STATUS_DMA_READY;
         self.refresh_irq_info();
         Ok(())
     }
@@ -1041,6 +1047,7 @@ impl Spu2DmaEndpoint for Spu2 {
         let core = &mut self.cores[channel as usize];
         let low = core.read_transfer_halfword(&self.ram);
         let high = core.read_transfer_halfword(&self.ram);
+        core.status |= STATUS_DMA_READY;
         self.refresh_irq_info();
         Ok(u32::from(low) | (u32::from(high) << 16))
     }
@@ -1192,8 +1199,9 @@ mod tests {
         EFFECT_START_LOW, ENDX_HIGH, IRQA_HIGH, IRQA_LOW, KEY_ON_HIGH, MMIX, MMIX_INPUT_A_DRY_LEFT,
         MMIX_INPUT_A_DRY_RIGHT, MMIX_VOICE_DRY_LEFT, MMIX_VOICE_DRY_RIGHT, MMIX_VOICE_EFFECT_LEFT,
         MMIX_VOICE_EFFECT_RIGHT, PRIMARY_BASE, PRIMARY_STRIDE, SAMPLE_RATE, SOUND_RAM_SIZE,
-        SPU2_BASE, SPU2_END, Spu2, Spu2Error, StereoFrame, TSA_HIGH, TSA_LOW, VMIXEL_HIGH,
-        VMIXER_HIGH, VMIXL_HIGH, VMIXR_HIGH, VOICE_ADDRESS_BASE, VOICE_STRIDE, VOICES_PER_CORE,
+        SPU2_BASE, SPU2_END, STATUS, STATUS_DMA_READY, Spu2, Spu2Error, StereoFrame, TSA_HIGH,
+        TSA_LOW, VMIXEL_HIGH, VMIXER_HIGH, VMIXL_HIGH, VMIXR_HIGH, VOICE_ADDRESS_BASE,
+        VOICE_STRIDE, VOICES_PER_CORE,
     };
 
     fn core_register(core: usize, local: u32) -> u32 {
@@ -1387,6 +1395,10 @@ mod tests {
             .unwrap();
         spu2.write_word(SoundDmaChannel::Core1, 0xaabb_ccdd)
             .unwrap();
+        assert_eq!(
+            spu2.read_register(core_register(1, STATUS)).unwrap() & STATUS_DMA_READY,
+            STATUS_DMA_READY
+        );
         assert_eq!(
             &spu2.ram()[SOUND_RAM_SIZE - 16..SOUND_RAM_SIZE - 12],
             &[0x44, 0x33, 0x22, 0x11]
