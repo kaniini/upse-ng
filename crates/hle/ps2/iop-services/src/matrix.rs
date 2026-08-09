@@ -120,7 +120,7 @@ fn library_description(name: &str) -> Option<Library> {
         "timrman" => (ServiceFamily::Timer, 0x0103, 28),
         "libsd" => (ServiceFamily::Sound, 0x0105, 33),
         "vblank" => (ServiceFamily::VBlank, 0x0101, 9),
-        "sysclib" => (ServiceFamily::Sysclib, 0x0101, 44),
+        "sysclib" => (ServiceFamily::Sysclib, 0x0104, 44),
         "stdio" => (ServiceFamily::Stdio, 0x0103, 14),
         "ioman" => (ServiceFamily::Ioman, 0x0104, 24),
         "sifman" => (ServiceFamily::SifManager, 0x0101, 36),
@@ -196,9 +196,10 @@ fn symbol(family: ServiceFamily, ordinal: u16) -> (&'static str, SupportLevel) {
         (Family::Sysclib, 4..=44) => (sysclib_symbol(ordinal), Local),
         (Family::Stdio, 4..=14) => (stdio_symbol(ordinal), Local),
         (Family::Ioman, 4..=8 | 16) => (ioman_symbol(ordinal), Local),
+        (Family::Ioman, 20 | 21) => (ioman_symbol(ordinal), ReturnOnly),
 
-        (Family::SifManager, 4..=6 | 21..=29) => ("SifState", Local),
-        (Family::SifManager, 7..=20 | 30..=33) => ("SifEeTransfer", Unsupported),
+        (Family::SifManager, 4..=8 | 21..=29) => ("SifState", Local),
+        (Family::SifManager, 9..=20 | 30..=33) => ("SifEeTransfer", Unsupported),
         (Family::SifCommand, 4..=9) => ("SifCommandState", Local),
         (Family::SifCommand, 10..=29) => ("SifEeCommand", Unsupported),
         (Family::Ssbus, 4..=17) => ("SsbusRegister", Local),
@@ -285,6 +286,8 @@ fn ioman_symbol(ordinal: u16) -> &'static str {
         7 => "write",
         8 => "lseek",
         16 => "getstat",
+        20 => "AddDrv",
+        21 => "DelDrv",
         _ => "reserved",
     }
 }

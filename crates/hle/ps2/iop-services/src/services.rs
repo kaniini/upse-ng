@@ -128,6 +128,7 @@ pub struct IopServices<F> {
     ioman: IoManager,
     tty: Vec<String>,
     sif_initialized: bool,
+    next_sif_dma_id: u32,
     sif_flags: [u32; 2],
     sif_registers: [u32; 32],
     ssbus_registers: [u32; 14],
@@ -143,6 +144,7 @@ impl<F> IopServices<F> {
             ioman: IoManager::new(),
             tty: Vec::new(),
             sif_initialized: false,
+            next_sif_dma_id: 1,
             sif_flags: [0; 2],
             sif_registers: [0; 32],
             ssbus_registers: [0; 14],
@@ -155,6 +157,7 @@ impl<F> IopServices<F> {
         self.ioman.reset();
         self.tty.clear();
         self.sif_initialized = false;
+        self.next_sif_dma_id = 1;
         self.sif_flags = [0; 2];
         self.sif_registers = [0; 32];
         self.ssbus_registers = [0; 14];
@@ -388,6 +391,12 @@ impl<F: ReadOnlyFileSystem> IopServices<F> {
                     Ok(0)
                 }
                 6 | 25..=27 => Ok(0),
+                7 => {
+                    let id = self.next_sif_dma_id;
+                    self.next_sif_dma_id = self.next_sif_dma_id.wrapping_add(1).max(1);
+                    Ok(id)
+                }
+                8 => Ok(u32::MAX),
                 21 => Ok(self.sif_flags[0]),
                 22 => {
                     self.sif_flags[0] = arguments[0];

@@ -562,7 +562,7 @@ fn ioman_is_read_only_bounded_and_has_no_host_fallback() {
 }
 
 #[test]
-fn sysclib_stdio_clock_sif_and_ssbus_are_guest_visible() {
+fn sysclib_stdio_and_clock_are_guest_visible() {
     let mut services = IopServices::new(MockFs::default());
     let mut backend = RecordingBackend::default();
     let mut memory = Memory::new();
@@ -592,6 +592,21 @@ fn sysclib_stdio_clock_sif_and_ssbus_are_guest_visible() {
         .unwrap();
     assert_eq!(services.take_tty(), ["value=42 ok\n"]);
 
+    memory.put(0x1400, b"music%03d.bgm %#08x %-5s!\0");
+    memory.put(0x1500, b"ok\0");
+    memory.put(0x1f_0010, &0x1500_u32.to_le_bytes());
+    set_arguments(&mut context, [0x1600, 0x1400, 1, 0x2a]);
+    services
+        .dispatch(
+            import("sysclib", 0x0101, 19),
+            &mut context,
+            &mut memory,
+            &mut backend,
+        )
+        .unwrap();
+    let expected = b"music001.bgm 0x00002a ok   !\0";
+    assert_eq!(&memory.0[0x1600..0x1600 + expected.len()], expected);
+
     set_arguments(&mut context, [1_000_000, 0x1300, 0, 0]);
     services
         .dispatch(
@@ -605,7 +620,14 @@ fn sysclib_stdio_clock_sif_and_ssbus_are_guest_visible() {
         u64::from_le_bytes(memory.0[0x1300..0x1308].try_into().unwrap()),
         36_864_000
     );
+}
 
+#[test]
+fn sif_and_ssbus_are_iop_local() {
+    let mut services = IopServices::new(MockFs::default());
+    let mut backend = RecordingBackend::default();
+    let mut memory = Memory::new();
+    let mut context = ServiceContext::reset(0x1000, 0x1f_0000);
     set_arguments(&mut context, [3, 0x55aa, 0, 0]);
     services
         .dispatch(
@@ -627,6 +649,30 @@ fn sysclib_stdio_clock_sif_and_ssbus_are_guest_visible() {
             .unwrap()
             .v0,
         0x55aa
+    );
+    set_arguments(&mut context, [0x1800, 1, 0, 0]);
+    let transfer = services
+        .dispatch(
+            import("sifman", 0x0101, 7),
+            &mut context,
+            &mut memory,
+            &mut backend,
+        )
+        .unwrap()
+        .v0;
+    assert_ne!(transfer, 0);
+    set_arguments(&mut context, [transfer, 0, 0, 0]);
+    assert_eq!(
+        services
+            .dispatch(
+                import("sifman", 0x0101, 8),
+                &mut context,
+                &mut memory,
+                &mut backend,
+            )
+            .unwrap()
+            .v0,
+        u32::MAX
     );
     set_arguments(&mut context, [2, 0x1234, 0, 0]);
     services

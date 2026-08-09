@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-use std::fmt::Write as _;
-
 use crate::services::{read_bytes, read_c_string, read_u32, write_memory, write_u32};
 use crate::{ServiceContext, ServiceError, ServiceMemory};
 
@@ -12,6 +10,11 @@ const RA: usize = 31;
 const MAX_MEMORY_OPERATION: usize = 16 * 1024 * 1024;
 const MAX_STRING: usize = 4096;
 const MAX_FORMATTED: usize = 16 * 1024;
+const FORMAT_LEFT: u8 = 1 << 0;
+const FORMAT_PLUS: u8 = 1 << 1;
+const FORMAT_SPACE: u8 = 1 << 2;
+const FORMAT_ALTERNATE: u8 = 1 << 3;
+const FORMAT_ZERO: u8 = 1 << 4;
 
 pub(crate) fn dispatch<M: ServiceMemory>(
     ordinal: u16,
@@ -541,20 +544,22 @@ fn format_guest<M: ServiceMemory>(
             output.push('%');
             continue;
         }
-        while characters
-            .peek()
-            .is_some_and(|character| "-+ #0".contains(*character))
-        {
+        let mut spec = FormatSpec::default();
+        while let Some(character) = characters.peek().copied() {
+            match character {
+                '-' => spec.flags |= FORMAT_LEFT,
+                '+' => spec.flags |= FORMAT_PLUS,
+                ' ' => spec.flags |= FORMAT_SPACE,
+                '#' => spec.flags |= FORMAT_ALTERNATE,
+                '0' => spec.flags |= FORMAT_ZERO,
+                _ => break,
+            }
             characters.next();
         }
-        while characters.peek().is_some_and(char::is_ascii_digit) {
-            characters.next();
-        }
+        spec.width = parse_format_number(&mut characters);
         if characters.peek() == Some(&'.') {
             characters.next();
-            while characters.peek().is_some_and(char::is_ascii_digit) {
-                characters.next();
-            }
+            spec.precision = Some(parse_format_number(&mut characters).unwrap_or(0));
         }
         while characters
             .peek()
@@ -565,40 +570,186 @@ fn format_guest<M: ServiceMemory>(
         let specifier = characters.next().unwrap_or('%');
         let value = argument(context, memory, next_argument)?;
         next_argument += 1;
-        match specifier {
-            'd' | 'i' => {
-                let signed = i32::from_ne_bytes(value.to_ne_bytes());
-                write!(&mut output, "{signed}")
-                    .map_err(|_| ServiceError::ResourceLimit("format"))?;
-            }
-            'u' => {
-                write!(&mut output, "{value}")
-                    .map_err(|_| ServiceError::ResourceLimit("format"))?;
-            }
-            'x' | 'p' => write!(&mut output, "{value:x}")
-                .map_err(|_| ServiceError::ResourceLimit("format"))?,
-            'X' => write!(&mut output, "{value:X}")
-                .map_err(|_| ServiceError::ResourceLimit("format"))?,
-            'o' => write!(&mut output, "{value:o}")
-                .map_err(|_| ServiceError::ResourceLimit("format"))?,
-            'c' => output.push(char::from(value.to_le_bytes()[0])),
-            's' => {
-                if value == 0 {
-                    output.push_str("(null)");
-                } else {
-                    output.push_str(&read_c_string(memory, value, MAX_STRING)?);
-                }
-            }
-            other => {
-                output.push('%');
-                output.push(other);
-            }
-        }
+        output.push_str(&format_value(specifier, value, spec, memory)?);
         if output.len() > MAX_FORMATTED {
             return Err(ServiceError::ResourceLimit("formatted output"));
         }
     }
     Ok(output)
+}
+
+fn format_value<M: ServiceMemory>(
+    specifier: char,
+    value: u32,
+    spec: FormatSpec,
+    memory: &M,
+) -> Result<String, ServiceError> {
+    Ok(match specifier {
+        'd' | 'i' => {
+            let signed = i32::from_ne_bytes(value.to_ne_bytes());
+            format_integer(
+                u64::from(signed.unsigned_abs()),
+                10,
+                false,
+                if signed.is_negative() {
+                    Some('-')
+                } else if spec.has(FORMAT_PLUS) {
+                    Some('+')
+                } else if spec.has(FORMAT_SPACE) {
+                    Some(' ')
+                } else {
+                    None
+                },
+                "",
+                spec,
+            )
+        }
+        'u' => format_integer(u64::from(value), 10, false, None, "", spec),
+        'x' => format_integer(
+            u64::from(value),
+            16,
+            false,
+            None,
+            if spec.has(FORMAT_ALTERNATE) && value != 0 {
+                "0x"
+            } else {
+                ""
+            },
+            spec,
+        ),
+        'p' => format_integer(u64::from(value), 16, false, None, "0x", spec),
+        'X' => format_integer(
+            u64::from(value),
+            16,
+            true,
+            None,
+            if spec.has(FORMAT_ALTERNATE) && value != 0 {
+                "0X"
+            } else {
+                ""
+            },
+            spec,
+        ),
+        'o' => format_integer(
+            u64::from(value),
+            8,
+            false,
+            None,
+            if spec.has(FORMAT_ALTERNATE) && value != 0 {
+                "0"
+            } else {
+                ""
+            },
+            spec,
+        ),
+        'c' => apply_format_width(char::from(value.to_le_bytes()[0]).to_string(), spec, false),
+        's' => {
+            let mut text = if value == 0 {
+                "(null)".to_owned()
+            } else {
+                read_c_string(memory, value, MAX_STRING)?
+            };
+            if let Some(precision) = spec.precision {
+                let end = text
+                    .char_indices()
+                    .nth(precision)
+                    .map_or(text.len(), |(index, _)| index);
+                text.truncate(end);
+            }
+            apply_format_width(text, spec, false)
+        }
+        other => {
+            let mut text = String::from('%');
+            text.push(other);
+            text
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FormatSpec {
+    flags: u8,
+    width: Option<usize>,
+    precision: Option<usize>,
+}
+
+impl FormatSpec {
+    const fn has(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+}
+
+fn parse_format_number<I>(characters: &mut std::iter::Peekable<I>) -> Option<usize>
+where
+    I: Iterator<Item = char>,
+{
+    let mut value = None::<usize>;
+    while let Some(digit) = characters
+        .peek()
+        .and_then(|character| character.to_digit(10))
+    {
+        characters.next();
+        value = Some(
+            value
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(usize::try_from(digit).unwrap_or(usize::MAX))
+                .min(MAX_FORMATTED),
+        );
+    }
+    value
+}
+
+fn format_integer(
+    value: u64,
+    radix: u32,
+    uppercase: bool,
+    sign: Option<char>,
+    prefix: &str,
+    spec: FormatSpec,
+) -> String {
+    let mut digits = match (radix, uppercase) {
+        (8, _) => format!("{value:o}"),
+        (16, false) => format!("{value:x}"),
+        (16, true) => format!("{value:X}"),
+        _ => value.to_string(),
+    };
+    if spec.precision == Some(0) && value == 0 {
+        digits.clear();
+    }
+    if let Some(precision) = spec.precision
+        && digits.len() < precision
+    {
+        digits.insert_str(0, &"0".repeat(precision - digits.len()));
+    }
+    let mut text = String::new();
+    if let Some(sign) = sign {
+        text.push(sign);
+    }
+    text.push_str(prefix);
+    text.push_str(&digits);
+    apply_format_width(text, spec, true)
+}
+
+fn apply_format_width(mut text: String, spec: FormatSpec, numeric: bool) -> String {
+    let width = spec.width.unwrap_or(0).min(MAX_FORMATTED);
+    let padding = width.saturating_sub(text.len());
+    if padding == 0 {
+        return text;
+    }
+    if spec.has(FORMAT_LEFT) {
+        text.push_str(&" ".repeat(padding));
+    } else if numeric && spec.has(FORMAT_ZERO) && spec.precision.is_none() {
+        let sign_length = usize::from(text.starts_with(['-', '+', ' ']));
+        let prefix_length = sign_length
+            + usize::from(
+                text[sign_length..].starts_with("0x") || text[sign_length..].starts_with("0X"),
+            ) * 2;
+        text.insert_str(prefix_length, &"0".repeat(padding));
+    } else {
+        text.insert_str(0, &" ".repeat(padding));
+    }
+    text
 }
 
 fn argument<M: ServiceMemory>(
