@@ -28,30 +28,30 @@ pub const SPU2_BASE: u32 = 0x1f90_0000;
 /// Final physical SPU2 register address, inclusive.
 pub const SPU2_END: u32 = 0x1f90_07ff;
 
-/// Mix input A into the dry left bus.
-pub const MMIX_INPUT_A_DRY_LEFT: u16 = 1 << 0;
-/// Mix input A into the dry right bus.
-pub const MMIX_INPUT_A_DRY_RIGHT: u16 = 1 << 1;
-/// Mix input B into the dry left bus.
-pub const MMIX_INPUT_B_DRY_LEFT: u16 = 1 << 2;
-/// Mix input B into the dry right bus.
-pub const MMIX_INPUT_B_DRY_RIGHT: u16 = 1 << 3;
-/// Mix voices into the dry left bus.
-pub const MMIX_VOICE_DRY_LEFT: u16 = 1 << 4;
-/// Mix voices into the dry right bus.
-pub const MMIX_VOICE_DRY_RIGHT: u16 = 1 << 5;
-/// Mix input A into the effect left bus.
-pub const MMIX_INPUT_A_EFFECT_LEFT: u16 = 1 << 6;
 /// Mix input A into the effect right bus.
-pub const MMIX_INPUT_A_EFFECT_RIGHT: u16 = 1 << 7;
-/// Mix input B into the effect left bus.
-pub const MMIX_INPUT_B_EFFECT_LEFT: u16 = 1 << 8;
+pub const MMIX_INPUT_A_EFFECT_RIGHT: u16 = 1 << 0;
+/// Mix input A into the effect left bus.
+pub const MMIX_INPUT_A_EFFECT_LEFT: u16 = 1 << 1;
+/// Mix input A into the dry right bus.
+pub const MMIX_INPUT_A_DRY_RIGHT: u16 = 1 << 2;
+/// Mix input A into the dry left bus.
+pub const MMIX_INPUT_A_DRY_LEFT: u16 = 1 << 3;
 /// Mix input B into the effect right bus.
-pub const MMIX_INPUT_B_EFFECT_RIGHT: u16 = 1 << 9;
-/// Mix voices into the effect left bus.
-pub const MMIX_VOICE_EFFECT_LEFT: u16 = 1 << 10;
+pub const MMIX_INPUT_B_EFFECT_RIGHT: u16 = 1 << 4;
+/// Mix input B into the effect left bus.
+pub const MMIX_INPUT_B_EFFECT_LEFT: u16 = 1 << 5;
+/// Mix input B into the dry right bus.
+pub const MMIX_INPUT_B_DRY_RIGHT: u16 = 1 << 6;
+/// Mix input B into the dry left bus.
+pub const MMIX_INPUT_B_DRY_LEFT: u16 = 1 << 7;
 /// Mix voices into the effect right bus.
-pub const MMIX_VOICE_EFFECT_RIGHT: u16 = 1 << 11;
+pub const MMIX_VOICE_EFFECT_RIGHT: u16 = 1 << 8;
+/// Mix voices into the effect left bus.
+pub const MMIX_VOICE_EFFECT_LEFT: u16 = 1 << 9;
+/// Mix voices into the dry right bus.
+pub const MMIX_VOICE_DRY_RIGHT: u16 = 1 << 10;
+/// Mix voices into the dry left bus.
+pub const MMIX_VOICE_DRY_LEFT: u16 = 1 << 11;
 
 /// Enables one SPU2 core.
 pub const CORE_ATTR_ENABLE: u16 = 1 << 15;
@@ -1320,6 +1320,24 @@ mod tests {
             core1,
             [1_489, 3_580, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091]
         );
+        assert_eq!(
+            output,
+            [
+                1_489, 1_489, 3_580, 3_580, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091,
+                4_091, 4_091, 4_091, 4_091,
+            ]
+        );
+    }
+
+    #[test]
+    fn ffx_mix_registers_keep_the_dry_voice_path_audible() {
+        let mut spu2 = configured_spu2();
+        spu2.write_register(core_register(0, MMIX), 0x0fc0).unwrap();
+        spu2.write_register(core_register(1, MMIX), 0x0fcc).unwrap();
+
+        let mut output = [0_i16; 16];
+        spu2.render(8, &mut output).unwrap();
+
         assert_eq!(
             output,
             [

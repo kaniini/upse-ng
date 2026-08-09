@@ -47,7 +47,7 @@ fn audible_spu2() -> Spu2 {
             .expect("fixture left route is valid");
         spu2.write_register(base + 0x190, 1)
             .expect("fixture right route is valid");
-        spu2.write_register(base + 0x198, if core == 0 { 0x30 } else { 0x33 })
+        spu2.write_register(base + 0x198, if core == 0 { 0x0c00 } else { 0x0c0c })
             .expect("fixture mixer register is valid");
         spu2.write_register(base + 0x19a, if core == 0 { 0xc000 } else { 0xc001 })
             .expect("fixture core attribute is valid");
