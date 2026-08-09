@@ -11,6 +11,8 @@ license.workspace = true
 thiserror.workspace = true
 upse-clock = { path = "../../support/clock" }
 upse-iop-machine = { path = "iop" }
+upse-iop-irq = { path = "../../hw/ps2/irq" }
+upse-iop-dma = { path = "../../hw/ps2/dma" }
 upse-iop-memory = { path = "../../hw/ps2/iop-memory" }
 upse-iop-services = { path = "../../hle/ps2/iop-services" }
 upse-iop-timers = { path = "../../hw/ps2/timers" }

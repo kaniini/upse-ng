@@ -14,10 +14,11 @@
 
 mod services;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use thiserror::Error;
 use upse_clock::{ClockError, Deadline, RateConverter, Ticks};
+use upse_iop_dma::{DmaEvent, SoundDmaChannel};
 use upse_iop_machine::{
     HardwareEventKind, IopMachine, MachineConfig as IopMachineConfig,
     MachineError as IopMachineError,
@@ -27,17 +28,18 @@ use upse_iop_services::{
     GuestAddressRange, ImportRequest, IopServices, ServiceAction, ServiceContext, ServiceError,
     ServiceMemory, ServiceMemoryError, describe_import,
 };
+use upse_iop_timers::{CounterBoundary, TimerId, TimingEvent};
 use upse_irx::{IrxError, IrxModule, ResidentState};
 use upse_ps2_bios::{
     AllocationMode, BiosError, BiosHle, CpuContext, DispatchCall, GuestMemory, GuestMemoryError,
-    GuestRange, KernelError, KernelEvent, RETURN_ENTRY, RescheduleReason,
+    GuestRange, KernelError, KernelEvent, RETURN_ENTRY, RescheduleReason, ThreadSpec,
 };
 use upse_ps2_spu2::{SAMPLE_RATE, Spu2, Spu2Error};
 use upse_psf::Psf2LoadPlan;
 use upse_psf2_vfs::{Psf2Vfs, VfsError, VfsLimits};
 use upse_r3000::{Cpu, Exception, StepEvent};
 
-use services::MachineServices;
+use services::{MachineServices, TimerManager};
 
 const IOP_CLOCK_HZ: u64 = 36_864_000;
 const AUDIO_CHUNK_FRAMES: usize = 256;
@@ -186,6 +188,7 @@ struct ModuleFrame {
     module_id: u32,
     caller: Option<ServiceContext>,
     argument_allocation: Option<u32>,
+    result_address: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,8 +201,13 @@ struct MachineState {
     module_frames: Vec<ModuleFrame>,
     thread_stacks: BTreeMap<u32, u32>,
     callbacks: VecDeque<upse_ps2_bios::CallbackRequest>,
+    interrupt_callbacks: VecDeque<upse_ps2_bios::CallbackRequest>,
+    timer_callbacks: VecDeque<(TimerId, upse_ps2_bios::CallbackRequest)>,
+    timer_manager: TimerManager,
     dma_events: u64,
     callback_active: Option<ActiveCallback>,
+    interrupts_enabled: bool,
+    enabled_interrupts: BTreeSet<u32>,
     halted: bool,
 }
 
@@ -207,6 +215,7 @@ struct MachineState {
 enum ActiveCallback {
     Kernel,
     Interrupt,
+    Timer(TimerId),
 }
 
 /// Fully composed IOP-only PSF2 machine with a post-load reset snapshot.
@@ -266,7 +275,24 @@ impl Ps2Machine {
         hardware
             .memory_mut()
             .load_ram(string_address, b"/psf2.irx\0")?;
-        let mut context = CpuContext::reset(invocation.entry, stack.address + stack.requested_size);
+        let loader_thread = bios.kernel_mut().create_thread(
+            ThreadSpec {
+                entry: invocation.entry,
+                stack: stack.address,
+                stack_size: stack.requested_size,
+                priority: 1,
+                attributes: 0,
+                option: 0,
+            },
+            GuestRange {
+                start: 0,
+                end: RAM_SIZE as u32,
+            },
+        )?;
+        bios.kernel_mut().start_thread(loader_thread, 1)?;
+        let mut context = CpuContext::reset(0, 0);
+        bios.kernel_mut()
+            .reschedule(&mut context, RescheduleReason::HleReturn)?;
         context.set_register(A0, 1);
         context.set_register(A1, arguments.address);
         context.set_register(GP, invocation.global_pointer);
@@ -283,11 +309,17 @@ impl Ps2Machine {
                 module_id: root_id,
                 caller: None,
                 argument_allocation: None,
+                result_address: None,
             }],
-            thread_stacks: BTreeMap::new(),
+            thread_stacks: BTreeMap::from([(loader_thread, stack.address)]),
             callbacks: VecDeque::new(),
+            interrupt_callbacks: VecDeque::new(),
+            timer_callbacks: VecDeque::new(),
+            timer_manager: TimerManager::default(),
             dma_events: 0,
             callback_active: None,
+            interrupts_enabled: true,
+            enabled_interrupts: BTreeSet::new(),
             halted: false,
         };
         Ok(Self {
@@ -313,6 +345,30 @@ impl Ps2Machine {
         self.state.hardware.cpu().pc()
     }
 
+    /// Returns the IOP CPU for debugger-style machine diagnostics.
+    #[must_use]
+    pub const fn cpu(&self) -> &Cpu {
+        self.state.hardware.cpu()
+    }
+
+    /// Returns IOP memory for debugger-style machine diagnostics.
+    #[must_use]
+    pub const fn memory(&self) -> &IopMemory {
+        self.state.hardware.memory()
+    }
+
+    /// Returns the loaded module containing the current PC, when any.
+    #[must_use]
+    pub fn current_module(&self) -> Option<&upse_ps2_bios::ModuleRecord> {
+        self.state.bios.modules().containing(self.pc())
+    }
+
+    /// Returns one loaded module by its BIOS identifier.
+    #[must_use]
+    pub fn module(&self, id: u32) -> Option<&upse_ps2_bios::ModuleRecord> {
+        self.state.bios.modules().get(id)
+    }
+
     /// Removes BIOS/stdio text emitted since the preceding call.
     pub fn take_tty(&mut self) -> Vec<String> {
         self.state.services.take_tty()
@@ -333,6 +389,27 @@ impl Ps2Machine {
         if self.state.hardware.cpu().pc() == RETURN_ENTRY {
             return self.handle_return();
         }
+        self.enter_pending_callback()?;
+        if self.state.callback_active.is_none()
+            && self.state.bios.kernel().current_thread().is_none()
+        {
+            let mut context = bios_context(self.state.hardware.cpu());
+            let schedule = self
+                .state
+                .bios
+                .kernel_mut()
+                .reschedule(&mut context, RescheduleReason::HleReturn)?;
+            if schedule.current.is_some() {
+                apply_bios_context(self.state.hardware.cpu_mut(), &context);
+                self.state.halted = false;
+            } else {
+                self.advance_idle(IDLE_ADVANCE_CYCLES)?;
+                return Ok(MachineStep {
+                    cycles: IDLE_ADVANCE_CYCLES,
+                    kind: MachineStepKind::Idle,
+                });
+            }
+        }
         if self.state.halted || self.in_idle_loop()? {
             self.advance_idle(IDLE_ADVANCE_CYCLES)?;
             return Ok(MachineStep {
@@ -340,7 +417,6 @@ impl Ps2Machine {
                 kind: MachineStepKind::Idle,
             });
         }
-        self.enter_pending_callback()?;
         let before = self.state.hardware.cpu().clone();
         let result = self.state.hardware.step_without_external_interrupts()?;
         let cycles = u64::from(result.cpu.cycles);
@@ -352,9 +428,11 @@ impl Ps2Machine {
             }),
             StepEvent::Exception(Exception::Break) => {
                 let entry = result.cpu.pc;
-                self.dispatch_import(&before, entry)?;
+                let service_cycles = self.dispatch_import(&before, entry)?;
                 Ok(MachineStep {
-                    cycles,
+                    cycles: cycles
+                        .checked_add(service_cycles)
+                        .ok_or(MachineError::ClockOverflow)?,
                     kind: MachineStepKind::Import,
                 })
             }
@@ -395,7 +473,7 @@ impl Ps2Machine {
         Ok(())
     }
 
-    fn dispatch_import(&mut self, cpu: &Cpu, entry: u32) -> Result<(), MachineError> {
+    fn dispatch_import(&mut self, cpu: &Cpu, entry: u32) -> Result<u64, MachineError> {
         let caller_pc = cpu.register(RA).unwrap_or(0).wrapping_sub(8);
         let module_id = self
             .state
@@ -419,6 +497,7 @@ impl Ps2Machine {
             pc: call.pc,
         };
         let mut context = service_context(cpu);
+        context.pc = context.register(RA).unwrap_or(0);
         let outcome = {
             let MachineState {
                 hardware,
@@ -426,14 +505,22 @@ impl Ps2Machine {
                 services,
                 module_frames,
                 thread_stacks,
+                interrupts_enabled,
+                enabled_interrupts,
+                timer_manager,
                 ..
             } = &mut self.state;
             let module_entry_active = !module_frames.is_empty();
-            let (memory, sound) = hardware.memory_and_sound_mut();
+            let (memory, sound, irq, timers) = hardware.memory_sound_interrupts_and_timers_mut();
             let mut memory = IopRam(memory);
             let mut backend = MachineServices {
                 bios: bios.as_mut(),
                 sound,
+                irq,
+                timers,
+                timer_manager,
+                interrupts_enabled,
+                enabled_interrupts,
                 thread_stacks,
                 module_frames,
                 module_entry_active,
@@ -447,7 +534,7 @@ impl Ps2Machine {
         if outcome.action == ServiceAction::Halt {
             self.state.halted = true;
         }
-        Ok(())
+        Ok(0)
     }
 
     fn handle_return(&mut self) -> Result<MachineStep, MachineError> {
@@ -466,6 +553,24 @@ impl Ps2Machine {
                         .bios
                         .dispatch_mut()
                         .return_from_exception(&mut context, &memory)?;
+                }
+                ActiveCallback::Timer(timer) => {
+                    let result = context.register(V0).unwrap_or(0);
+                    self.state
+                        .bios
+                        .kernel_mut()
+                        .return_from_callback(&mut context)?;
+                    self.state
+                        .timer_manager
+                        .finish_callback(timer, result, self.state.hardware.timers_mut())
+                        .map_err(IopMachineError::Timer)?;
+                    let source = timer_interrupt(timer);
+                    let retained =
+                        self.state.hardware.interrupt_controller().status() & !source.bit();
+                    self.state
+                        .hardware
+                        .interrupt_controller_mut()
+                        .acknowledge(retained);
                 }
             }
             apply_bios_context(self.state.hardware.cpu_mut(), &context);
@@ -500,6 +605,12 @@ impl Ps2Machine {
         if let Some(address) = frame.argument_allocation {
             let _ = self.state.bios.memory_mut().free(address);
         }
+        if let Some(address) = frame.result_address {
+            self.state
+                .hardware
+                .memory_mut()
+                .write_u32(address, result)?;
+        }
         if let Some(mut caller) = frame.caller {
             caller.set_register(V0, frame.module_id);
             caller.set_register(V1, result);
@@ -507,11 +618,17 @@ impl Ps2Machine {
             apply_service_context(self.state.hardware.cpu_mut(), &caller);
         } else {
             let mut context = bios_context(self.state.hardware.cpu());
+            let current = self.state.bios.kernel().current_thread();
             let schedule = self
                 .state
                 .bios
                 .kernel_mut()
-                .reschedule(&mut context, RescheduleReason::HleReturn)?;
+                .exit_delete_current(&mut context)?;
+            if let Some(id) = current
+                && let Some(stack) = self.state.thread_stacks.remove(&id)
+            {
+                let _ = self.state.bios.memory_mut().free(stack);
+            }
             if schedule.current.is_some() {
                 apply_bios_context(self.state.hardware.cpu_mut(), &context);
             } else {
@@ -525,7 +642,7 @@ impl Ps2Machine {
     }
 
     fn enter_pending_callback(&mut self) -> Result<(), MachineError> {
-        if self.state.callback_active.is_some() || !self.state.module_frames.is_empty() {
+        if self.state.callback_active.is_some() || !self.state.interrupts_enabled {
             return Ok(());
         }
         if let Some(source) = self.state.hardware.interrupt_controller().first_pending()
@@ -542,6 +659,30 @@ impl Ps2Machine {
             callback.apply(&mut context);
             apply_bios_context(self.state.hardware.cpu_mut(), &context);
             self.state.callback_active = Some(ActiveCallback::Interrupt);
+            return Ok(());
+        }
+        if let Some(callback) = self.state.interrupt_callbacks.pop_front() {
+            let mut context = bios_context(self.state.hardware.cpu());
+            {
+                let mut memory = IopRam(self.state.hardware.memory_mut());
+                self.state
+                    .bios
+                    .dispatch_mut()
+                    .enter_interrupt(&mut context, &mut memory)?;
+            }
+            callback.apply(&mut context);
+            apply_bios_context(self.state.hardware.cpu_mut(), &context);
+            self.state.callback_active = Some(ActiveCallback::Interrupt);
+            return Ok(());
+        }
+        if let Some((timer, callback)) = self.state.timer_callbacks.pop_front() {
+            let mut context = bios_context(self.state.hardware.cpu());
+            self.state
+                .bios
+                .kernel_mut()
+                .enter_callback(&mut context, callback)?;
+            apply_bios_context(self.state.hardware.cpu_mut(), &context);
+            self.state.callback_active = Some(ActiveCallback::Timer(timer));
             return Ok(());
         }
         if let Some(callback) = self.state.callbacks.pop_front() {
@@ -588,12 +729,31 @@ impl Ps2Machine {
             if matches!(event.kind, HardwareEventKind::Dma(_)) {
                 self.state.dma_events = self.state.dma_events.saturating_add(1);
             }
-            if let HardwareEventKind::Timing(upse_iop_timers::TimingEvent::VBlankStart) = event.kind
+            if let HardwareEventKind::Dma(DmaEvent::Completed { channel, .. }) = event.kind {
+                let interrupt = match channel {
+                    SoundDmaChannel::Core0 => 36,
+                    SoundDmaChannel::Core1 => 40,
+                };
+                if self.state.enabled_interrupts.contains(&interrupt)
+                    && let Ok(callback) = self.state.bios.handlers().dispatch_interrupt(interrupt)
+                {
+                    self.state.interrupt_callbacks.push_back(callback);
+                }
+            }
+            if let HardwareEventKind::Timing(TimingEvent::Counter {
+                timer,
+                boundary: CounterBoundary::Target,
+            }) = event.kind
+                && let Some(callback) = self.state.timer_manager.callback(timer)
+            {
+                self.state.timer_callbacks.push_back((timer, callback));
+            }
+            if let HardwareEventKind::Timing(TimingEvent::VBlankStart) = event.kind
                 && let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(0)
             {
                 self.state.callbacks.extend(callbacks);
             }
-            if let HardwareEventKind::Timing(upse_iop_timers::TimingEvent::VBlankEnd) = event.kind
+            if let HardwareEventKind::Timing(TimingEvent::VBlankEnd) = event.kind
                 && let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(1)
             {
                 self.state.callbacks.extend(callbacks);
@@ -643,29 +803,37 @@ pub(crate) fn bind_module_imports<M: ServiceMemory>(
         .to_vec();
     for library in imports {
         for stub in library.stubs {
-            let target = if describe_import(&library.name, stub.ordinal).is_some() {
-                let call = upse_ps2_bios::ImportCall {
-                    library: library.name.clone(),
-                    version: library.version,
-                    ordinal: stub.ordinal,
-                    module_id,
-                    pc: stub.address,
-                };
-                let mut guest = BiosMemoryAdapter(memory);
-                bios.dispatch_mut()
-                    .allocate_import(&mut guest, call)?
-                    .address
-            } else {
-                bios.modules_mut()
+            let target =
+                match bios
+                    .modules_mut()
                     .bind_import(&library.name, library.version, stub.ordinal)
-                    .map_err(|_| MachineError::UnresolvedImport {
-                        library: library.name.clone(),
-                        version: library.version,
-                        ordinal: stub.ordinal,
-                        module_id,
-                    })?
-                    .address
-            };
+                {
+                    Ok(binding) => binding.address,
+                    Err(KernelError::LibraryNotFound)
+                        if describe_import(&library.name, stub.ordinal).is_some() =>
+                    {
+                        let call = upse_ps2_bios::ImportCall {
+                            library: library.name.clone(),
+                            version: library.version,
+                            ordinal: stub.ordinal,
+                            module_id,
+                            pc: stub.address,
+                        };
+                        let mut guest = BiosMemoryAdapter(memory);
+                        bios.dispatch_mut()
+                            .allocate_import(&mut guest, call)?
+                            .address
+                    }
+                    Err(KernelError::LibraryNotFound) => {
+                        return Err(MachineError::UnresolvedImport {
+                            library: library.name.clone(),
+                            version: library.version,
+                            ordinal: stub.ordinal,
+                            module_id,
+                        });
+                    }
+                    Err(error) => return Err(error.into()),
+                };
             let jump = 0x0800_0000 | ((target >> 2) & 0x03ff_ffff);
             memory.write(stub.address, &jump.to_le_bytes())?;
         }
@@ -809,6 +977,17 @@ fn apply_bios_context(cpu: &mut Cpu, context: &CpuContext) {
     let mut service = ServiceContext::reset(context.pc, context.register(29).unwrap_or(0));
     service_context_from_bios(context, &mut service);
     apply_service_context(cpu, &service);
+}
+
+const fn timer_interrupt(timer: TimerId) -> upse_iop_irq::InterruptSource {
+    match timer {
+        TimerId::Timer0 => upse_iop_irq::InterruptSource::Timer0,
+        TimerId::Timer1 => upse_iop_irq::InterruptSource::Timer1,
+        TimerId::Timer2 => upse_iop_irq::InterruptSource::Timer2,
+        TimerId::Timer3 => upse_iop_irq::InterruptSource::Timer3,
+        TimerId::Timer4 => upse_iop_irq::InterruptSource::Timer4,
+        TimerId::Timer5 => upse_iop_irq::InterruptSource::Timer5,
+    }
 }
 
 #[cfg(test)]

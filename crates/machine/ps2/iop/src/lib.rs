@@ -12,6 +12,7 @@ use upse_iop_dma::{
 };
 use upse_iop_irq::{I_MASK, I_STAT, InterruptController};
 use upse_iop_memory::{IopMemory, MemoryError, MemoryRegion, OpenBusPolicy};
+use upse_iop_ssbus::SsbusController;
 use upse_iop_timers::{
     IopTimers, RefreshClock, TIMER0_BASE, TIMER1_BASE, TIMER2_BASE, TIMER3_BASE, TIMER4_BASE,
     TIMER5_BASE, TimerError, TimingEvent, VideoStandard,
@@ -118,6 +119,7 @@ pub struct IopMachine<E> {
     timers: IopTimers,
     refresh: RefreshClock,
     dma: DmaController,
+    ssbus: SsbusController,
     scheduler: Scheduler,
     sound: E,
     now: Deadline,
@@ -139,6 +141,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
             timers: IopTimers::new(),
             refresh: RefreshClock::new(config.video_standard),
             dma: DmaController::new(),
+            ssbus: SsbusController::new(),
             scheduler: Scheduler::new(),
             sound,
             now: Deadline::ZERO,
@@ -215,6 +218,35 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
         (&mut self.memory, &mut self.sound)
     }
 
+    /// Returns guest RAM, sound, and interrupts as disjoint mutable parts.
+    ///
+    /// This is the composition boundary used by BIOS services which combine
+    /// guest-buffer access with sound and interrupt-manager operations.
+    #[must_use]
+    pub fn memory_sound_and_interrupt_controller_mut(
+        &mut self,
+    ) -> (&mut IopMemory, &mut E, &mut InterruptController) {
+        (&mut self.memory, &mut self.sound, &mut self.irq)
+    }
+
+    /// Returns guest RAM, sound, interrupts, and timers as disjoint mutable parts.
+    #[must_use]
+    pub fn memory_sound_interrupts_and_timers_mut(
+        &mut self,
+    ) -> (
+        &mut IopMemory,
+        &mut E,
+        &mut InterruptController,
+        &mut IopTimers,
+    ) {
+        (
+            &mut self.memory,
+            &mut self.sound,
+            &mut self.irq,
+            &mut self.timers,
+        )
+    }
+
     /// Returns the interrupt controller.
     #[must_use]
     pub const fn interrupt_controller(&self) -> &InterruptController {
@@ -231,6 +263,12 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
     #[must_use]
     pub const fn timers(&self) -> &IopTimers {
         &self.timers
+    }
+
+    /// Returns the timer component mutably for BIOS service composition.
+    #[must_use]
+    pub const fn timers_mut(&mut self) -> &mut IopTimers {
+        &mut self.timers
     }
 
     /// Returns the DMA component.
@@ -292,6 +330,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
                 irq: &mut self.irq,
                 timers: &mut self.timers,
                 dma: &mut self.dma,
+                ssbus: &mut self.ssbus,
                 scheduler: &mut self.scheduler,
                 sound: &mut self.sound,
                 now: self.now,
@@ -387,6 +426,7 @@ struct MachineBus<'a, E> {
     irq: &'a mut InterruptController,
     timers: &'a mut IopTimers,
     dma: &'a mut DmaController,
+    ssbus: &'a mut SsbusController,
     scheduler: &'a mut Scheduler,
     sound: &'a mut E,
     now: Deadline,
@@ -403,6 +443,10 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> MachineBus<'_, E> {
             }
             _ if is_timer_address(address) => self.timers.read_u16(address).map_err(bus_fault),
             _ if is_dma_address(address) => self.dma.read_u16(address).map_err(bus_fault),
+            _ if is_ssbus_address(address) => {
+                let value = self.ssbus.read_u32(address & !3).map_err(bus_fault)?;
+                Ok(half(value, address))
+            }
             _ => Err(BusFault::new(format!(
                 "unmodeled IOP MMIO read at {address:#010x}"
             ))),
@@ -435,6 +479,13 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> MachineBus<'_, E> {
                         self.irq,
                         &mut observer,
                     )
+                    .map_err(bus_fault)
+            }
+            _ if is_ssbus_address(address) => {
+                let aligned = address & !3;
+                let old = self.ssbus.read_u32(aligned).map_err(bus_fault)?;
+                self.ssbus
+                    .write_u32(aligned, merge_half(old, address, value))
                     .map_err(bus_fault)
             }
             _ => Err(BusFault::new(format!(
@@ -483,6 +534,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> Bus for MachineBus<'_, E> {
                     self.timers.read_u32(physical).map_err(bus_fault)
                 }
                 _ if is_dma_address(physical) => self.dma.read_u32(physical).map_err(bus_fault),
+                _ if is_ssbus_address(physical) => self.ssbus.read_u32(physical).map_err(bus_fault),
                 _ => Err(BusFault::new(format!(
                     "unmodeled IOP MMIO read at {physical:#010x}"
                 ))),
@@ -543,6 +595,9 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> Bus for MachineBus<'_, E> {
                         )
                         .map_err(bus_fault)
                 }
+                _ if is_ssbus_address(physical) => {
+                    self.ssbus.write_u32(physical, value).map_err(bus_fault)
+                }
                 _ => Err(BusFault::new(format!(
                     "unmodeled IOP MMIO write at {physical:#010x}"
                 ))),
@@ -584,6 +639,10 @@ fn is_dma_address(address: u32) -> bool {
         || (0x1f80_1560..=0x1f80_156a).contains(&address)
         || (DPCR2..=DMAC_ENABLE + 2).contains(&address)
         || address == DICR2
+}
+
+fn is_ssbus_address(address: u32) -> bool {
+    SsbusController::contains(address & !3)
 }
 
 fn half(value: u32, address: u32) -> u16 {

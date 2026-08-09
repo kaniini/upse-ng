@@ -172,6 +172,7 @@ dependencies = [
  "upse-iop-dma",
  "upse-iop-irq",
  "upse-iop-memory",
+ "upse-iop-ssbus",
  "upse-iop-timers",
  "upse-r3000",
  "upse-scheduler",
@@ -193,6 +194,13 @@ dependencies = [
  "upse-irx",
  "upse-ps2-bios",
  "upse-psf2-vfs",
+]
+
+[[package]]
+name = "upse-iop-ssbus"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -315,6 +323,8 @@ dependencies = [
  "flate2",
  "thiserror",
  "upse-clock",
+ "upse-iop-dma",
+ "upse-iop-irq",
  "upse-iop-machine",
  "upse-iop-memory",
  "upse-iop-services",

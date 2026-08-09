@@ -13,6 +13,7 @@ upse-clock = { path = "../../../support/clock" }
 upse-iop-dma = { path = "../../../hw/ps2/dma" }
 upse-iop-irq = { path = "../../../hw/ps2/irq" }
 upse-iop-memory = { path = "../../../hw/ps2/iop-memory" }
+upse-iop-ssbus = { path = "../../../hw/ps2/ssbus" }
 upse-iop-timers = { path = "../../../hw/ps2/timers" }
 upse-r3000 = { path = "../../../hw/shared/r3000" }
 upse-scheduler = { path = "../../../support/scheduler" }

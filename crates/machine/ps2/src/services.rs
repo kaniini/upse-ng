@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use upse_iop_irq::{InterruptController, InterruptSource};
 use upse_iop_services::{
     BackendError, BackendPayload, BackendRequest, BackendResponse, BiosServices, ServiceAction,
     ServiceContext, ServiceFamily, ServiceMemory,
 };
+use upse_iop_timers::{
+    IopTimers, TIMER0_BASE, TIMER1_BASE, TIMER2_BASE, TIMER3_BASE, TIMER4_BASE, TIMER5_BASE,
+    TimerId,
+};
 use upse_irx::IrxModule;
 use upse_ps2_bios::{
-    AllocationMode, BiosHle, EventFlagSpec, GuestRange, KernelError, RescheduleReason,
-    SemaphoreSpec, ThreadSpec,
+    AllocationMode, BiosHle, CallbackRequest, EventFlagSpec, GuestRange, KernelError,
+    RescheduleReason, SemaphoreSpec, ThreadSpec,
 };
 use upse_ps2_spu2::{
     CORE_ATTR_EFFECT_ENABLE, CORE_ATTR_ENABLE, CORE_ATTR_IRQ_ENABLE, CORE_ATTR_UNMUTE,
@@ -26,6 +31,8 @@ const V0: usize = 2;
 const V1: usize = 3;
 const A0: usize = 4;
 const A1: usize = 5;
+const A2: usize = 6;
+const A3: usize = 7;
 const GP: usize = 28;
 const RA: usize = 31;
 const RETURN_ENTRY: u32 = upse_ps2_bios::RETURN_ENTRY;
@@ -36,10 +43,104 @@ const VOICE_ADDRESS_BASE: u32 = 0x1c0;
 const VOICE_ADDRESS_STRIDE: u32 = 0x0c;
 const PRIMARY_BASE: u32 = 0x760;
 const PRIMARY_STRIDE: u32 = 0x28;
+const TIMER_COUNT: usize = 6;
+const TIMER_BASES: [u32; TIMER_COUNT] = [
+    TIMER0_BASE,
+    TIMER1_BASE,
+    TIMER2_BASE,
+    TIMER3_BASE,
+    TIMER4_BASE,
+    TIMER5_BASE,
+];
+const TIMER_ALLOCATION_ORDER: [usize; TIMER_COUNT] = [2, 5, 4, 3, 0, 1];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TimerSlot {
+    allocated: bool,
+    control: u16,
+    compare: u32,
+    handler: Option<(u32, u32)>,
+    callback_pending: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TimerManager {
+    slots: [TimerSlot; TIMER_COUNT],
+}
+
+impl TimerManager {
+    fn allocate(&mut self, source: u32, size: u32, prescale: u32) -> u32 {
+        for index in TIMER_ALLOCATION_ORDER {
+            let compatible = match index {
+                0 => source & 0x0b != 0 && size == 16 && prescale <= 1,
+                1 => source & 0x0d != 0 && size == 16 && prescale <= 1,
+                2 => source & 1 != 0 && size == 16 && prescale <= 8,
+                3 => source & 5 != 0 && size == 32 && prescale <= 1,
+                4 | 5 => source & 1 != 0 && size == 32 && prescale <= 256,
+                _ => false,
+            };
+            if compatible && !self.slots[index].allocated {
+                self.slots[index] = TimerSlot {
+                    allocated: true,
+                    ..TimerSlot::default()
+                };
+                return timer_handle(index);
+            }
+        }
+        kernel_code(-150)
+    }
+
+    fn index(&self, handle: u32) -> Option<usize> {
+        let index = usize::try_from(handle >> 28).ok()?.checked_sub(1)?;
+        (index < TIMER_COUNT
+            && self.slots[index].allocated
+            && handle.wrapping_shl(4) == TIMER_BASES[index])
+            .then_some(index)
+    }
+
+    pub(crate) fn callback(&mut self, timer: TimerId) -> Option<CallbackRequest> {
+        let index = timer as usize;
+        let slot = &mut self.slots[index];
+        let (entry, argument) = slot.handler?;
+        if slot.callback_pending {
+            return None;
+        }
+        slot.callback_pending = true;
+        Some(CallbackRequest {
+            entry,
+            argument,
+            return_address: RETURN_ENTRY,
+            source: index as u32,
+        })
+    }
+
+    pub(crate) fn finish_callback(
+        &mut self,
+        timer: TimerId,
+        result: u32,
+        timers: &mut IopTimers,
+    ) -> Result<(), upse_iop_timers::TimerError> {
+        let index = timer as usize;
+        let slot = &mut self.slots[index];
+        slot.callback_pending = false;
+        if result == 0 {
+            slot.control = 0;
+            timers.write_u32(TIMER_BASES[index] + 4, 0)
+        } else {
+            slot.compare = result;
+            timers.write_u32(TIMER_BASES[index] + 8, result)
+        }
+    }
+}
 
 pub(crate) struct MachineServices<'a> {
     pub(crate) bios: &'a mut BiosHle,
     pub(crate) sound: &'a mut Spu2,
+    pub(crate) irq: &'a mut InterruptController,
+    pub(crate) timers: &'a mut IopTimers,
+    pub(crate) timer_manager: &'a mut TimerManager,
+    pub(crate) interrupts_enabled: &'a mut bool,
+    pub(crate) enabled_interrupts: &'a mut BTreeSet<u32>,
     pub(crate) thread_stacks: &'a mut BTreeMap<u32, u32>,
     pub(crate) module_frames: &'a mut Vec<ModuleFrame>,
     pub(crate) module_entry_active: bool,
@@ -224,7 +325,7 @@ impl MachineServices<'_> {
             25 | 26 => Ok(Self::kernel_result(
                 self.bios.kernel_mut().wakeup_thread(a0).map(|_| 0),
             )),
-            33 | 34 => {
+            33 => {
                 let mut cpu = bios_context_from_service(context);
                 let action = self
                     .bios
@@ -233,6 +334,11 @@ impl MachineServices<'_> {
                     .map_err(backend)?;
                 service_context_from_bios(&cpu, context);
                 Ok(schedule_response(&cpu, action.switched))
+            }
+            34 => {
+                let clock = self.bios.kernel().now().get().to_le_bytes();
+                memory.write(a0, &clock).map_err(backend)?;
+                Ok(BackendResponse::returning(0))
             }
             _ => Err(unsupported("thbase", ordinal)),
         }
@@ -307,7 +413,10 @@ impl MachineServices<'_> {
             6 | 7 => Ok(Self::kernel_result(
                 self.bios.kernel_mut().set_event_flag(a0, a1).map(|_| 0),
             )),
-            8 => {
+            8 | 9 => Ok(Self::kernel_result(
+                self.bios.kernel_mut().clear_event_flag(a0, a1),
+            )),
+            10 => {
                 let mut cpu = bios_context_from_service(context);
                 let result = self
                     .bios
@@ -320,21 +429,222 @@ impl MachineServices<'_> {
                         if a3 != 0 {
                             memory.write(a3, &bits.to_le_bytes()).map_err(backend)?;
                         }
-                        Ok(BackendResponse::returning(bits))
+                        Ok(BackendResponse::returning(0))
                     }
                     Err(schedule) => Ok(schedule_response(&cpu, schedule.switched)),
+                }
+            }
+            11 => {
+                let result = self.bios.kernel_mut().poll_event_flag(a0, a1, a2);
+                match result {
+                    Ok(bits) => {
+                        if a3 != 0 {
+                            memory.write(a3, &bits.to_le_bytes()).map_err(backend)?;
+                        }
+                        Ok(BackendResponse::returning(0))
+                    }
+                    Err(error) => Ok(Self::kernel_result(Err(error))),
                 }
             }
             _ => Err(unsupported("thevent", ordinal)),
         }
     }
 
+    fn dispatch_timer<M: ServiceMemory>(
+        &mut self,
+        ordinal: u16,
+        [a0, a1, a2, a3]: [u32; 4],
+        memory: &M,
+    ) -> Result<BackendResponse, BackendError> {
+        let invalid = || BackendResponse::returning(kernel_code(-157));
+        match ordinal {
+            4 => Ok(BackendResponse::returning(
+                self.timer_manager.allocate(a0, a1, a2),
+            )),
+            6 => {
+                let Some(index) = self.timer_manager.index(a0) else {
+                    return Ok(invalid());
+                };
+                self.timers
+                    .write_u32(TIMER_BASES[index] + 4, 0)
+                    .map_err(backend)?;
+                self.timer_manager.slots[index] = TimerSlot::default();
+                Ok(BackendResponse::returning(0))
+            }
+            20 => {
+                let Some(index) = self.timer_manager.index(a0) else {
+                    return Ok(invalid());
+                };
+                if a2 != 0 && memory.range().validate(a2, 4, 4).is_err() {
+                    return Ok(BackendResponse::returning(kernel_code(-402)));
+                }
+                let slot = &mut self.timer_manager.slots[index];
+                if slot.control != 0 {
+                    return Ok(BackendResponse::returning(kernel_code(-156)));
+                }
+                slot.compare = a1;
+                slot.handler = (a2 != 0).then_some((a2, a3));
+                Ok(BackendResponse::returning(0))
+            }
+            22 => {
+                let Some(index) = self.timer_manager.index(a0) else {
+                    return Ok(invalid());
+                };
+                let mode = match a2 {
+                    0 | 1 | 3 | 5 | 7 => a2 as u16,
+                    _ => return Ok(BackendResponse::returning(kernel_code(-405))),
+                };
+                let external = match a1 {
+                    1 => 0,
+                    2 | 4 => 0x0100,
+                    _ => return Ok(BackendResponse::returning(kernel_code(-152))),
+                };
+                let prescale = match a3 {
+                    1 => 0,
+                    8 if index < 3 => 0x0200,
+                    8 => 0x2000,
+                    16 => 0x4000,
+                    256 => 0x6000,
+                    _ => return Ok(BackendResponse::returning(kernel_code(-153))),
+                };
+                let slot = &mut self.timer_manager.slots[index];
+                if slot.control != 0 {
+                    return Ok(BackendResponse::returning(kernel_code(-154)));
+                }
+                slot.control = mode | external | prescale;
+                Ok(BackendResponse::returning(0))
+            }
+            23 => {
+                let Some(index) = self.timer_manager.index(a0) else {
+                    return Ok(invalid());
+                };
+                let slot = &mut self.timer_manager.slots[index];
+                let mut control = slot.control;
+                if slot.handler.is_some() {
+                    control |= 0x0058;
+                    self.timers
+                        .write_u32(TIMER_BASES[index] + 8, slot.compare)
+                        .map_err(backend)?;
+                    self.irq
+                        .set_mask(self.irq.mask() | timer_interrupt(index).bit());
+                }
+                self.timers
+                    .write_u32(TIMER_BASES[index], 0)
+                    .map_err(backend)?;
+                self.timers
+                    .write_u32(TIMER_BASES[index] + 4, u32::from(control))
+                    .map_err(backend)?;
+                slot.control = control;
+                Ok(BackendResponse::returning(0))
+            }
+            24 => {
+                let Some(index) = self.timer_manager.index(a0) else {
+                    return Ok(invalid());
+                };
+                self.timers
+                    .write_u32(TIMER_BASES[index] + 4, 0)
+                    .map_err(backend)?;
+                self.irq
+                    .set_mask(self.irq.mask() & !timer_interrupt(index).bit());
+                self.timer_manager.slots[index].control = 0;
+                Ok(BackendResponse::returning(0))
+            }
+            _ => Err(unsupported("timrman", ordinal)),
+        }
+    }
+
     fn dispatch_handlers<M: ServiceMemory>(
         &mut self,
         request: &BackendRequest,
-        memory: &M,
+        context: &mut ServiceContext,
+        memory: &mut M,
     ) -> Result<BackendResponse, BackendError> {
         let [a0, a1, a2, a3] = request.arguments;
+        if request.family == ServiceFamily::Interrupt {
+            return match request.import.ordinal {
+                3 | 15 | 16 | 23 => Ok(BackendResponse::returning(0)),
+                6 => {
+                    if let Some(source) = interrupt_source(a0) {
+                        self.irq.set_mask(self.irq.mask() | source.bit());
+                    } else if a0 < 64 {
+                        self.enabled_interrupts.insert(a0);
+                    } else {
+                        return Ok(Self::kernel_result(Err(KernelError::IllegalInterruptCode)));
+                    }
+                    Ok(BackendResponse::returning(0))
+                }
+                7 => {
+                    let enabled = if let Some(source) = interrupt_source(a0) {
+                        let enabled = self.irq.mask() & source.bit() != 0;
+                        self.irq.set_mask(self.irq.mask() & !source.bit());
+                        enabled
+                    } else if a0 < 64 {
+                        self.enabled_interrupts.remove(&a0)
+                    } else {
+                        return Ok(Self::kernel_result(Err(KernelError::IllegalInterruptCode)));
+                    };
+                    if a1 != 0 {
+                        memory
+                            .write(a1, &u32::from(enabled).to_le_bytes())
+                            .map_err(backend)?;
+                    }
+                    Ok(BackendResponse::returning(0))
+                }
+                8 => {
+                    let was_enabled = *self.interrupts_enabled;
+                    *self.interrupts_enabled = false;
+                    Ok(BackendResponse::returning(if was_enabled {
+                        0
+                    } else {
+                        kernel_code(-102)
+                    }))
+                }
+                9 => {
+                    *self.interrupts_enabled = true;
+                    Ok(BackendResponse::returning(0))
+                }
+                17 => {
+                    let was_enabled = *self.interrupts_enabled;
+                    if a0 != 0 {
+                        memory
+                            .write(a0, &u32::from(was_enabled).to_le_bytes())
+                            .map_err(backend)?;
+                    }
+                    *self.interrupts_enabled = false;
+                    Ok(BackendResponse::returning(if was_enabled {
+                        0
+                    } else {
+                        kernel_code(-102)
+                    }))
+                }
+                18 => {
+                    *self.interrupts_enabled = a0 != 0;
+                    Ok(BackendResponse::returning(0))
+                }
+                24 => Ok(BackendResponse::returning(
+                    context.register(29).unwrap_or(0),
+                )),
+                _ => {
+                    let result = match request.import.ordinal {
+                        4 => self.bios.handlers_mut().register_interrupt(
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            guest_range(memory),
+                        ),
+                        5 => self.bios.handlers_mut().release_interrupt(a0).map(|_| ()),
+                        _ => {
+                            return Err(unsupported(
+                                &request.import.library,
+                                request.import.ordinal,
+                            ));
+                        }
+                    };
+                    Ok(Self::kernel_result(result.map(|()| 0)))
+                }
+            };
+        }
         let result = match (request.family, request.import.ordinal) {
             (ServiceFamily::Exception, 4) => {
                 self.bios
@@ -343,14 +653,6 @@ impl MachineServices<'_> {
             }
             (ServiceFamily::Exception, 5) => {
                 self.bios.handlers_mut().release_exception(a0).map(|_| ())
-            }
-            (ServiceFamily::Interrupt, 4) => {
-                self.bios
-                    .handlers_mut()
-                    .register_interrupt(a0, a1, a2, a3, guest_range(memory))
-            }
-            (ServiceFamily::Interrupt, 5) => {
-                self.bios.handlers_mut().release_interrupt(a0).map(|_| ())
             }
             (ServiceFamily::VBlank, 8) => {
                 self.bios
@@ -373,6 +675,7 @@ impl MachineServices<'_> {
         context: &mut ServiceContext,
         memory: &mut M,
     ) -> Result<BackendResponse, BackendError> {
+        let result_address = request.arguments[3];
         let BackendPayload::Module {
             path,
             bytes,
@@ -382,30 +685,23 @@ impl MachineServices<'_> {
         else {
             return Err(BackendError::new("module request has no VFS payload"));
         };
-        let irx = IrxModule::parse(path, &bytes).map_err(backend)?;
+        let irx = IrxModule::parse(&path, &bytes).map_err(backend)?;
         let id = {
             let mut guest = BiosMemoryAdapter(memory);
-            self.bios.load_module(&irx, &mut guest).map_err(backend)?
+            self.bios.load_module(&irx, &mut guest).map_err(|error| {
+                BackendError::new(format!(
+                    "cannot load {path} (image {:#x}, alignment {:#x}): {error}",
+                    irx.allocation_size(),
+                    irx.alignment()
+                ))
+            })?
         };
         bind_module_imports(self.bios, memory, id).map_err(backend)?;
         if !start {
             return Ok(BackendResponse::returning(id));
         }
-        let argument_address = if arguments.is_empty() {
-            0
-        } else {
-            let size = u32::try_from(arguments.len())
-                .map_err(|_| BackendError::new("module argument block exceeds IOP width"))?;
-            let allocation = self
-                .bios
-                .memory_mut()
-                .allocate(AllocationMode::First, size, 0)
-                .map_err(backend)?;
-            memory
-                .write(allocation.address, &arguments)
-                .map_err(backend)?;
-            allocation.address
-        };
+        let (argument_address, argument_count) =
+            marshal_module_arguments(self.bios, memory, &path, &arguments)?;
         let invocation = {
             let mut guest = BiosMemoryAdapter(memory);
             self.bios
@@ -416,11 +712,20 @@ impl MachineServices<'_> {
         self.module_frames.push(ModuleFrame {
             module_id: id,
             caller: Some(context.clone()),
-            argument_allocation: (argument_address != 0).then_some(argument_address),
+            argument_allocation: Some(argument_address),
+            result_address: (result_address != 0).then_some(result_address),
         });
         context.pc = invocation.entry;
-        context.set_register(A0, u32::try_from(arguments.len()).unwrap_or(u32::MAX));
+        context.set_register(A0, argument_count);
         context.set_register(A1, argument_address);
+        context.set_register(A2, 0);
+        context.set_register(
+            A3,
+            self.bios
+                .modules()
+                .get(id)
+                .map_or(0, upse_ps2_bios::ModuleRecord::info_address),
+        );
         context.set_register(GP, invocation.global_pointer);
         context.set_register(RA, RETURN_ENTRY);
         Ok(BackendResponse {
@@ -532,16 +837,20 @@ impl BiosServices for MachineServices<'_> {
         memory: &mut M,
     ) -> Result<BackendResponse, BackendError> {
         let ordinal = request.import.ordinal;
+        let library = request.import.library.clone();
+        let module_id = request.import.module_id;
+        let pc = request.import.pc;
         let arguments = request.arguments;
-        match request.family {
+        let result = match request.family {
             ServiceFamily::SystemMemory => self.dispatch_system_memory(ordinal, arguments),
             ServiceFamily::Thread => self.dispatch_thread(ordinal, arguments, context, memory),
             ServiceFamily::Semaphore => {
                 self.dispatch_semaphore(ordinal, arguments, context, memory)
             }
             ServiceFamily::EventFlag => self.dispatch_event(ordinal, arguments, context, memory),
+            ServiceFamily::Timer => self.dispatch_timer(ordinal, arguments, memory),
             ServiceFamily::Exception | ServiceFamily::Interrupt | ServiceFamily::VBlank => {
-                self.dispatch_handlers(&request, memory)
+                self.dispatch_handlers(&request, context, memory)
             }
             ServiceFamily::ModuleLoader if matches!(ordinal, 6 | 7) => {
                 self.dispatch_module(request, context, memory)
@@ -552,7 +861,12 @@ impl BiosServices for MachineServices<'_> {
             }
             ServiceFamily::Dma if matches!(ordinal, 3..=35) => Ok(BackendResponse::returning(0)),
             _ => Err(unsupported(&request.import.library, ordinal)),
-        }
+        };
+        result.map_err(|error| {
+            BackendError::new(format!(
+                "{library} ordinal {ordinal} for module {module_id} at PC {pc:#010x}: {error}"
+            ))
+        })
     }
 }
 
@@ -850,6 +1164,93 @@ fn guest_range<M: ServiceMemory>(memory: &M) -> GuestRange {
         start: range.start,
         end: range.end,
     }
+}
+
+fn marshal_module_arguments<M: ServiceMemory>(
+    bios: &mut BiosHle,
+    memory: &mut M,
+    path: &str,
+    arguments: &[u8],
+) -> Result<(u32, u32), BackendError> {
+    let mut argument_offsets = Vec::new();
+    let mut cursor = 0;
+    while cursor < arguments.len() {
+        argument_offsets.push(cursor);
+        let terminator = arguments[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| BackendError::new("module argument is not NUL-terminated"))?;
+        cursor = cursor
+            .checked_add(terminator + 1)
+            .ok_or_else(|| BackendError::new("module argument block overflows host width"))?;
+    }
+    let argc = argument_offsets
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| BackendError::new("module argument count overflows host width"))?;
+    let pointer_bytes = argc
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| BackendError::new("module argv table overflows host width"))?;
+    let launch_name = format!("/{path}");
+    let string_bytes = launch_name
+        .len()
+        .checked_add(1)
+        .and_then(|size| size.checked_add(arguments.len()))
+        .ok_or_else(|| BackendError::new("module argv strings overflow host width"))?;
+    let size = pointer_bytes
+        .checked_add(string_bytes)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| BackendError::new("module argv block exceeds IOP width"))?;
+    let allocation = bios
+        .memory_mut()
+        .allocate(AllocationMode::First, size, 0)
+        .map_err(backend)?;
+    let mut block = vec![0_u8; size as usize];
+    let strings_address = allocation.address + u32::try_from(pointer_bytes).unwrap_or(0);
+    block[..4].copy_from_slice(&strings_address.to_le_bytes());
+    let mut string_cursor = pointer_bytes;
+    block[string_cursor..string_cursor + launch_name.len()].copy_from_slice(launch_name.as_bytes());
+    string_cursor += launch_name.len() + 1;
+    let argument_base = string_cursor;
+    block[argument_base..argument_base + arguments.len()].copy_from_slice(arguments);
+    for (index, offset) in argument_offsets.into_iter().enumerate() {
+        let address = allocation.address
+            + u32::try_from(argument_base + offset)
+                .map_err(|_| BackendError::new("module argv address exceeds IOP width"))?;
+        let pointer = (index + 1) * 4;
+        block[pointer..pointer + 4].copy_from_slice(&address.to_le_bytes());
+    }
+    if let Err(error) = memory.write(allocation.address, &block) {
+        let _ = bios.memory_mut().free(allocation.address);
+        return Err(backend(error));
+    }
+    Ok((allocation.address, u32::try_from(argc).unwrap_or(u32::MAX)))
+}
+
+fn interrupt_source(value: u32) -> Option<InterruptSource> {
+    u8::try_from(value)
+        .ok()
+        .and_then(InterruptSource::from_index)
+}
+
+const fn timer_handle(index: usize) -> u32 {
+    ((index as u32 + 1) << 28) | (TIMER_BASES[index] >> 4)
+}
+
+const fn timer_interrupt(index: usize) -> InterruptSource {
+    match index {
+        0 => InterruptSource::Timer0,
+        1 => InterruptSource::Timer1,
+        2 => InterruptSource::Timer2,
+        3 => InterruptSource::Timer3,
+        4 => InterruptSource::Timer4,
+        _ => InterruptSource::Timer5,
+    }
+}
+
+const fn kernel_code(value: i32) -> u32 {
+    u32::from_ne_bytes(value.to_ne_bytes())
 }
 
 fn read_u16<M: ServiceMemory>(memory: &M, address: u32) -> Result<u16, BackendError> {
