@@ -54,9 +54,9 @@ fn audible_spu2() -> Spu2 {
         spu2.write_register(base + 0x1a0, 1)
             .expect("fixture key-on register is valid");
         let primary = SPU2_BASE + 0x760 + core * 0x28;
-        spu2.write_register(primary, 0x7fff)
+        spu2.write_register(primary, 0x3fff)
             .expect("fixture master-left register is valid");
-        spu2.write_register(primary + 2, 0x7fff)
+        spu2.write_register(primary + 2, 0x3fff)
             .expect("fixture master-right register is valid");
         if core == 1 {
             spu2.write_register(primary + 8, 0x7fff)

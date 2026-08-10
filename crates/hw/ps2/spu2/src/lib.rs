@@ -608,8 +608,8 @@ impl Core {
             return Ok(StereoFrame::default());
         }
         Ok(StereoFrame::new(
-            apply_signed_volume(clamp_i64_to_i16(dry[0]), self.master_volume[0]),
-            apply_signed_volume(clamp_i64_to_i16(dry[1]), self.master_volume[1]),
+            apply_volume(clamp_i64_to_i16(dry[0]), self.master_volume[0]),
+            apply_volume(clamp_i64_to_i16(dry[1]), self.master_volume[1]),
         ))
     }
 
@@ -1257,9 +1257,9 @@ mod tests {
             MMIX_VOICE_DRY_LEFT | MMIX_VOICE_DRY_RIGHT,
         )
         .unwrap();
-        spu2.write_register(primary_register(core, 0), 0x7fff)
+        spu2.write_register(primary_register(core, 0), 0x3fff)
             .unwrap();
-        spu2.write_register(primary_register(core, 2), 0x7fff)
+        spu2.write_register(primary_register(core, 2), 0x3fff)
             .unwrap();
         spu2.write_register(
             core_register(core, CORE_ATTR),
@@ -1274,8 +1274,8 @@ mod tests {
             MMIX_INPUT_A_DRY_LEFT | MMIX_INPUT_A_DRY_RIGHT,
         )
         .unwrap();
-        spu2.write_register(primary_register(1, 0), 0x7fff).unwrap();
-        spu2.write_register(primary_register(1, 2), 0x7fff).unwrap();
+        spu2.write_register(primary_register(1, 0), 0x3fff).unwrap();
+        spu2.write_register(primary_register(1, 2), 0x3fff).unwrap();
         spu2.write_register(primary_register(1, 8), 0x7fff).unwrap();
         spu2.write_register(primary_register(1, 0x0a), 0x7fff)
             .unwrap();
