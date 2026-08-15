@@ -579,6 +579,18 @@ fn sysclib_stdio_and_clock_are_guest_visible() {
         .unwrap();
     assert_eq!(&memory.0[0x2000..0x2008], b"copy me\0");
 
+    memory.put(0x1010, b"bcopy!\0");
+    set_arguments(&mut context, [0x1010, 0x2010, 7, 0]);
+    services
+        .dispatch(
+            import("sysclib", 0x0101, 16),
+            &mut context,
+            &mut memory,
+            &mut backend,
+        )
+        .unwrap();
+    assert_eq!(&memory.0[0x2010..0x2017], b"bcopy!\0");
+
     memory.put(0x1100, b"value=%d %s\n\0");
     memory.put(0x1200, b"ok\0");
     set_arguments(&mut context, [0x1100, 42, 0x1200, 0]);
