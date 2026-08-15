@@ -889,12 +889,12 @@ impl Execution {
 
     fn conditional_branch(&mut self, condition: bool, pc: u32, immediate: i16) {
         self.is_branch = true;
-        self.branch_target = Some(if condition {
-            pc.wrapping_add(4)
-                .wrapping_add_signed(i32::from(immediate) << 2)
-        } else {
-            pc.wrapping_add(8)
-        });
+        if condition {
+            self.branch_target = Some(
+                pc.wrapping_add(4)
+                    .wrapping_add_signed(i32::from(immediate) << 2),
+            );
+        }
     }
 
     fn address_exception(&mut self, exception: Exception, address: u32) {
@@ -1131,6 +1131,21 @@ mod tests {
         let mut cpu = Cpu::new(profile());
         let pcs = std::array::from_fn::<_, 4, _>(|_| cpu.step(&mut bus).unwrap().pc);
         assert_eq!(pcs, [0, 4, 16, 32]);
+        assert_eq!(cpu.register(1), Some(11));
+        assert_eq!(cpu.register(2), Some(22));
+    }
+
+    #[test]
+    fn untaken_branch_in_delay_slot_continues_from_outer_target() {
+        let mut words = vec![0; 9];
+        words[0] = i(0x04, 0, 0, 3);
+        words[1] = i(0x05, 0, 0, 6);
+        words[4] = i(0x09, 0, 1, 11);
+        words[5] = i(0x09, 0, 2, 22);
+        let mut bus = TestBus::new(&words);
+        let mut cpu = Cpu::new(profile());
+        let pcs = std::array::from_fn::<_, 4, _>(|_| cpu.step(&mut bus).unwrap().pc);
+        assert_eq!(pcs, [0, 4, 16, 20]);
         assert_eq!(cpu.register(1), Some(11));
         assert_eq!(cpu.register(2), Some(22));
     }
