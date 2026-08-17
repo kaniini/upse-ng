@@ -59,7 +59,8 @@ const DPCR_ENABLE: u32 = 1 << 3;
 const DICR_FORCE: u32 = 1 << 15;
 const DICR_MASTER_ENABLE: u32 = 1 << 23;
 const DICR_MASTER_FLAG: u32 = 1 << 31;
-const CYCLES_PER_WORD: u64 = 2;
+// Sound DMA payloads become visible atomically at the next scheduler boundary.
+const COMPLETION_CYCLES: u64 = 0;
 const MAX_RAM_WORDS: u64 = (2 * 1024 * 1024) / 4;
 
 /// SPU2 core selected by an IOP DMA channel.
@@ -589,31 +590,7 @@ impl DmaController {
                 event: event.id.get(),
             });
         }
-        validate_ram_range(
-            channel.channel(),
-            pending.address,
-            pending.words,
-            pending.decrement,
-            memory.ram().len(),
-        )?;
-        for index in 0..pending.words {
-            let address = transfer_address(pending.address, index, pending.decrement);
-            let offset = usize::try_from(address).map_err(|_| DmaError::RamRange {
-                channel: channel.channel(),
-                base: pending.address,
-                words: pending.words,
-                decrement: pending.decrement,
-            })?;
-            match pending.direction {
-                DmaDirection::FromRam => {
-                    endpoint.write_word(channel, read_ram_word(memory.ram(), offset))?;
-                }
-                DmaDirection::ToRam => {
-                    let value = endpoint.read_word(channel)?;
-                    write_ram_word(memory.ram_mut(), offset, value);
-                }
-            }
-        }
+        transfer(channel, pending, memory, endpoint)?;
         self.pending[channel.core()] = None;
         let registers = &mut self.channels[channel.channel()];
         let byte_count = u32::try_from(pending.words * 4).map_err(|_| DmaError::ClockOverflow)?;
@@ -671,11 +648,7 @@ impl DmaController {
         } else {
             DmaDirection::ToRam
         };
-        let deadline = now.checked_advance(Ticks::new(
-            words
-                .checked_mul(CYCLES_PER_WORD)
-                .ok_or(DmaError::ClockOverflow)?,
-        ))?;
+        let deadline = now.checked_advance(Ticks::new(COMPLETION_CYCLES))?;
         let pending = PendingTransfer {
             deadline,
             address: registers.madr,
@@ -839,6 +812,40 @@ fn enabled_flags(control: u32, flags: u32, channels: u32) -> u32 {
     ((control >> 16) & mask) & ((flags >> 24) & mask)
 }
 
+fn transfer<E: Spu2DmaEndpoint>(
+    channel: SoundDmaChannel,
+    pending: PendingTransfer,
+    memory: &mut IopMemory,
+    endpoint: &mut E,
+) -> Result<(), DmaError> {
+    validate_ram_range(
+        channel.channel(),
+        pending.address,
+        pending.words,
+        pending.decrement,
+        memory.ram().len(),
+    )?;
+    for index in 0..pending.words {
+        let address = transfer_address(pending.address, index, pending.decrement);
+        let offset = usize::try_from(address).map_err(|_| DmaError::RamRange {
+            channel: channel.channel(),
+            base: pending.address,
+            words: pending.words,
+            decrement: pending.decrement,
+        })?;
+        match pending.direction {
+            DmaDirection::FromRam => {
+                endpoint.write_word(channel, read_ram_word(memory.ram(), offset))?;
+            }
+            DmaDirection::ToRam => {
+                let value = endpoint.read_word(channel)?;
+                write_ram_word(memory.ram_mut(), offset, value);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_ram_range(
     channel: usize,
     base: u32,
@@ -990,6 +997,7 @@ mod tests {
             false,
         );
         let deadline = dma.completion_deadline(SoundDmaChannel::Core0).unwrap();
+        assert_eq!(deadline, Deadline::ZERO);
         assert_eq!(
             deadline,
             dma.completion_deadline(SoundDmaChannel::Core1).unwrap()

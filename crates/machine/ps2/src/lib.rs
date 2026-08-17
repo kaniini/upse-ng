@@ -281,6 +281,7 @@ impl Ps2Machine {
                 stack: stack.address,
                 stack_size: stack.requested_size,
                 priority: 1,
+                global_pointer: invocation.global_pointer,
                 attributes: 0,
                 option: 0,
             },
@@ -498,6 +499,8 @@ impl Ps2Machine {
         };
         let mut context = service_context(cpu);
         context.pc = context.register(RA).unwrap_or(0);
+        let interrupt_context =
+            self.state.callback_active.is_some() || !self.state.interrupts_enabled;
         let outcome = {
             let MachineState {
                 hardware,
@@ -524,6 +527,7 @@ impl Ps2Machine {
                 thread_stacks,
                 module_frames,
                 module_entry_active,
+                interrupt_context,
             };
             services.dispatch(import, &mut context, &mut memory, &mut backend)?
         };
@@ -1007,11 +1011,11 @@ mod tests {
     const IMAGE_OFFSET: usize = 0x100;
     const IMAGE_FILE_SIZE: usize = 0x500;
     const IMAGE_MEMORY_SIZE: usize = 0x600;
-    const THREAD_ENTRY: usize = 0x180;
+    const THREAD_ENTRY: usize = 0x190;
     const IOMAN_TABLE: usize = 0x200;
     const LIBSD_TABLE: usize = 0x240;
     const THBASE_TABLE: usize = 0x290;
-    const MODLOAD_TABLE: usize = 0x2c0;
+    const MODLOAD_TABLE: usize = 0x2d0;
     const THREAD_SPEC: usize = 0x300;
     const PATH: usize = 0x340;
     const CHILD_PATH: usize = 0x360;
@@ -1064,6 +1068,10 @@ mod tests {
     const START_THREAD: Import = Import {
         table: THBASE_TABLE,
         index: 1,
+    };
+    const GET_SYSTEM_TIME: Import = Import {
+        table: THBASE_TABLE,
+        index: 2,
     };
     const LOAD_START_MODULE: Import = Import {
         table: MODLOAD_TABLE,
@@ -1130,6 +1138,28 @@ mod tests {
                 0x11, 0x11
             ]
         );
+        let fixture = machine.state.bios.modules().find("fixture").unwrap();
+        let clock_address =
+            fixture.image_allocation().address + u32::try_from(BUFFER).unwrap() + 32;
+        let clock = u64::from(
+            machine
+                .state
+                .hardware
+                .memory()
+                .read_u32(clock_address)
+                .unwrap(),
+        ) | (u64::from(
+            machine
+                .state
+                .hardware
+                .memory()
+                .read_u32(clock_address + 4)
+                .unwrap(),
+        ) << 32);
+        assert!(clock >= super::services::SYSTEM_CLOCK_EPOCH);
+        assert!(
+            clock <= super::services::SYSTEM_CLOCK_EPOCH + machine.state.bios.kernel().now().get()
+        );
         for _ in 0..1_000 {
             if machine
                 .state
@@ -1189,6 +1219,8 @@ mod tests {
         emit_addiu(&mut code, 5, 28, BUFFER as i16);
         emit_addiu(&mut code, 6, 0, 16);
         emit_call(&mut code, IOMAN_READ);
+        emit_addiu(&mut code, 4, 28, (BUFFER + 32) as i16);
+        emit_call(&mut code, GET_SYSTEM_TIME);
         emit_addiu(&mut code, 4, 28, CHILD_PATH as i16);
         emit_addiu(&mut code, 5, 0, 0);
         emit_addiu(&mut code, 6, 0, 0);
@@ -1249,7 +1281,7 @@ mod tests {
 
         write_import_table(&mut image, IOMAN_TABLE, "ioman", 0x0104, &[4, 6]);
         write_import_table(&mut image, LIBSD_TABLE, "libsd", 0x0105, &[4, 5, 7, 9, 17]);
-        write_import_table(&mut image, THBASE_TABLE, "thbase", 0x0102, &[4, 6]);
+        write_import_table(&mut image, THBASE_TABLE, "thbase", 0x0102, &[4, 6, 34]);
         write_import_table(&mut image, MODLOAD_TABLE, "modload", 0x0107, &[7]);
         put_u32(&mut image, THREAD_SPEC + 12, 0x400);
         put_u32(&mut image, THREAD_SPEC + 16, 32);

@@ -212,6 +212,7 @@ struct Voice {
     adsr_high: u16,
     start_address: u32,
     repeat_address: u32,
+    repeat_address_written: bool,
     current_address: usize,
     current_block_address: usize,
     decoded: [i16; 28],
@@ -236,6 +237,7 @@ impl Default for Voice {
             adsr_high: 0,
             start_address: 0,
             repeat_address: 0,
+            repeat_address_written: false,
             current_address: 0,
             current_block_address: 0,
             decoded: [0; 28],
@@ -261,6 +263,7 @@ struct VoiceOutput {
 
 impl Voice {
     fn key_on(&mut self) {
+        self.repeat_address_written = false;
         self.current_address = normalize_ram_address(self.start_address);
         self.current_block_address = self.current_address;
         self.decoded_valid = false;
@@ -397,7 +400,7 @@ impl Voice {
         self.decoded_flags = decoded.flags;
         self.current_block_address = address;
         self.current_address = address;
-        if decoded.flags.loop_start {
+        if decoded.flags.loop_start && !self.repeat_address_written {
             self.repeat_address = u32::try_from(address).unwrap_or(0);
         }
         self.sample_index = 0;
@@ -457,6 +460,8 @@ struct Core {
     mix: u16,
     attributes: u16,
     endx: u32,
+    key_on_pending: u32,
+    key_off_pending: u32,
     irq_address: u32,
     transfer_address: u32,
     effect_start: u32,
@@ -486,6 +491,8 @@ impl Default for Core {
             mix: 0,
             attributes: 0,
             endx: 0,
+            key_on_pending: 0,
+            key_off_pending: 0,
             irq_address: 0,
             transfer_address: 0,
             effect_start: 0,
@@ -506,18 +513,23 @@ impl Default for Core {
 
 impl Core {
     fn key_on(&mut self, mask: u32) {
-        for (index, voice) in self.voices.iter_mut().enumerate() {
-            if mask & (1_u32 << index) != 0 {
-                voice.key_on();
-                self.endx &= !(1_u32 << index);
-            }
-        }
+        self.key_on_pending |= mask;
     }
 
     fn key_off(&mut self, mask: u32) {
+        self.key_off_pending |= mask;
+    }
+
+    fn apply_key_switches(&mut self) {
+        let key_off = std::mem::take(&mut self.key_off_pending);
+        let key_on = std::mem::take(&mut self.key_on_pending);
         for (index, voice) in self.voices.iter_mut().enumerate() {
-            if mask & (1_u32 << index) != 0 {
+            if key_off & (1_u32 << index) != 0 {
                 voice.key_off();
+            }
+            if key_on & (1_u32 << index) != 0 {
+                voice.key_on();
+                self.endx &= !(1_u32 << index);
             }
         }
     }
@@ -528,6 +540,7 @@ impl Core {
         ram: &mut [u8],
         input: CoreInput,
     ) -> Result<StereoFrame, Spu2Error> {
+        self.apply_key_switches();
         if self.attributes & CORE_ATTR_ENABLE == 0 {
             return Ok(StereoFrame::default());
         }
@@ -771,7 +784,15 @@ impl Spu2 {
             return Ok(match local {
                 ENDX_HIGH => high_switch_half(core.endx),
                 ENDX_LOW => low_switch_half(core.endx),
-                STATUS => core.status,
+                KEY_ON_HIGH | KEY_ON_LOW | KEY_OFF_HIGH | KEY_OFF_LOW => 0,
+                STATUS => {
+                    core.status
+                        | if core.attributes & CORE_ATTR_DMA_MASK != 0 {
+                            STATUS_DMA_READY
+                        } else {
+                            0
+                        }
+                }
                 _ => self.registers[index],
             });
         }
@@ -808,14 +829,17 @@ impl Spu2 {
                 return Ok(());
             }
             if let Some((voice_index, register)) = decode_voice_address(local) {
-                let pair_base = offset - register;
+                let pair_base = offset - (register & 2);
                 let pair_index = register_index(pair_base);
                 let high = self.registers[pair_index];
                 let low = self.registers[pair_index + 1];
                 let voice = &mut self.cores[core_index].voices[voice_index];
                 match register {
                     0 | 2 => voice.start_address = decode_sound_address(high, low),
-                    4 | 6 => voice.repeat_address = decode_sound_address(high, low),
+                    4 | 6 => {
+                        voice.repeat_address = decode_sound_address(high, low);
+                        voice.repeat_address_written = true;
+                    }
                     _ => {}
                 }
                 return Ok(());
@@ -1433,6 +1457,77 @@ mod tests {
         write_address(&mut spu2, 1, TSA_HIGH, 0x1f_fff0);
         assert_eq!(spu2.read_word(SoundDmaChannel::Core1).unwrap(), 0x1122_3344);
         assert_eq!(spu2.read_word(SoundDmaChannel::Core1).unwrap(), 0xaabb_ccdd);
+    }
+
+    #[test]
+    fn key_switches_are_write_only_and_transfer_mode_reports_ready() {
+        let mut spu2 = Spu2::new();
+        spu2.write_register(core_register(0, KEY_ON_HIGH), 0xffff)
+            .unwrap();
+        spu2.write_register(core_register(0, super::KEY_ON_LOW), 0x00ff)
+            .unwrap();
+        spu2.write_register(core_register(0, super::KEY_OFF_HIGH), 0xffff)
+            .unwrap();
+        spu2.write_register(core_register(0, super::KEY_OFF_LOW), 0x00ff)
+            .unwrap();
+        assert_eq!(
+            spu2.read_register(core_register(0, KEY_ON_HIGH)).unwrap(),
+            0
+        );
+        assert_eq!(
+            spu2.read_register(core_register(0, super::KEY_ON_LOW))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            spu2.read_register(core_register(0, super::KEY_OFF_HIGH))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            spu2.read_register(core_register(0, super::KEY_OFF_LOW))
+                .unwrap(),
+            0
+        );
+
+        spu2.write_register(
+            core_register(0, CORE_ATTR),
+            CORE_ATTR_ENABLE | super::CORE_ATTR_DMA_MASK,
+        )
+        .unwrap();
+        assert_eq!(
+            spu2.read_register(core_register(0, STATUS)).unwrap() & STATUS_DMA_READY,
+            STATUS_DMA_READY
+        );
+    }
+
+    #[test]
+    fn live_repeat_address_write_survives_embedded_loop_start() {
+        let mut spu2 = Spu2::new();
+        spu2.load_ram(0x1000, &constant_block(1, 0)).unwrap();
+        spu2.load_ram(0x1010, &constant_block(1, 4)).unwrap();
+        spu2.load_ram(0x1020, &constant_block(1, 3)).unwrap();
+        spu2.load_ram(0x2000, &constant_block(2, 3)).unwrap();
+        configure_voice(&mut spu2, 0, 0, 0x1000);
+        enable_voice_mix(&mut spu2, 0, 1);
+        spu2.write_register(core_register(0, KEY_ON_HIGH), 1)
+            .unwrap();
+
+        // Apply KON and begin playback before the driver changes LSA.
+        spu2.render_frame([CoreInput::default(); CORE_COUNT])
+            .unwrap();
+        assert!(!spu2.cores[0].voices[0].repeat_address_written);
+        write_address(&mut spu2, 0, VOICE_ADDRESS_BASE + 4, 0x2000);
+        assert_eq!(spu2.cores[0].voices[0].repeat_address, 0x2000);
+        assert!(spu2.cores[0].voices[0].repeat_address_written);
+
+        for _ in 0..28 {
+            spu2.render_frame([CoreInput::default(); CORE_COUNT])
+                .unwrap();
+        }
+
+        assert_eq!(spu2.cores[0].voices[0].repeat_address, 0x2000);
+        assert!(spu2.cores[0].voices[0].repeat_address_written);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::{CallbackRequest, CpuContext, FixedTable, GuestRange, KernelError};
 const V0: usize = 2;
 const V1: usize = 3;
 const A0: usize = 4;
+const GP: usize = 28;
 const RA: usize = 31;
 const THREAD_CAPACITY: usize = 64;
 const SEMAPHORE_CAPACITY: usize = 64;
@@ -40,6 +41,8 @@ pub struct ThreadSpec {
     pub stack_size: u32,
     /// Initial IOP priority, where a lower value runs first.
     pub priority: u32,
+    /// Guest global pointer captured from the creating thread.
+    pub global_pointer: u32,
     /// Guest thread attributes retained for inspection.
     pub attributes: u32,
     /// Guest-defined option word retained for inspection.
@@ -409,6 +412,7 @@ impl Kernel {
             thread.spec.stack.wrapping_add(thread.spec.stack_size),
         );
         thread.context.set_register(A0, argument);
+        thread.context.set_register(GP, thread.spec.global_pointer);
         thread.context.set_register(RA, 0);
         thread.current_priority = thread.spec.priority;
         thread.wakeup_count = 0;
@@ -1686,6 +1690,7 @@ mod tests {
             stack: 0x18_0000 + index * 0x1000,
             stack_size: 0x800,
             priority,
+            global_pointer: 0x1234_0000 + index,
             attributes: 0,
             option: index,
         }
@@ -1733,6 +1738,10 @@ mod tests {
             .unwrap();
         assert_eq!(action.current, Some(low));
         assert_eq!(context.register(A0), Some(0xaa));
+        assert_eq!(
+            context.register(GP),
+            Some(thread_spec(0, 40).global_pointer)
+        );
 
         kernel.start_thread(high_a, 0xbb).unwrap();
         kernel.start_thread(high_b, 0xcc).unwrap();
@@ -1742,6 +1751,10 @@ mod tests {
         assert_eq!(action.current, Some(high_a));
         assert_eq!(kernel.thread(low).unwrap().state(), ThreadState::Ready);
         assert_eq!(context.register(A0), Some(0xbb));
+        assert_eq!(
+            context.register(GP),
+            Some(thread_spec(1, 20).global_pointer)
+        );
 
         let action = kernel
             .reschedule(&mut context, RescheduleReason::Yield)

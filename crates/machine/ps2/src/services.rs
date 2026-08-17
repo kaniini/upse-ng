@@ -43,6 +43,9 @@ const VOICE_ADDRESS_BASE: u32 = 0x1c0;
 const VOICE_ADDRESS_STRIDE: u32 = 0x0c;
 const PRIMARY_BASE: u32 = 0x760;
 const PRIMARY_STRIDE: u32 = 0x28;
+// Some sound drivers fold the BIOS clock into a 24-bit counter and require a
+// realistic nonzero boot epoch to distinguish startup from counter wrap.
+pub(super) const SYSTEM_CLOCK_EPOCH: u64 = 0x0be0_0000;
 const TIMER_COUNT: usize = 6;
 const TIMER_BASES: [u32; TIMER_COUNT] = [
     TIMER0_BASE,
@@ -144,6 +147,7 @@ pub(crate) struct MachineServices<'a> {
     pub(crate) thread_stacks: &'a mut BTreeMap<u32, u32>,
     pub(crate) module_frames: &'a mut Vec<ModuleFrame>,
     pub(crate) module_entry_active: bool,
+    pub(crate) interrupt_context: bool,
 }
 
 impl MachineServices<'_> {
@@ -244,6 +248,7 @@ impl MachineServices<'_> {
                             stack,
                             stack_size,
                             priority,
+                            global_pointer: context.register(GP).unwrap_or(0),
                             attributes,
                             option,
                         },
@@ -336,7 +341,9 @@ impl MachineServices<'_> {
                 Ok(schedule_response(&cpu, action.switched))
             }
             34 => {
-                let clock = self.bios.kernel().now().get().to_le_bytes();
+                let clock = SYSTEM_CLOCK_EPOCH
+                    .wrapping_add(self.bios.kernel().now().get())
+                    .to_le_bytes();
                 memory.write(a0, &clock).map_err(backend)?;
                 Ok(BackendResponse::returning(0))
             }
@@ -562,7 +569,10 @@ impl MachineServices<'_> {
         let [a0, a1, a2, a3] = request.arguments;
         if request.family == ServiceFamily::Interrupt {
             return match request.import.ordinal {
-                3 | 15 | 16 | 23 => Ok(BackendResponse::returning(0)),
+                3 | 15 | 16 => Ok(BackendResponse::returning(0)),
+                23 => Ok(BackendResponse::returning(u32::from(
+                    self.interrupt_context,
+                ))),
                 6 => {
                     if let Some(source) = interrupt_source(a0) {
                         self.irq.set_mask(self.irq.mask() | source.bit());

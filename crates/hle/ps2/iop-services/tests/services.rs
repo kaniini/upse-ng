@@ -207,6 +207,7 @@ impl BiosServices for BiosHarness {
                             stack,
                             stack_size,
                             priority,
+                            global_pointer: context.register(28).unwrap_or(0),
                             attributes,
                             option,
                         },

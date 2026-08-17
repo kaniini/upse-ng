@@ -324,7 +324,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
     }
 
     fn step_inner(&mut self, sample_external_interrupt: bool) -> Result<MachineStep, MachineError> {
-        let outcome = {
+        let mut outcome = {
             let mut bus = MachineBus {
                 memory: &mut self.memory,
                 irq: &mut self.irq,
@@ -342,7 +342,10 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
                 self.cpu.step_without_external_interrupts(&mut bus)?
             }
         };
-        self.advance_devices(u64::from(outcome.cycles))?;
+        // PSF2 drivers schedule against retired IOP instructions. Charging
+        // individual load/store latency here skews their timer command stream.
+        outcome.cycles = 1;
+        self.advance_devices(1)?;
         Ok(MachineStep {
             cpu: outcome,
             now: self.now,
@@ -730,6 +733,7 @@ mod tests {
             addiu(27, 27, 1),
             sw(27, u16::try_from(TRACE_INTERRUPTS).unwrap(), 0),
             (0x10 << 26) | (26 << 16) | (14 << 11),
+            0,
             (26 << 21) | 8,
             0x4200_0010,
         ];
@@ -816,6 +820,7 @@ mod tests {
         let mut interrupt_entries = 0;
         for _ in 0..600 {
             let step = machine.step().unwrap();
+            assert_eq!(step.cpu.cycles, 1);
             if step.cpu.event == StepEvent::Exception(Exception::Interrupt) {
                 interrupt_entries += 1;
             }
