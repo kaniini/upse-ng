@@ -2,6 +2,8 @@
 **/target/
 /build/
 /examples/upse123
+/plugins/audacious/test-plugin
+/plugins/audacious/upse-ng.so
 **/*.profraw
 **/*.profdata
 /dist/

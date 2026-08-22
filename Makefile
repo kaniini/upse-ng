@@ -22,7 +22,8 @@ PKGCONFIG_FILE := $(BUILD_DIR)/libupse-ng.pc
 
 .PHONY: all check fmt clippy test doc header check-header rust-library \
 	libraries check-exports pkgconfig upse123 check-c-api \
-	check-c-api-sanitize install install-upse123 uninstall clean
+	check-c-api-sanitize audacious check-audacious install \
+	install-upse123 install-audacious uninstall uninstall-audacious clean
 
 all: libraries pkgconfig
 
@@ -84,6 +85,19 @@ upse123: libraries
 		UPSE_CFLAGS='-I$(CURDIR)/include' \
 		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -Wl,-rpath,$(CURDIR)/$(BUILD_DIR) -lupse-ng'
 
+audacious: libraries
+	$(MAKE) -C plugins/audacious \
+		UPSE_CFLAGS='-I$(CURDIR)/include' \
+		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -lupse-ng'
+
+check-audacious: audacious
+	python3 tests/fixtures/generate.py $(CURDIR)/$(BUILD_DIR)/tests/fixtures
+	LD_LIBRARY_PATH='$(CURDIR)/$(BUILD_DIR)' \
+		$(MAKE) -C plugins/audacious check \
+		UPSE_CFLAGS='-I$(CURDIR)/include' \
+		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -lupse-ng' \
+		FIXTURE_DIR='$(CURDIR)/$(BUILD_DIR)/tests/fixtures'
+
 check-c-api:
 	sh tests/c-api/run.sh
 
@@ -106,6 +120,10 @@ install: all
 install-upse123: upse123
 	$(MAKE) -C examples install DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
 
+install-audacious: audacious
+	$(MAKE) -C plugins/audacious install \
+		DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
+
 uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/libupse-ng.a \
 		$(DESTDIR)$(LIBDIR)/libupse-ng.so \
@@ -115,7 +133,12 @@ uninstall:
 		$(DESTDIR)$(PKGCONFIGDIR)/libupse-ng.pc \
 		$(DESTDIR)$(PREFIX)/share/licenses/libupse-ng/LGPL-2.1-or-later.txt
 
+uninstall-audacious:
+	$(MAKE) -C plugins/audacious uninstall \
+		DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
+
 clean:
 	$(MAKE) -C examples clean
+	$(MAKE) -C plugins/audacious clean
 	$(CARGO) clean
 	rm -rf $(BUILD_DIR)
