@@ -21,7 +21,7 @@ CXXFLAGS += -std=c++17 -O2 -Wall -Wextra -Werror -pedantic
 PLUGIN_CXXFLAGS := -fPIC -fvisibility=hidden
 PLUGIN_LDFLAGS := -shared -Wl,-z,defs
 
-.PHONY: all check install uninstall clean
+.PHONY: all check install install-built uninstall clean
 
 all: $(PLUGIN)
 
@@ -45,6 +45,11 @@ check: $(PLUGIN) $(TEST)
 		$(FIXTURE_DIR)/synthetic.minipsf $(FIXTURE_DIR)/synthetic.psf2
 
 install: $(PLUGIN)
+
+install install-built:
+	@test -f $(PLUGIN) || { \
+		echo 'run make audacious before installing' >&2; exit 1; \
+	}
 	$(INSTALL) -d $(DESTDIR)$(INPUT_PLUGIN_DIR) $(DESTDIR)$(LICENSE_DIR)
 	$(INSTALL) -m 755 $(PLUGIN) $(DESTDIR)$(INPUT_PLUGIN_DIR)/$(PLUGIN)
 	$(INSTALL) -m 644 ../../LICENSES/LGPL-2.1-or-later.txt \

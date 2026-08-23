@@ -23,7 +23,8 @@ PKGCONFIG_FILE := $(BUILD_DIR)/libupse-ng.pc
 .PHONY: all check fmt clippy test doc header check-header rust-library \
 	libraries check-exports pkgconfig upse123 check-c-api \
 	check-c-api-sanitize audacious check-audacious install \
-	install-upse123 install-audacious uninstall uninstall-audacious clean
+	install-only install-upse123 install-audacious uninstall \
+	uninstall-audacious clean
 
 all: libraries pkgconfig
 
@@ -85,7 +86,7 @@ upse123: libraries
 		UPSE_CFLAGS='-I$(CURDIR)/include' \
 		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -Wl,-rpath,$(CURDIR)/$(BUILD_DIR) -lupse-ng'
 
-audacious: libraries
+audacious: libraries pkgconfig
 	$(MAKE) -C plugins/audacious \
 		UPSE_CFLAGS='-I$(CURDIR)/include' \
 		UPSE_LIBS='-L$(CURDIR)/$(BUILD_DIR) -lupse-ng'
@@ -105,6 +106,8 @@ check-c-api-sanitize:
 	sh tests/c-api/run.sh sanitize
 
 install: all
+
+install install-only:
 	$(INSTALL) -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR) \
 		$(DESTDIR)$(PKGCONFIGDIR) \
 		$(DESTDIR)$(PREFIX)/share/licenses/libupse-ng
@@ -120,8 +123,21 @@ install: all
 install-upse123: upse123
 	$(MAKE) -C examples install DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
 
-install-audacious: audacious
-	$(MAKE) -C plugins/audacious install \
+install-audacious:
+	@test -f $(STATIC_LIBRARY) || { \
+		echo 'run make audacious before installing' >&2; exit 1; \
+	}
+	@test -f $(SHARED_LIBRARY) || { \
+		echo 'run make audacious before installing' >&2; exit 1; \
+	}
+	@test -f $(PKGCONFIG_FILE) || { \
+		echo 'run make audacious before installing' >&2; exit 1; \
+	}
+	@test -f plugins/audacious/upse-ng.so || { \
+		echo 'run make audacious before installing' >&2; exit 1; \
+	}
+	$(MAKE) install-only
+	$(MAKE) -C plugins/audacious install-built \
 		DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
 
 uninstall:
