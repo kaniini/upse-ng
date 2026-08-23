@@ -377,7 +377,7 @@ fn decode_block_at(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Spu {
     ram: Vec<u8>,
-    voices: [Voice; VOICE_COUNT],
+    voices: Box<[Voice]>,
     main_volume_left: u16,
     main_volume_right: u16,
     reverb_volume_left: u16,
@@ -417,7 +417,10 @@ impl Spu {
     pub fn new() -> Self {
         Self {
             ram: vec![0; SOUND_RAM_SIZE],
-            voices: std::array::from_fn(|_| Voice::default()),
+            voices: (0..VOICE_COUNT)
+                .map(|_| Voice::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             main_volume_left: 0,
             main_volume_right: 0,
             reverb_volume_left: 0,

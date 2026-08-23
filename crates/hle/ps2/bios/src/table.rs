@@ -5,7 +5,7 @@ use crate::KernelError;
 /// Instance-owned fixed-capacity table with stable positive identifiers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FixedTable<T, const N: usize> {
-    entries: [Option<T>; N],
+    entries: Box<[Option<T>]>,
     first_id: u32,
     len: usize,
 }
@@ -15,7 +15,7 @@ impl<T, const N: usize> FixedTable<T, N> {
     #[must_use]
     pub fn new(first_id: u32) -> Self {
         Self {
-            entries: std::array::from_fn(|_| None),
+            entries: (0..N).map(|_| None).collect::<Vec<_>>().into_boxed_slice(),
             first_id,
             len: 0,
         }
@@ -135,5 +135,18 @@ impl<T, const N: usize> FixedTable<T, N> {
     fn index(&self, id: u32) -> Option<usize> {
         let index = usize::try_from(id.checked_sub(self.first_id)?).ok()?;
         (index < N).then_some(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FixedTable;
+
+    #[test]
+    fn capacity_does_not_increase_host_stack_footprint() {
+        assert_eq!(
+            std::mem::size_of::<FixedTable<u64, 4096>>(),
+            4 * std::mem::size_of::<usize>()
+        );
     }
 }

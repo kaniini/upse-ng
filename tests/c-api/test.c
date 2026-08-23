@@ -436,7 +436,7 @@ static void *thread_player(void *userdata) {
 
 static int player_thread_attributes(pthread_attr_t *attributes) {
   return pthread_attr_init(attributes) == 0 &&
-         pthread_attr_setstacksize(attributes, 4U * 1024U * 1024U) == 0;
+         pthread_attr_setstacksize(attributes, 64U * 1024U) == 0;
 }
 
 static int test_parallel_handles(const struct bytes *module) {

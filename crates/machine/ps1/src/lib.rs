@@ -219,8 +219,8 @@ struct MachineState {
 /// Fully composed PSF1 machine with a reset snapshot.
 #[derive(Clone, Debug)]
 pub struct Ps1Machine {
-    state: MachineState,
-    reset: MachineState,
+    state: Box<MachineState>,
+    reset: Box<MachineState>,
 }
 
 impl Ps1Machine {
@@ -253,7 +253,7 @@ impl Ps1Machine {
             LoadDelayMode::Interlocked,
         );
         cpu.set_register(29, image.sp);
-        let state = MachineState {
+        let state = Box::new(MachineState {
             cpu,
             memory,
             cdrom: CdRom::new(),
@@ -275,7 +275,7 @@ impl Ps1Machine {
             halted: false,
             trace_events: config.trace_events,
             event_log: Vec::new(),
-        };
+        });
         Ok(Self {
             reset: state.clone(),
             state,
@@ -416,7 +416,7 @@ impl Ps1Machine {
         }
 
         let outcome = {
-            let state = &mut self.state;
+            let state = &mut *self.state;
             let mut bus = MachineBus {
                 memory: &mut state.memory,
                 cdrom: &mut state.cdrom,
@@ -1095,6 +1095,14 @@ mod tests {
         IDLE_ADVANCE_CYCLES, MachineConfig, MachineEvent, MachineStepKind, Ps1Machine, StepEvent,
         VideoStandard,
     };
+
+    #[test]
+    fn large_snapshots_are_heap_backed() {
+        assert_eq!(
+            std::mem::size_of::<Ps1Machine>(),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
 
     fn instruction_lui(rt: u32, immediate: u16) -> u32 {
         (0x0f << 26) | (rt << 16) | u32::from(immediate)

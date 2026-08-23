@@ -193,7 +193,7 @@ struct ModuleFrame {
 
 #[derive(Clone, Debug)]
 struct MachineState {
-    hardware: IopMachine<Spu2>,
+    hardware: Box<IopMachine<Spu2>>,
     bios: Box<BiosHle>,
     services: IopServices<Psf2Vfs>,
     sample_clock: RateConverter,
@@ -211,6 +211,16 @@ struct MachineState {
     halted: bool,
 }
 
+fn new_hardware(open_bus: OpenBusPolicy) -> Box<IopMachine<Spu2>> {
+    Box::new(IopMachine::new(
+        Spu2::new(),
+        IopMachineConfig {
+            open_bus,
+            ..IopMachineConfig::default()
+        },
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActiveCallback {
     Kernel,
@@ -221,8 +231,8 @@ enum ActiveCallback {
 /// Fully composed IOP-only PSF2 machine with a post-load reset snapshot.
 #[derive(Clone, Debug)]
 pub struct Ps2Machine {
-    state: MachineState,
-    reset: MachineState,
+    state: Box<MachineState>,
+    reset: Box<MachineState>,
 }
 
 impl Ps2Machine {
@@ -238,13 +248,7 @@ impl Ps2Machine {
             .file("psf2.irx")
             .map_err(|_| MachineError::MissingRootModule)?;
         let irx = IrxModule::parse("/psf2.irx", root_bytes)?;
-        let mut hardware = IopMachine::new(
-            Spu2::new(),
-            IopMachineConfig {
-                open_bus: config.open_bus,
-                ..IopMachineConfig::default()
-            },
-        );
+        let mut hardware = new_hardware(config.open_bus);
         let mut bios = Box::new(BiosHle::new()?);
         {
             let mut guest = IopRam(hardware.memory_mut());
@@ -300,7 +304,7 @@ impl Ps2Machine {
         context.set_register(RA, RETURN_ENTRY);
         apply_bios_context(hardware.cpu_mut(), &context);
 
-        let state = MachineState {
+        let state = Box::new(MachineState {
             hardware,
             bios,
             services: IopServices::new(vfs),
@@ -322,7 +326,7 @@ impl Ps2Machine {
             interrupts_enabled: true,
             enabled_interrupts: BTreeSet::new(),
             halted: false,
-        };
+        });
         Ok(Self {
             reset: state.clone(),
             state,
@@ -512,7 +516,7 @@ impl Ps2Machine {
                 enabled_interrupts,
                 timer_manager,
                 ..
-            } = &mut self.state;
+            } = &mut *self.state;
             let module_entry_active = !module_frames.is_empty();
             let (memory, sound, irq, timers) = hardware.memory_sound_interrupts_and_timers_mut();
             let mut memory = IopRam(memory);
@@ -1204,6 +1208,14 @@ mod tests {
             MachineConfig,
         ) -> Result<Ps2Machine, super::MachineError> = Ps2Machine::from_plan;
         let _ = constructor;
+    }
+
+    #[test]
+    fn large_snapshots_are_heap_backed() {
+        assert_eq!(
+            std::mem::size_of::<Ps2Machine>(),
+            2 * std::mem::size_of::<usize>()
+        );
     }
 
     fn generated_irx() -> Vec<u8> {

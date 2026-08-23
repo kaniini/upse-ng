@@ -694,7 +694,7 @@ impl Core {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Spu2 {
     ram: Vec<u8>,
-    cores: [Core; CORE_COUNT],
+    cores: Box<[Core]>,
     registers: Vec<u16>,
     irq_info: u16,
 }
@@ -711,7 +711,10 @@ impl Spu2 {
     pub fn new() -> Self {
         Self {
             ram: vec![0; SOUND_RAM_SIZE],
-            cores: std::array::from_fn(|_| Core::default()),
+            cores: (0..CORE_COUNT)
+                .map(|_| Core::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             registers: vec![0; REGISTER_HALFWORDS],
             irq_info: 0,
         }
