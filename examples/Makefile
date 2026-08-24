@@ -17,14 +17,19 @@ CPPFLAGS += $(UPSE_CFLAGS) $(AO_CFLAGS)
 CFLAGS += -std=c11 -O2 -Wall -Wextra -Werror -pedantic
 LDLIBS += $(UPSE_LIBS) $(AO_LIBS) -lm
 
-.PHONY: all clean install
+.PHONY: all clean install install-built
 
 all: upse123
 
 upse123: upse123.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
-install: upse123
+install: install-built
+
+install-built:
+	@test -f upse123 || { \
+		echo 'run make upse123 before installing' >&2; exit 1; \
+	}
 	$(INSTALL) -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LICENSEDIR)
 	$(INSTALL) -m 755 upse123 $(DESTDIR)$(BINDIR)/upse123
 	$(INSTALL) -m 644 ../LICENSES/GPL-2.0-or-later.txt \

@@ -10,6 +10,7 @@ BUILD_DIR ?= build
 CARGO ?= cargo
 CBINDGEN ?= cbindgen
 CC ?= cc
+CXX ?= c++
 INSTALL ?= install
 
 VERSION := 0.1.0
@@ -105,9 +106,18 @@ check-c-api:
 check-c-api-sanitize:
 	sh tests/c-api/run.sh sanitize
 
-install: all
+install: install-only
 
-install install-only:
+install-only:
+	@test -f $(STATIC_LIBRARY) || { \
+		echo 'run make before installing' >&2; exit 1; \
+	}
+	@test -f $(SHARED_LIBRARY) || { \
+		echo 'run make before installing' >&2; exit 1; \
+	}
+	@test -f $(PKGCONFIG_FILE) || { \
+		echo 'run make before installing' >&2; exit 1; \
+	}
 	$(INSTALL) -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR) \
 		$(DESTDIR)$(PKGCONFIGDIR) \
 		$(DESTDIR)$(PREFIX)/share/licenses/libupse-ng
@@ -120,8 +130,11 @@ install install-only:
 	$(INSTALL) -m 644 LICENSES/LGPL-2.1-or-later.txt \
 		$(DESTDIR)$(PREFIX)/share/licenses/libupse-ng/LGPL-2.1-or-later.txt
 
-install-upse123: upse123
-	$(MAKE) -C examples install DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
+install-upse123:
+	@test -f examples/upse123 || { \
+		echo 'run make upse123 before installing' >&2; exit 1; \
+	}
+	$(MAKE) -C examples install-built DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)'
 
 install-audacious:
 	@test -f $(STATIC_LIBRARY) || { \
