@@ -10,7 +10,8 @@ stage=$(mktemp -d /tmp/upse-ng-c-api.XXXXXX)
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
 
 python3 "$root/tests/fixtures/generate.py" "$fixture_dir"
-make -C "$root" DESTDIR="$stage" install
+make -C "$root"
+make -C "$root" DESTDIR="$stage" install-only
 mkdir -p "$binary_dir"
 
 export PKG_CONFIG_PATH="$stage/usr/local/lib/pkgconfig"
