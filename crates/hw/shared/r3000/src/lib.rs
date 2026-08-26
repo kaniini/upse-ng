@@ -140,6 +140,29 @@ pub enum LoadDelayMode {
     Interlocked,
 }
 
+/// Handling of a control-transfer instruction in another branch's delay slot.
+///
+/// MIPS-I leaves this sequence architecturally undefined. Machine profiles can
+/// select the behavior required by their software while the standalone core
+/// retains both pipeline targets by default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DelaySlotBranchMode {
+    /// Visit the outer target before following the delay-slot branch target.
+    #[default]
+    Preserve,
+    /// Suppress a delay-slot branch when the outer branch was taken.
+    ///
+    /// When the outer conditional branch is not taken, the delay-slot branch
+    /// behaves normally, including execution of its own delay slot.
+    SuppressWhenOuterTaken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DelaySlotState {
+    branch_pc: u32,
+    branch_taken: bool,
+}
+
 /// Implemented architectural exception classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Exception {
@@ -259,11 +282,12 @@ pub struct Cpu {
     lo: u32,
     pc: u32,
     next_pc: u32,
-    delay_branch_pc: Option<u32>,
+    delay_slot: Option<DelaySlotState>,
     pending_load: Option<(usize, u32)>,
     cop0: Cop0,
     profile: ResetProfile,
     load_delay_mode: LoadDelayMode,
+    delay_slot_branch_mode: DelaySlotBranchMode,
 }
 
 impl Cpu {
@@ -282,7 +306,7 @@ impl Cpu {
             lo: 0,
             pc: profile.pc,
             next_pc: profile.pc.wrapping_add(4),
-            delay_branch_pc: None,
+            delay_slot: None,
             pending_load: None,
             cop0: Cop0 {
                 status: profile.status,
@@ -291,12 +315,20 @@ impl Cpu {
             },
             profile,
             load_delay_mode,
+            delay_slot_branch_mode: DelaySlotBranchMode::Preserve,
         }
     }
 
     /// Restores architectural reset state.
     pub fn reset(&mut self) {
+        let delay_slot_branch_mode = self.delay_slot_branch_mode;
         *self = Self::with_load_delay_mode(self.profile, self.load_delay_mode);
+        self.delay_slot_branch_mode = delay_slot_branch_mode;
+    }
+
+    /// Selects handling for a branch encountered in another branch's delay slot.
+    pub fn set_delay_slot_branch_mode(&mut self, mode: DelaySlotBranchMode) {
+        self.delay_slot_branch_mode = mode;
     }
 
     /// Returns a general-purpose register; register zero is always zero.
@@ -326,7 +358,7 @@ impl Cpu {
     pub fn set_pc(&mut self, pc: u32) {
         self.pc = pc;
         self.next_pc = pc.wrapping_add(4);
-        self.delay_branch_pc = None;
+        self.delay_slot = None;
         self.pending_load = None;
     }
 
@@ -397,7 +429,8 @@ impl Cpu {
             self.update_interrupt_line(bus.interrupt_pending());
         }
         let current_pc = self.pc;
-        let delay_branch_pc = self.delay_branch_pc;
+        let delay_slot = self.delay_slot;
+        let delay_branch_pc = delay_slot.map(|state| state.branch_pc);
         if sample_external_interrupt && self.interrupt_enabled() {
             self.commit_old_load(None);
             self.enter_exception(Exception::Interrupt, current_pc, delay_branch_pc, None);
@@ -451,12 +484,22 @@ impl Cpu {
                 self.pending_load = None;
             }
         }
+        let suppress_nested_branch = execution.is_branch
+            && delay_slot.is_some_and(|state| state.branch_taken)
+            && self.delay_slot_branch_mode == DelaySlotBranchMode::SuppressWhenOuterTaken;
+        let branch_target = if suppress_nested_branch {
+            None
+        } else {
+            execution.branch_target
+        };
+        let is_branch = execution.is_branch && !suppress_nested_branch;
         let sequential = self.next_pc;
         self.pc = sequential;
-        self.next_pc = execution
-            .branch_target
-            .unwrap_or_else(|| sequential.wrapping_add(4));
-        self.delay_branch_pc = execution.is_branch.then_some(current_pc);
+        self.next_pc = branch_target.unwrap_or_else(|| sequential.wrapping_add(4));
+        self.delay_slot = is_branch.then_some(DelaySlotState {
+            branch_pc: current_pc,
+            branch_taken: branch_target.is_some(),
+        });
         self.registers[0] = 0;
         Ok(StepOutcome {
             pc: current_pc,
@@ -788,7 +831,7 @@ impl Cpu {
         };
         self.pc = vector;
         self.next_pc = vector.wrapping_add(4);
-        self.delay_branch_pc = None;
+        self.delay_slot = None;
         self.pending_load = None;
     }
 
@@ -981,7 +1024,8 @@ impl Cpu {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bus, BusFault, CAUSE_BD, CAUSE_IP2, Cpu, Exception, LoadDelayMode, ResetProfile, StepEvent,
+        Bus, BusFault, CAUSE_BD, CAUSE_IP2, Cpu, DelaySlotBranchMode, Exception, LoadDelayMode,
+        ResetProfile, StepEvent,
     };
 
     struct TestBus {
@@ -1148,6 +1192,25 @@ mod tests {
         assert_eq!(pcs, [0, 4, 16, 20]);
         assert_eq!(cpu.register(1), Some(11));
         assert_eq!(cpu.register(2), Some(22));
+    }
+
+    #[test]
+    fn suppressed_delay_slot_branch_exits_loop_after_outer_branch_falls_through() {
+        let mut words = vec![0; 9];
+        words[0] = i(0x09, 0, 2, 3);
+        words[1] = i(0x09, 1, 1, 1);
+        words[2] = i(0x05, 1, 2, (-2_i16) as u16);
+        words[3] = 0x0800_0008;
+        words[4] = i(0x09, 3, 3, 1);
+        words[8] = i(0x09, 0, 4, 44);
+        let mut bus = TestBus::new(&words);
+        let mut cpu = Cpu::new(profile());
+        cpu.set_delay_slot_branch_mode(DelaySlotBranchMode::SuppressWhenOuterTaken);
+        let pcs = std::array::from_fn::<_, 12, _>(|_| cpu.step(&mut bus).unwrap().pc);
+        assert_eq!(pcs, [0, 4, 8, 12, 4, 8, 12, 4, 8, 12, 16, 32]);
+        assert_eq!(cpu.register(1), Some(3));
+        assert_eq!(cpu.register(3), Some(1));
+        assert_eq!(cpu.register(4), Some(44));
     }
 
     #[test]
