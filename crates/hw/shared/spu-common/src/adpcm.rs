@@ -57,10 +57,10 @@ pub struct DecodedBlock {
     pub flags: AdpcmFlags,
 }
 
-/// Malformed ADPCM header.
+/// ADPCM decoder diagnostic.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum AdpcmError {
-    /// Shift exceeds the defined 0 through 12 range.
+    /// Shift is outside the decoder's supported hardware behavior.
     #[error("invalid PlayStation ADPCM shift {shift}")]
     InvalidShift {
         /// Four-bit header value.
@@ -72,17 +72,16 @@ pub enum AdpcmError {
 ///
 /// # Errors
 ///
-/// Returns [`AdpcmError`] for undefined shift header values. Reserved predictor
-/// selectors 5 through 15 use the hardware's zero-coefficient behavior.
+/// Returns [`AdpcmError`] for unsupported header encodings. Reserved shifts 13
+/// through 15 decode as shift 9, while reserved predictor selectors 5 through
+/// 15 use the hardware's zero-coefficient behavior.
 pub fn decode_block(
     block: &[u8; 16],
     history: &mut AdpcmHistory,
 ) -> Result<DecodedBlock, AdpcmError> {
-    let shift = block[0] & 0x0f;
+    let encoded_shift = block[0] & 0x0f;
+    let shift = if encoded_shift > 12 { 9 } else { encoded_shift };
     let filter = block[0] >> 4;
-    if shift > 12 {
-        return Err(AdpcmError::InvalidShift { shift });
-    }
     // Hardware treats the reserved predictor selectors as filter zero.
     let (positive, negative) = FILTERS.get(usize::from(filter)).copied().unwrap_or((0, 0));
     let mut samples = [0_i16; 28];
@@ -118,7 +117,7 @@ pub fn decode_block(
 
 #[cfg(test)]
 mod tests {
-    use super::{AdpcmError, AdpcmFlags, AdpcmHistory, decode_block};
+    use super::{AdpcmFlags, AdpcmHistory, decode_block};
 
     #[test]
     fn filter_zero_nibble_order_and_flags_match_golden_vector() {
@@ -161,16 +160,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_shift_does_not_mutate_history() {
-        let original = AdpcmHistory::new(12, -4);
-        let mut history = original;
-        let mut block = [0_u8; 16];
-        block[0] = 13;
-        assert_eq!(
-            decode_block(&block, &mut history),
-            Err(AdpcmError::InvalidShift { shift: 13 })
-        );
-        assert_eq!(history, original);
+    fn reserved_shifts_decode_as_shift_nine() {
+        for shift in 13..=15 {
+            let mut block = [0_u8; 16];
+            block[0] = shift;
+            block[2] = 0xf1;
+            block[3] = 0x87;
+            let decoded = decode_block(&block, &mut AdpcmHistory::default()).unwrap();
+            assert_eq!(&decoded.samples[..4], &[8, -8, 56, -64]);
+        }
     }
 
     #[test]
