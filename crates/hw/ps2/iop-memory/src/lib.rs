@@ -16,10 +16,10 @@ const SCRATCHPAD_SIZE_U32: u32 = 0x800;
 pub const MMIO_START: u32 = 0x1f80_1000;
 /// Last physical register in the main IOP hardware window.
 pub const MMIO_END: u32 = 0x1f80_ffff;
-/// First SPU2 register byte.
+/// First byte in the SPU2 device aperture.
 pub const SPU2_MMIO_START: u32 = 0x1f90_0000;
-/// Last SPU2 register byte.
-pub const SPU2_MMIO_END: u32 = 0x1f90_07ff;
+/// Last byte in the SPU2 device aperture.
+pub const SPU2_MMIO_END: u32 = 0x1f90_ffff;
 /// First byte of the firmware range reserved for BIOS HLE.
 pub const HLE_ROM_START: u32 = 0x1fc0_0000;
 /// Last byte of the firmware range reserved for BIOS HLE.
@@ -371,7 +371,7 @@ fn region_kind(region: MemoryRegion) -> u8 {
 mod tests {
     use super::{
         HLE_ROM_START, IopMemory, MMIO_START, MemoryError, MemoryRegion, OpenBusPolicy, RAM_SIZE,
-        SCRATCHPAD_START, SPU2_MMIO_START,
+        SCRATCHPAD_START, SPU2_MMIO_END, SPU2_MMIO_START,
     };
 
     #[test]
@@ -406,6 +406,18 @@ mod tests {
             Err(MemoryError::Spu2 {
                 address: SPU2_MMIO_START
             })
+        );
+        assert_eq!(
+            memory.write_u16(SPU2_MMIO_START + 0x0b60, 0x1234),
+            Err(MemoryError::Spu2 {
+                address: SPU2_MMIO_START + 0x0b60
+            })
+        );
+        assert_eq!(
+            IopMemory::classify(SPU2_MMIO_END).unwrap(),
+            MemoryRegion::Spu2 {
+                physical: SPU2_MMIO_END
+            }
         );
         assert_eq!(
             memory.read_u32(HLE_ROM_START),

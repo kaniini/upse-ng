@@ -25,8 +25,8 @@ pub const SOUND_RAM_SIZE: usize = 2 * 1024 * 1024;
 pub const SAMPLE_RATE: u32 = 48_000;
 /// First physical SPU2 register address.
 pub const SPU2_BASE: u32 = 0x1f90_0000;
-/// Final physical SPU2 register address, inclusive.
-pub const SPU2_END: u32 = 0x1f90_07ff;
+/// Final byte in the physical SPU2 device aperture, inclusive.
+pub const SPU2_END: u32 = 0x1f90_ffff;
 
 /// Mix input A into the effect right bus.
 pub const MMIX_INPUT_A_EFFECT_RIGHT: u16 = 1 << 0;
@@ -65,6 +65,7 @@ pub const CORE_ATTR_IRQ_ENABLE: u16 = 1 << 6;
 pub const CORE_ATTR_EXTERNAL_ENABLE: u16 = 1;
 
 const REGISTER_HALFWORDS: usize = 0x400;
+const REGISTER_END: u32 = 0x7ff;
 const CORE_STRIDE: u32 = 0x400;
 const VOICE_PARAMETER_END: u32 = 0x180;
 const VOICE_STRIDE: u32 = 0x10;
@@ -752,7 +753,11 @@ impl Spu2 {
     ///
     /// Returns [`Spu2Error::InvalidRegister`] outside the SPU2 window.
     pub fn read_register(&self, address: u32) -> Result<u16, Spu2Error> {
-        let (offset, index) = decode_register(address)?;
+        let offset = decode_register(address)?;
+        if offset > REGISTER_END {
+            return Ok(0);
+        }
+        let index = register_index(offset);
         if offset == IRQ_INFO {
             return Ok(self.irq_info);
         }
@@ -805,13 +810,18 @@ impl Spu2 {
     /// Writes one aligned 16-bit register and applies its hardware side effects.
     ///
     /// Unknown aligned locations in the physical SPU2 window remain readable,
-    /// allowing module drivers to probe revision-specific state safely.
+    /// allowing module drivers to probe revision-specific state safely. Writes
+    /// beyond the implemented `0x800`-byte register bank are discarded.
     ///
     /// # Errors
     ///
     /// Returns [`Spu2Error::InvalidRegister`] outside the SPU2 window.
     pub fn write_register(&mut self, address: u32, value: u16) -> Result<(), Spu2Error> {
-        let (offset, index) = decode_register(address)?;
+        let offset = decode_register(address)?;
+        if offset > REGISTER_END {
+            return Ok(());
+        }
+        let index = register_index(offset);
         self.registers[index] = value;
         if offset == IRQ_INFO {
             self.irq_info &= value;
@@ -1091,12 +1101,12 @@ impl Spu2MmioEndpoint for Spu2 {
     }
 }
 
-fn decode_register(address: u32) -> Result<(u32, usize), Spu2Error> {
+fn decode_register(address: u32) -> Result<u32, Spu2Error> {
     if !(SPU2_BASE..=SPU2_END).contains(&address) || address & 1 != 0 {
         return Err(Spu2Error::InvalidRegister { address });
     }
     let offset = address - SPU2_BASE;
-    Ok((offset, register_index(offset)))
+    Ok(offset)
 }
 
 fn register_index(offset: u32) -> usize {
@@ -1625,6 +1635,11 @@ mod tests {
         assert_eq!(
             Spu2MmioEndpoint::read_register(&mut spu2, SPU2_BASE + 0x7fe).unwrap(),
             0x1234
+        );
+        Spu2MmioEndpoint::write_register(&mut spu2, SPU2_BASE + 0x0b60, 0x5678).unwrap();
+        assert_eq!(
+            Spu2MmioEndpoint::read_register(&mut spu2, SPU2_BASE + 0x0b60).unwrap(),
+            0
         );
         assert!(matches!(
             spu2.write_register(SPU2_BASE + 1, 0),
