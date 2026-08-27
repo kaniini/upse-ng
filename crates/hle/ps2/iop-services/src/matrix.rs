@@ -293,7 +293,9 @@ fn ioman_symbol(ordinal: u16) -> &'static str {
 }
 
 pub(crate) const fn version_compatible(provided: u16, required: u16) -> bool {
-    provided >> 8 == required >> 8 && (provided & 0xff) >= (required & 0xff)
+    // Loadcore uses the minor version when replacing exports, but import
+    // linking compares only the library name and major version.
+    provided >> 8 == required >> 8
 }
 
 #[cfg(test)]
@@ -309,7 +311,7 @@ mod tests {
         assert_eq!(describe_import("ioman", 25), None);
         assert_eq!(describe_import("hostfs", 4), None);
         assert!(version_compatible(0x0103, 0x0101));
-        assert!(!version_compatible(0x0101, 0x0103));
+        assert!(version_compatible(0x0101, 0x0103));
         assert!(!version_compatible(0x0201, 0x0101));
     }
 }

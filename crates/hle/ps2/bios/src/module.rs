@@ -816,7 +816,9 @@ fn validate_library_name(name: &str) -> Result<(), KernelError> {
 }
 
 const fn version_compatible(provided: u16, required: u16) -> bool {
-    provided >> 8 == required >> 8 && (provided & 0xff) >= (required & 0xff)
+    // Loadcore uses the minor version when replacing exports, but import
+    // linking compares only the library name and major version.
+    provided >> 8 == required >> 8
 }
 
 fn put_u16(output: &mut [u8], offset: usize, value: u16) {
@@ -962,11 +964,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            modules.bind_import("sysclib", 0x0102, 1).unwrap(),
+            modules.bind_import("sysclib", 0x0104, 1).unwrap(),
             ResolvedImport {
                 library_id: id,
                 address: 0x2010
             }
+        );
+        assert_eq!(
+            modules.bind_import("sysclib", 0x0200, 1),
+            Err(KernelError::LibraryNotFound)
         );
         assert_eq!(modules.release_export(id), Err(KernelError::LibraryInUse));
         modules.unbind_import(id).unwrap();
