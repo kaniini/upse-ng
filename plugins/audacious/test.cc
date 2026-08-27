@@ -102,13 +102,14 @@ int main(int argc, char ** argv)
         plugin && plugin->magic == _AUD_PLUGIN_MAGIC &&
         plugin->version == _AUD_PLUGIN_VERSION &&
         plugin->type == PluginType::Input &&
+        plugin->info.prefs &&
         has_extension(plugin, "psf") && has_extension(plugin, "minipsf") &&
         has_extension(plugin, "psf2") && has_extension(plugin, "minipsf2");
     if (!valid_plugin)
         std::fprintf(stderr, "invalid Audacious input plugin descriptor\n");
 
     const bool valid_fixtures =
-        valid_plugin &&
+        valid_plugin && plugin->init() &&
         check_fixture(plugin, argv[2], "UPSE-NG synthetic noise",
                       "PlayStation Sound Format (PSF)") &&
         check_fixture(plugin, argv[3], "UPSE-NG synthetic noise",
@@ -116,6 +117,8 @@ int main(int argc, char ** argv)
         check_fixture(plugin, argv[4], "UPSE-NG synthetic PSF2",
                       "PlayStation 2 Sound Format (PSF2)");
 
+    if (valid_plugin)
+        plugin->cleanup();
     dlclose(module);
     aud_cleanup();
     return valid_fixtures ? EXIT_SUCCESS : EXIT_FAILURE;

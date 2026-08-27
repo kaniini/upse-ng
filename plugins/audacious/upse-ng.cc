@@ -2,6 +2,7 @@
 
 #include <libaudcore/audstrings.h>
 #include <libaudcore/plugin.h>
+#include <libaudcore/preferences.h>
 #include <libaudcore/runtime.h>
 
 #include <upse.h>
@@ -20,6 +21,33 @@ namespace
 
 constexpr uint64_t RenderQuantum = 4096;
 constexpr uint64_t SeekQuantum = 65536;
+constexpr const char * ConfigSection = "upse-ng";
+
+const char * const ConfigDefaults[] = {
+    "detect_silence", "FALSE",
+    "silence_duration", "5000",
+    "silence_threshold", "0.000030517578125",
+    nullptr,
+};
+
+const PreferencesWidget PreferenceWidgets[] = {
+    WidgetLabel("<b>Silence detection</b>"),
+    WidgetCheck("Stop playback after trailing silence",
+                WidgetBool(ConfigSection, "detect_silence")),
+    WidgetSpin("Quiet duration:",
+               WidgetInt(ConfigSection, "silence_duration"),
+               {100, 60000, 100, "ms"}),
+    WidgetSpin("Quiet threshold:",
+               WidgetFloat(ConfigSection, "silence_threshold"),
+               {0.0, 1.0, 0.00001, "normalized amplitude"}),
+};
+
+const PluginPreferences Preferences = {
+    {PreferenceWidgets},
+    nullptr,
+    nullptr,
+    nullptr,
+};
 
 const char * const extensions[] = {"psf", "minipsf", "psf2", "minipsf2",
                                    nullptr};
@@ -98,7 +126,8 @@ bool read_root(VFSFile & file, Index<char> & bytes)
     return bytes.len() >= 4;
 }
 
-PlayerPtr open_player(const char * filename, const Index<char> & bytes)
+PlayerPtr open_player(const char * filename, const Index<char> & bytes,
+                      bool playback)
 {
     PlayerPtr player(nullptr, upse_player_free);
     upse_config config{};
@@ -107,6 +136,22 @@ PlayerPtr open_player(const char * filename, const Index<char> & bytes)
     {
         report_error("initialize configuration", result, nullptr);
         return player;
+    }
+
+    if (playback && aud_get_bool(ConfigSection, "detect_silence"))
+    {
+        const int duration = aud_get_int(ConfigSection, "silence_duration");
+        const double threshold =
+            aud_get_double(ConfigSection, "silence_threshold");
+        if (duration > 0 && threshold >= 0.0 && threshold <= 1.0)
+        {
+            config.trailing_silence_ms = static_cast<uint64_t>(duration);
+            config.silence_threshold = static_cast<float>(threshold);
+        }
+        else
+        {
+            AUDERR("upse-ng: ignoring invalid silence detection settings\n");
+        }
     }
 
     upse_resolver resolver = {
@@ -241,11 +286,17 @@ public:
                   nullptr,
                   "PlayStation and PlayStation 2 Sound Format decoder using "
                   "libupse-ng",
-                  nullptr,
+                  &Preferences,
                   0,
               },
               InputInfo().with_exts(extensions).with_priority(1))
     {
+    }
+
+    bool init() override
+    {
+        aud_config_set_defaults(ConfigSection, ConfigDefaults);
+        return true;
     }
 
     bool is_our_file(const char *, VFSFile & file) override
@@ -270,7 +321,7 @@ public:
             AUDERR("upse-ng: cannot read %s\n", filename);
             return false;
         }
-        PlayerPtr player = open_player(filename, bytes);
+        PlayerPtr player = open_player(filename, bytes, false);
         if (!player)
             return false;
         upse_audio_format format{};
@@ -288,7 +339,7 @@ public:
             AUDERR("upse-ng: cannot read %s\n", filename);
             return false;
         }
-        PlayerPtr player = open_player(filename, bytes);
+        PlayerPtr player = open_player(filename, bytes, true);
         if (!player)
             return false;
 
