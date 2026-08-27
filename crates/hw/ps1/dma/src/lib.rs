@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! PS1 DMA registers with channel 4 transfers and inert non-audio channels.
+//! PS1 DMA registers with MDEC-input and sound transfers.
 
 use thiserror::Error;
 use upse_clock::{ClockError, Deadline, Ticks};
@@ -15,6 +15,12 @@ pub const DMA_CHANNEL_END: u32 = 0x1f80_10e8;
 pub const DMA_CHANNEL_HALFWORD_END: u32 = DMA_CHANNEL_END + 2;
 /// Last DMA global-control halfword address.
 pub const DMA_CONTROL_END: u32 = 0x1f80_10f6;
+/// Channel 0 memory address register.
+pub const D0_MADR: u32 = 0x1f80_1080;
+/// Channel 0 block control register.
+pub const D0_BCR: u32 = 0x1f80_1084;
+/// Channel 0 channel control register.
+pub const D0_CHCR: u32 = 0x1f80_1088;
 /// Channel 4 memory address register.
 pub const D4_MADR: u32 = 0x1f80_10c0;
 /// Channel 4 block control register.
@@ -29,6 +35,7 @@ pub const DICR: u32 = 0x1f80_10f4;
 pub const CHANNEL4_EVENT: EventId = EventId::new(0x0004_0004);
 
 const DPCR_RESET: u32 = 0x0765_4321;
+const CHANNEL0_ENABLE: u32 = 1 << 3;
 const CHANNEL4_ENABLE: u32 = 1 << 19;
 const CHCR_DIRECTION_FROM_RAM: u32 = 1 << 0;
 const CHCR_DECREMENT: u32 = 1 << 1;
@@ -46,6 +53,7 @@ const DICR_WRITABLE_CONTROL: u32 = 0x00ff_803f;
 /// Channel 4 interrupt-enable bit in `DICR`.
 pub const DICR_CHANNEL4_MASK: u32 = 1 << 20;
 const DICR_CHANNEL4_FLAG: u32 = 1 << 28;
+const DICR_CHANNEL0_FLAG: u32 = 1 << 24;
 const RAM_ADDRESS_MASK: u32 = 0x00ff_fffc;
 const CYCLES_PER_WORD: u64 = 4;
 const MAX_RAM_WORDS: u64 = (2 * 1024 * 1024) / 4;
@@ -53,6 +61,17 @@ const CHANNEL_COUNT: usize = 7;
 const CHANNEL_STRIDE: u32 = 0x10;
 const CHANNEL_REGISTER_COUNT: usize = 3;
 const CHANNEL4: usize = 4;
+const CHANNEL0: usize = 0;
+
+/// MDEC command port consumed by DMA channel 0.
+pub trait MdecDmaEndpoint {
+    /// Accepts one little-endian 32-bit word from main RAM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EndpointError`] if the device cannot accept the word.
+    fn write_word(&mut self, value: u32) -> Result<(), EndpointError>;
+}
 
 /// Sound-device port consumed by DMA channel 4.
 pub trait SoundDmaEndpoint {
@@ -83,7 +102,7 @@ impl InterruptSink for InterruptController {
     }
 }
 
-/// A sound endpoint rejected or failed a transfer word.
+/// A device endpoint rejected or failed a transfer word.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{message}")]
 pub struct EndpointError {
@@ -142,9 +161,18 @@ pub enum DmaError {
     /// Scheduler delivered a different or obsolete event.
     #[error("stale DMA completion event")]
     StaleEvent,
-    /// Sound endpoint failed while transferring a word.
-    #[error("sound DMA endpoint failure: {0}")]
+    /// Device endpoint failed while transferring a word.
+    #[error("DMA endpoint failure: {0}")]
     Endpoint(#[from] EndpointError),
+    /// Channel 0 was programmed in a direction unsupported by MDEC input.
+    #[error("MDEC input DMA direction is device-to-RAM")]
+    MdecDirection,
+    /// Channel 0 linked-list or reserved synchronization mode is unsupported.
+    #[error("unsupported MDEC input DMA synchronization mode {mode}")]
+    UnsupportedMdecSync {
+        /// Two-bit synchronization field.
+        mode: u8,
+    },
     /// Scheduler insertion sequence was exhausted.
     #[error("DMA scheduler failure")]
     Scheduler,
@@ -171,7 +199,7 @@ struct PendingTransfer {
     words: u64,
 }
 
-/// Instance-owned PS1 DMA controller implementing sound channel 4.
+/// Instance-owned PS1 DMA controller implementing MDEC input and sound channels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DmaController {
     madr: u32,
@@ -265,6 +293,13 @@ impl DmaController {
                     }
                     _ => unreachable!("validated DMA register index"),
                 }
+            } else if channel == CHANNEL0 {
+                self.register_only_channels[channel][register] = match register {
+                    0 => value & RAM_ADDRESS_MASK,
+                    1 => value,
+                    2 => value & CHCR_WRITABLE,
+                    _ => unreachable!("validated DMA register index"),
+                };
             } else {
                 self.register_only_channels[channel][register] = match register {
                     0 => value & RAM_ADDRESS_MASK,
@@ -287,6 +322,63 @@ impl DmaController {
             _ => return Err(DmaError::InvalidRegister { address }),
         }
         Ok(())
+    }
+
+    /// Immediately services one active MDEC-input transfer.
+    ///
+    /// The audio-oriented machine has no video timing consumer, so channel 0
+    /// completes at its next MMIO programming boundary. Sound channel 4 keeps
+    /// its scheduled cycle timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DmaError`] for invalid direction, synchronization, RAM range,
+    /// word count, or endpoint input.
+    pub fn service_mdec_in<E: MdecDmaEndpoint, S: InterruptSink>(
+        &mut self,
+        memory: &Ps1Memory,
+        endpoint: &mut E,
+        sink: &mut S,
+    ) -> Result<bool, DmaError> {
+        let registers = &mut self.register_only_channels[CHANNEL0];
+        let [madr, bcr, chcr] = *registers;
+        if self.dpcr & CHANNEL0_ENABLE == 0 || chcr & CHCR_START == 0 {
+            return Ok(false);
+        }
+        if chcr & CHCR_DIRECTION_FROM_RAM == 0 {
+            return Err(DmaError::MdecDirection);
+        }
+        let sync = sync_mode(chcr);
+        let active = match sync {
+            0 => chcr & CHCR_TRIGGER != 0,
+            1 => true,
+            mode => return Err(DmaError::UnsupportedMdecSync { mode }),
+        };
+        if !active {
+            return Ok(false);
+        }
+        let words = transfer_words(bcr, sync)?;
+        let decrement = chcr & CHCR_DECREMENT != 0;
+        validate_ram_range(madr, words, decrement, memory.ram().len())?;
+        for index in 0..words {
+            let address = transfer_address(madr, index, decrement)?;
+            let offset = usize::try_from(address).map_err(|_| DmaError::RamRange {
+                base: madr,
+                words,
+                decrement,
+            })?;
+            endpoint.write_word(read_ram_word(memory.ram(), offset))?;
+        }
+        let byte_count = words.checked_mul(4).ok_or(DmaError::ClockOverflow)?;
+        let byte_count = u32::try_from(byte_count).map_err(|_| DmaError::ClockOverflow)?;
+        registers[0] = if decrement {
+            madr.wrapping_sub(byte_count)
+        } else {
+            madr.wrapping_add(byte_count)
+        } & RAM_ADDRESS_MASK;
+        registers[2] &= !(CHCR_START | CHCR_TRIGGER);
+        self.finish_channel0(sink);
+        Ok(true)
     }
 
     /// Completes the scheduler event and transfers exact words through the port.
@@ -373,6 +465,14 @@ impl DmaController {
     fn finish_channel4<S: InterruptSink>(&mut self, sink: &mut S) {
         let was_asserted = self.master_irq();
         self.dicr_flags |= DICR_CHANNEL4_FLAG;
+        if !was_asserted && self.master_irq() {
+            sink.request(InterruptSource::Dma);
+        }
+    }
+
+    fn finish_channel0<S: InterruptSink>(&mut self, sink: &mut S) {
+        let was_asserted = self.master_irq();
+        self.dicr_flags |= DICR_CHANNEL0_FLAG;
         if !was_asserted && self.master_irq() {
             sink.request(InterruptSource::Dma);
         }
@@ -506,10 +606,11 @@ mod tests {
     use upse_scheduler::Scheduler;
 
     use super::{
-        CHANNEL4_ENABLE, CHCR_DECREMENT, CHCR_DIRECTION_FROM_RAM, CHCR_START, CHCR_TRIGGER, D4_BCR,
-        D4_CHCR, D4_MADR, DICR, DICR_CHANNEL4_FLAG, DICR_CHANNEL4_MASK, DICR_MASTER_ENABLE,
-        DICR_MASTER_FLAG, DMA_CHANNEL_START, DPCR, DmaController, DmaError, EndpointError,
-        InterruptSink, SoundDmaEndpoint,
+        CHANNEL0_ENABLE, CHANNEL4_ENABLE, CHCR_DECREMENT, CHCR_DIRECTION_FROM_RAM, CHCR_START,
+        CHCR_TRIGGER, D0_BCR, D0_CHCR, D0_MADR, D4_BCR, D4_CHCR, D4_MADR, DICR, DICR_CHANNEL0_FLAG,
+        DICR_CHANNEL4_FLAG, DICR_CHANNEL4_MASK, DICR_MASTER_ENABLE, DICR_MASTER_FLAG,
+        DMA_CHANNEL_START, DPCR, DmaController, DmaError, EndpointError, InterruptSink,
+        MdecDmaEndpoint, SoundDmaEndpoint,
     };
 
     #[derive(Default)]
@@ -528,6 +629,13 @@ mod tests {
             self.reads
                 .pop_front()
                 .ok_or_else(|| EndpointError::new("empty synthetic endpoint"))
+        }
+    }
+
+    impl MdecDmaEndpoint for Endpoint {
+        fn write_word(&mut self, value: u32) -> Result<(), EndpointError> {
+            self.written.push(value);
+            Ok(())
         }
     }
 
@@ -600,6 +708,45 @@ mod tests {
         assert_ne!(dma.read(DICR).unwrap() & DICR_CHANNEL4_FLAG, 0);
         assert_ne!(dma.read(DICR).unwrap() & DICR_MASTER_FLAG, 0);
         assert_eq!(irq.status(), InterruptSource::Dma.bit());
+    }
+
+    #[test]
+    fn ram_to_mdec_transfer_services_exact_words_and_completes() {
+        let mut dma = DmaController::new();
+        let mut memory = Ps1Memory::new(OpenBusPolicy::Strict);
+        for index in 0..32_u32 {
+            memory.write_u32(0x100 + index * 4, index).unwrap();
+        }
+        let mut endpoint = Endpoint::default();
+        let mut scheduler = Scheduler::new();
+        let mut irq = InterruptController::new();
+        write(
+            &mut dma,
+            DPCR,
+            super::DPCR_RESET | CHANNEL0_ENABLE,
+            &mut scheduler,
+            &mut irq,
+        )
+        .unwrap();
+        write(&mut dma, D0_MADR, 0x100, &mut scheduler, &mut irq).unwrap();
+        write(&mut dma, D0_BCR, 0x0001_0020, &mut scheduler, &mut irq).unwrap();
+        write(
+            &mut dma,
+            D0_CHCR,
+            CHCR_DIRECTION_FROM_RAM | (1 << 9) | CHCR_START,
+            &mut scheduler,
+            &mut irq,
+        )
+        .unwrap();
+
+        assert!(
+            dma.service_mdec_in(&memory, &mut endpoint, &mut irq)
+                .unwrap()
+        );
+        assert_eq!(endpoint.written, (0..32).collect::<Vec<_>>());
+        assert_eq!(dma.read(D0_MADR).unwrap(), 0x180);
+        assert_eq!(dma.read(D0_CHCR).unwrap() & CHCR_START, 0);
+        assert_ne!(dma.read(DICR).unwrap() & DICR_CHANNEL0_FLAG, 0);
     }
 
     #[test]

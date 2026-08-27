@@ -17,6 +17,7 @@ use upse_ps1_dma::{
 };
 use upse_ps1_gpu::{GP0, GP1, Gpu};
 use upse_ps1_irq::{I_MASK, I_STAT, InterruptController, InterruptSource};
+use upse_ps1_mdec::{MDEC_CONTROL_STATUS, MDEC_DATA, Mdec};
 use upse_ps1_memory::{
     MEMORY_CONTROL_END, MEMORY_CONTROL_START, MemoryError, MemoryRegion, OpenBusPolicy, Ps1Memory,
 };
@@ -200,6 +201,7 @@ struct MachineState {
     memory: Ps1Memory,
     cdrom: CdRom,
     gpu: Gpu,
+    mdec: Mdec,
     irq: InterruptController,
     timers: RootCounters,
     refresh: VBlankClock,
@@ -265,6 +267,7 @@ impl Ps1Machine {
             memory,
             cdrom: CdRom::new(),
             gpu: Gpu::new(),
+            mdec: Mdec::new(),
             irq: InterruptController::new(),
             timers: RootCounters::new(),
             refresh: VBlankClock::new(standard),
@@ -428,6 +431,7 @@ impl Ps1Machine {
                 memory: &mut state.memory,
                 cdrom: &mut state.cdrom,
                 gpu: &mut state.gpu,
+                mdec: &mut state.mdec,
                 irq: &mut state.irq,
                 timers: &mut state.timers,
                 dma: &mut state.dma,
@@ -802,6 +806,7 @@ struct MachineBus<'a> {
     memory: &'a mut Ps1Memory,
     cdrom: &'a mut CdRom,
     gpu: &'a mut Gpu,
+    mdec: &'a mut Mdec,
     irq: &'a mut InterruptController,
     timers: &'a mut RootCounters,
     dma: &'a mut DmaController,
@@ -813,6 +818,16 @@ struct MachineBus<'a> {
 impl MachineBus<'_> {
     fn physical_region(address: u32) -> Result<MemoryRegion, BusFault> {
         Ps1Memory::classify(address).map_err(bus_fault)
+    }
+
+    fn write_dma(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
+        self.dma
+            .write(address, value, self.now, self.scheduler, self.irq)
+            .map_err(bus_fault)?;
+        self.dma
+            .service_mdec_in(self.memory, self.mdec, self.irq)
+            .map_err(bus_fault)?;
+        Ok(())
     }
 
     fn read_mmio_u16(&mut self, address: u32) -> Result<u16, BusFault> {
@@ -879,9 +894,7 @@ impl MachineBus<'_> {
                 } else {
                     (old & 0x0000_ffff) | (u32::from(value) << 16)
                 };
-                self.dma
-                    .write(aligned, merged, self.now, self.scheduler, self.irq)
-                    .map_err(bus_fault)
+                self.write_dma(aligned, merged)
             }
             SPU_BASE..=SPU_END => self.spu.write_register(address, value).map_err(bus_fault),
             _ => Err(BusFault::new(format!(
@@ -930,6 +943,9 @@ impl Bus for MachineBus<'_> {
                     self.dma.read(physical).map_err(bus_fault)
                 }
                 GP0 | GP1 => self.gpu.read_register(physical).map_err(bus_fault),
+                MDEC_DATA | MDEC_CONTROL_STATUS => {
+                    self.mdec.read_register(physical).map_err(bus_fault)
+                }
                 SPU_BASE..=SPU_END => {
                     let low = self.spu.read_register(physical).map_err(bus_fault)?;
                     let high = self.spu.read_register(physical + 2).map_err(bus_fault)?;
@@ -985,11 +1001,13 @@ impl Bus for MachineBus<'_> {
                     .map_err(bus_fault),
                 I_STAT | I_MASK => self.irq.write(physical, value).map_err(bus_fault),
                 TIMER_BASE..=TIMER_END => self.timers.write(physical, value).map_err(bus_fault),
-                DMA_CHANNEL_START..=DMA_CHANNEL_END | DPCR | DICR => self
-                    .dma
-                    .write(physical, value, self.now, self.scheduler, self.irq)
-                    .map_err(bus_fault),
+                DMA_CHANNEL_START..=DMA_CHANNEL_END | DPCR | DICR => {
+                    self.write_dma(physical, value)
+                }
                 GP0 | GP1 => self.gpu.write_register(physical, value).map_err(bus_fault),
+                MDEC_DATA | MDEC_CONTROL_STATUS => {
+                    self.mdec.write_register(physical, value).map_err(bus_fault)
+                }
                 SPU_BASE..=SPU_END => {
                     let bytes = value.to_le_bytes();
                     self.spu
@@ -1242,6 +1260,33 @@ mod tests {
         let mut reset = [0_i16; 32];
         machine.render(16, &mut reset).unwrap();
         assert_eq!(reset, golden);
+    }
+
+    #[test]
+    fn mdec_reset_and_status_are_routed_through_the_cpu_bus() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let program = 0x8001_8000;
+        let instructions = [
+            instruction_lui(8, 0x1f80),
+            instruction_lui(9, 0x8000),
+            instruction_sw(9, 0x1824, 8),
+            instruction_lw(10, 0x1824, 8),
+        ];
+        for (index, instruction) in instructions.into_iter().enumerate() {
+            machine
+                .state
+                .memory
+                .write_u32(program + u32::try_from(index * 4).unwrap(), instruction)
+                .unwrap();
+        }
+        machine.state.cpu.set_pc(program);
+
+        for _ in 0..instructions.len() {
+            machine.step().unwrap();
+        }
+
+        assert_eq!(machine.state.cpu.register(10), Some(0x8004_ffff));
     }
 
     #[test]

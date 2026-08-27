@@ -17,6 +17,7 @@ upse-ps1-bios = { path = "../../hle/ps1/bios" }
 upse-ps1-cdrom = { path = "../../hw/ps1/cdrom" }
 upse-ps1-dma = { path = "../../hw/ps1/dma" }
 upse-ps1-gpu = { path = "../../hw/ps1/gpu" }
+upse-ps1-mdec = { path = "../../hw/ps1/mdec" }
 upse-ps1-irq = { path = "../../hw/ps1/irq" }
 upse-ps1-memory = { path = "../../hw/ps1/memory" }
 upse-ps1-spu = { path = "../../hw/ps1/spu" }

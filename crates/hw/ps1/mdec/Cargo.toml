@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+[package]
+name = "upse-ps1-mdec"
+description = "Composable PS1 MDEC control and status interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+upse-ps1-dma = { path = "../dma" }
+
+[lints]
+workspace = true
