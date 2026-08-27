@@ -502,6 +502,7 @@ impl Spu {
             MAIN_VOLUME_RIGHT | CURRENT_MAIN_VOLUME_RIGHT => Ok(self.main_volume_right),
             REVERB_VOLUME_LEFT => Ok(self.reverb_volume_left),
             REVERB_VOLUME_RIGHT => Ok(self.reverb_volume_right),
+            KEY_ON_LOW | KEY_ON_HIGH | KEY_OFF_LOW | KEY_OFF_HIGH => Ok(0),
             PITCH_MOD_LOW => Ok(low_half(self.pitch_mod_mask)),
             PITCH_MOD_HIGH => Ok(high_half(self.pitch_mod_mask)),
             NOISE_LOW => Ok(low_half(self.noise_mask)),
@@ -834,11 +835,11 @@ mod tests {
     use super::{
         CD_VOLUME_LEFT, CD_VOLUME_RIGHT, CONTROL, CONTROL_ENABLE, CONTROL_IRQ_ENABLE,
         CONTROL_REVERB_ENABLE, ENDX_LOW, EXTERNAL_VOLUME_LEFT, EXTERNAL_VOLUME_RIGHT, IRQ_ADDRESS,
-        KEY_OFF_LOW, KEY_ON_LOW, MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT, NOISE_LOW, PITCH_MOD_LOW,
-        REVERB_BASE, REVERB_ON_HIGH, REVERB_ON_LOW, REVERB_REGISTERS_START, REVERB_VOLUME_LEFT,
-        REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE, STATUS, STATUS_IRQ, Spu, SpuError,
-        TRANSFER_ADDRESS, TRANSFER_CONTROL, UNKNOWN_DA0, UNKNOWN_DBC, UNKNOWN_DBE, VOICE_COUNT,
-        Voice,
+        KEY_OFF_HIGH, KEY_OFF_LOW, KEY_ON_HIGH, KEY_ON_LOW, MAIN_VOLUME_LEFT, MAIN_VOLUME_RIGHT,
+        NOISE_LOW, PITCH_MOD_LOW, REVERB_BASE, REVERB_ON_HIGH, REVERB_ON_LOW,
+        REVERB_REGISTERS_START, REVERB_VOLUME_LEFT, REVERB_VOLUME_RIGHT, SOUND_RAM_SIZE, SPU_BASE,
+        STATUS, STATUS_IRQ, Spu, SpuError, TRANSFER_ADDRESS, TRANSFER_CONTROL, UNKNOWN_DA0,
+        UNKNOWN_DBC, UNKNOWN_DBE, VOICE_COUNT, Voice,
     };
 
     const ROOM_REVERB: [u16; 32] = [
@@ -996,6 +997,15 @@ mod tests {
         let mut tail = [0_i16; 8];
         spu.render(4, &mut tail).unwrap();
         assert_ne!(tail, [0; 8]);
+    }
+
+    #[test]
+    fn key_command_registers_read_as_zero() {
+        let mut spu = Spu::new();
+        for address in [KEY_ON_LOW, KEY_ON_HIGH, KEY_OFF_LOW, KEY_OFF_HIGH] {
+            spu.write_register(address, u16::MAX).unwrap();
+            assert_eq!(spu.read_register(address).unwrap(), 0);
+        }
     }
 
     #[test]
