@@ -150,6 +150,38 @@ fn fixed_executable_fixture() -> Vec<u8> {
     elf
 }
 
+fn truncated_linker_tail_fixture() -> Vec<u8> {
+    let source = ps2sdk_irx_fixture();
+    let relocation_size = 10 * 8;
+    let section_count = 5;
+    let relocation_offset = SHOFF + section_count * 40;
+    let mut elf = source;
+    let relocations = elf[REL_OFFSET..REL_OFFSET + relocation_size].to_vec();
+    elf.resize(relocation_offset + relocation_size + 4, 0);
+    elf[relocation_offset..relocation_offset + relocation_size].copy_from_slice(&relocations);
+
+    put_u16(&mut elf, 48, u16::try_from(section_count).unwrap());
+    section_header(
+        &mut elf,
+        2,
+        9,
+        0,
+        0,
+        relocation_offset,
+        relocation_size + 8,
+        3,
+        1,
+        4,
+        8,
+    );
+    let truncated_end = elf.len();
+    section_header(&mut elf, 3, 2, 0, 0, truncated_end + 4, 16, 4, 1, 4, 16);
+    section_header(&mut elf, 4, 3, 0, 0, truncated_end + 20, 1, 0, 0, 1, 0);
+    put_u32(&mut elf, relocation_offset + relocation_size, 0x34);
+    put_u32(&mut elf, IMAGE_OFFSET + 0x34, 0x20);
+    elf
+}
+
 #[allow(clippy::too_many_arguments)]
 fn program_header(
     elf: &mut [u8],
@@ -289,6 +321,20 @@ fn version_one_and_stripped_section_tables_are_identified() {
     put_u16(&mut stripped, 48, 0);
     let module = IrxModule::parse("stripped.irx", &stripped).unwrap();
     assert_eq!(module.description().name, "fixture");
+}
+
+#[test]
+fn truncated_linker_tail_keeps_complete_relocations() {
+    let module = IrxModule::parse("stripped-tail.irx", &truncated_linker_tail_fixture()).unwrap();
+    let mut target = FixtureTarget::new(MemoryRange {
+        start: 0x8000,
+        end: 0xb000,
+    });
+    module.load_into(0x9000, &mut target).unwrap();
+
+    assert_eq!(word(&target.image, 0x04), 0x0000_9020);
+    assert_eq!(word(&target.image, 0xa4), 0x0000_9010);
+    assert_eq!(word(&target.image, 0x34), 0x20);
 }
 
 #[test]

@@ -872,7 +872,11 @@ impl<'a> Parser<'a> {
                 alignment: self.u32(at + 32)?,
                 entry_size: self.u32(at + 36)?,
             };
-            if header.kind != SHT_NOBITS {
+            // Some PSF2 kits truncate final-IRX linker data while preserving
+            // the complete load image and section headers. Runtime sections
+            // remain strict; relocations are bounded to complete records below,
+            // while symbol and string tables are optional after final linking.
+            if !matches!(header.kind, SHT_NOBITS | SHT_REL | SHT_SYMTAB | SHT_STRTAB) {
                 self.slice(header.offset as usize, header.size as usize)?;
             }
             if header.alignment != 0 && !header.alignment.is_power_of_two() {
@@ -894,6 +898,11 @@ impl<'a> Parser<'a> {
                 || sections[section.link as usize].kind != SHT_STRTAB
             {
                 return Err(self.error(index * SECTION_HEADER_SIZE, IrxErrorKind::InvalidSection));
+            }
+            if !self.section_is_complete(*section)
+                || !self.section_is_complete(sections[section.link as usize])
+            {
+                continue;
             }
             let symbols = self.slice(section.offset as usize, section.size as usize)?;
             let strings = &sections[section.link as usize];
@@ -933,14 +942,23 @@ impl<'a> Parser<'a> {
             {
                 return Err(self.error(section.offset as usize, IrxErrorKind::InvalidSection));
             }
-            let count = section.size as usize / REL_SIZE;
-            if output.len().saturating_add(count) > self.limits.max_relocations {
+            let declared_count = section.size as usize / REL_SIZE;
+            if output.len().saturating_add(declared_count) > self.limits.max_relocations {
                 return Err(self.error(
                     section.offset as usize,
                     IrxErrorKind::LimitExceeded("relocations"),
                 ));
             }
-            let data = self.slice(section.offset as usize, section.size as usize)?;
+            let available = self
+                .input
+                .len()
+                .checked_sub(section.offset as usize)
+                .ok_or_else(|| self.error(self.input.len(), IrxErrorKind::Truncated))?
+                .min(section.size as usize);
+            // A partially stripped final record cannot be interpreted safely.
+            // Earlier complete records remain useful and deterministic.
+            let count = available / REL_SIZE;
+            let data = self.slice(section.offset as usize, count * REL_SIZE)?;
             let mut index = 0;
             while index < count {
                 let at = index * REL_SIZE;
@@ -1071,6 +1089,12 @@ impl<'a> Parser<'a> {
             .checked_mul(size)
             .ok_or_else(|| self.error(offset, IrxErrorKind::Overflow))?;
         self.slice(offset, bytes).map(|_| ())
+    }
+
+    fn section_is_complete(&self, section: SectionHeader) -> bool {
+        (section.offset as usize)
+            .checked_add(section.size as usize)
+            .is_some_and(|end| end <= self.input.len())
     }
 
     fn slice(&self, offset: usize, size: usize) -> Result<&'a [u8], IrxError> {
