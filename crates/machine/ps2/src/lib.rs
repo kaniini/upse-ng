@@ -571,15 +571,11 @@ impl Ps2Machine {
                         .return_from_exception(&mut context, &memory)?;
                 }
                 ActiveCallback::Timer(timer) => {
-                    let result = context.register(V0).unwrap_or(0);
                     self.state
                         .bios
                         .kernel_mut()
                         .return_from_callback(&mut context)?;
-                    self.state
-                        .timer_manager
-                        .finish_callback(timer, result, self.state.hardware.timers_mut())
-                        .map_err(IopMachineError::Timer)?;
+                    self.state.timer_manager.finish_callback(timer);
                     let source = timer_interrupt(timer);
                     let retained =
                         self.state.hardware.interrupt_controller().status() & !source.bit();

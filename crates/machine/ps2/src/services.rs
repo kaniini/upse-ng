@@ -112,22 +112,9 @@ impl TimerManager {
         })
     }
 
-    pub(crate) fn finish_callback(
-        &mut self,
-        timer: TimerId,
-        result: u32,
-        timers: &mut IopTimers,
-    ) -> Result<(), upse_iop_timers::TimerError> {
+    pub(crate) fn finish_callback(&mut self, timer: TimerId) {
         let index = timer as usize;
-        let slot = &mut self.slots[index];
-        slot.callback_pending = false;
-        if result == 0 {
-            slot.control = 0;
-            timers.write_u32(TIMER_BASES[index] + 4, 0)
-        } else {
-            slot.compare = result;
-            timers.write_u32(TIMER_BASES[index] + 8, result)
-        }
+        self.slots[index].callback_pending = false;
     }
 }
 
@@ -1333,4 +1320,29 @@ fn unsupported(library: &str, ordinal: u16) -> BackendError {
 #[allow(clippy::needless_pass_by_value)]
 fn backend(error: impl ToString) -> BackendError {
     BackendError::new(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_timer_callbacks_keep_the_programmed_period() {
+        let mut manager = TimerManager::default();
+        let slot = &mut manager.slots[TimerId::Timer5 as usize];
+        *slot = TimerSlot {
+            allocated: true,
+            control: 0x59,
+            compare: 0x11_8cc,
+            handler: Some((0x20_000, 0x12_000)),
+            callback_pending: false,
+        };
+
+        assert!(manager.callback(TimerId::Timer5).is_some());
+        assert!(manager.callback(TimerId::Timer5).is_none());
+        manager.finish_callback(TimerId::Timer5);
+        assert_eq!(manager.slots[TimerId::Timer5 as usize].control, 0x59);
+        assert_eq!(manager.slots[TimerId::Timer5 as usize].compare, 0x11_8cc);
+        assert!(manager.callback(TimerId::Timer5).is_some());
+    }
 }
