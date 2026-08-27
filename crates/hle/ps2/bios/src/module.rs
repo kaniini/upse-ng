@@ -801,7 +801,7 @@ fn validate_module_name(name: &str) -> Result<(), KernelError> {
         || name.len() > 127
         || name
             .bytes()
-            .any(|byte| byte == 0 || !byte.is_ascii_graphic())
+            .any(|byte| byte == 0 || !(byte.is_ascii_graphic() || byte == b' '))
     {
         return Err(KernelError::IllegalObject);
     }
@@ -1007,6 +1007,16 @@ mod tests {
             Err(KernelError::IllegalLibrary)
         );
         assert_eq!(allocator.total_free(), initial);
+    }
+
+    #[test]
+    fn module_names_accept_printable_spaces() {
+        assert_eq!(validate_module_name("kcet sd drv."), Ok(()));
+        assert_eq!(validate_module_name(""), Err(KernelError::IllegalObject));
+        assert_eq!(
+            validate_module_name("bad\nname"),
+            Err(KernelError::IllegalObject)
+        );
     }
 
     fn ps2sdk_irx_fixture() -> Vec<u8> {
