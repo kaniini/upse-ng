@@ -28,6 +28,11 @@
 
 #define RENDER_QUANTUM UINT64_C(4096)
 
+enum {
+  OPTION_SILENCE_DURATION = 256,
+  OPTION_SILENCE_THRESHOLD,
+};
+
 struct cli_option {
   char *key;
   char *value;
@@ -98,14 +103,31 @@ static int append_cli_option(struct cli_option **options, const char *text) {
 static void usage(FILE *stream, const char *program) {
   fprintf(stream,
           "usage: %s [--driver NAME] [--ao-option KEY=VALUE] "
-          "[--seek TIME] FILE\n"
+          "[--seek TIME] [--silence-duration MILLISECONDS] "
+          "[--silence-threshold AMPLITUDE] FILE\n"
           "\n"
           "  -d, --driver NAME          select a libao live driver\n"
           "  -o, --ao-option KEY=VALUE pass an option to the libao driver\n"
           "  -s, --seek TIME           reset and fast-forward before playback\n"
+          "      --silence-duration MS end after this many quiet milliseconds\n"
+          "      --silence-threshold N maximum quiet normalized amplitude\n"
           "  -h, --help                show this help\n"
           "  -v, --version             show the player version\n",
           program);
+}
+
+static int parse_threshold(const char *text, float *output) {
+  char *end = NULL;
+  float value;
+
+  errno = 0;
+  value = strtof(text, &end);
+  if (end == text || *end != '\0' || errno == ERANGE || !isfinite(value) ||
+      value < 0.0f) {
+    return 0;
+  }
+  *output = value;
+  return 1;
 }
 
 static void report_upse_error(const char *operation, upse_result result,
@@ -405,12 +427,18 @@ int main(int argc, char **argv) {
       {"driver", required_argument, NULL, 'd'},
       {"ao-option", required_argument, NULL, 'o'},
       {"seek", required_argument, NULL, 's'},
+      {"silence-duration", required_argument, NULL, OPTION_SILENCE_DURATION},
+      {"silence-threshold", required_argument, NULL,
+       OPTION_SILENCE_THRESHOLD},
       {"help", no_argument, NULL, 'h'},
       {"version", no_argument, NULL, 'v'},
       {NULL, 0, NULL, 0},
   };
   const char *driver_name = NULL;
   const char *seek_time = NULL;
+  uint64_t trailing_silence_ms = 0;
+  float silence_threshold = 0.0f;
+  int silence_threshold_set = 0;
   struct cli_option *cli_options = NULL;
   struct cli_option *option;
   ao_option *ao_options = NULL;
@@ -440,6 +468,19 @@ int main(int argc, char **argv) {
     case 's':
       seek_time = optarg;
       break;
+    case OPTION_SILENCE_DURATION:
+      if (!parse_unsigned(optarg, strlen(optarg), &trailing_silence_ms)) {
+        fprintf(stderr, "upse123: invalid silence duration: %s\n", optarg);
+        goto cleanup;
+      }
+      break;
+    case OPTION_SILENCE_THRESHOLD:
+      if (!parse_threshold(optarg, &silence_threshold)) {
+        fprintf(stderr, "upse123: invalid silence threshold: %s\n", optarg);
+        goto cleanup;
+      }
+      silence_threshold_set = 1;
+      break;
     case 'h':
       usage(stdout, argv[0]);
       exit_code = EXIT_SUCCESS;
@@ -465,6 +506,10 @@ int main(int argc, char **argv) {
   if (result != UPSE_RESULT_OK) {
     report_upse_error("initialize configuration", result, &error);
     goto cleanup;
+  }
+  config.trailing_silence_ms = trailing_silence_ms;
+  if (silence_threshold_set) {
+    config.silence_threshold = silence_threshold;
   }
   result = upse_player_open_path(argv[optind], &config, &player, &error);
   if (result != UPSE_RESULT_OK) {
