@@ -32,7 +32,8 @@ use upse_iop_timers::{CounterBoundary, TimerId, TimingEvent};
 use upse_irx::{IrxError, IrxModule, ResidentState};
 use upse_ps2_bios::{
     AllocationMode, BiosError, BiosHle, CpuContext, DispatchCall, GuestMemory, GuestMemoryError,
-    GuestRange, KernelError, KernelEvent, RETURN_ENTRY, RescheduleReason, ThreadSpec,
+    GuestRange, KernelError, KernelEvent, RETURN_ENTRY, RescheduleReason, THREAD_RETURN_ENTRY,
+    ThreadSpec,
 };
 use upse_ps2_spu2::{SAMPLE_RATE, Spu2, Spu2Error};
 use upse_psf::Psf2LoadPlan;
@@ -46,9 +47,9 @@ const AUDIO_CHUNK_FRAMES: usize = 256;
 const IDLE_ADVANCE_CYCLES: u64 = 768;
 const ROOT_STACK_SIZE: u32 = 64 * 1024;
 const ARGUMENT_BLOCK_SIZE: u32 = 256;
+const MODULE_START_PRIORITY: u32 = 8;
 const RA: usize = 31;
 const V0: usize = 2;
-const V1: usize = 3;
 const A0: usize = 4;
 const A1: usize = 5;
 const GP: usize = 28;
@@ -82,6 +83,8 @@ pub enum MachineStepKind {
     ModuleReturn,
     /// A kernel or interrupt callback returned through the HLE sentinel.
     CallbackReturn,
+    /// A guest thread returned from its entry function and became dormant.
+    ThreadReturn,
     /// Devices advanced while no guest thread was runnable.
     Idle,
 }
@@ -186,7 +189,8 @@ impl From<ClockError> for MachineError {
 #[derive(Clone, Debug)]
 struct ModuleFrame {
     module_id: u32,
-    caller: Option<ServiceContext>,
+    thread_id: u32,
+    requester: Option<u32>,
     argument_allocation: Option<u32>,
     result_address: Option<u32>,
 }
@@ -312,7 +316,8 @@ impl Ps2Machine {
             pending_audio: VecDeque::new(),
             module_frames: vec![ModuleFrame {
                 module_id: root_id,
-                caller: None,
+                thread_id: loader_thread,
+                requester: None,
                 argument_allocation: None,
                 result_address: None,
             }],
@@ -393,6 +398,9 @@ impl Ps2Machine {
     pub fn step(&mut self) -> Result<MachineStep, MachineError> {
         if self.state.hardware.cpu().pc() == RETURN_ENTRY {
             return self.handle_return();
+        }
+        if self.state.hardware.cpu().pc() == THREAD_RETURN_ENTRY {
+            return self.handle_thread_return();
         }
         self.enter_pending_callback()?;
         if self.state.callback_active.is_none()
@@ -619,33 +627,51 @@ impl Ps2Machine {
                 .memory_mut()
                 .write_u32(address, result)?;
         }
-        if let Some(mut caller) = frame.caller {
-            caller.set_register(V0, frame.module_id);
-            caller.set_register(V1, result);
-            caller.pc = caller.register(RA).unwrap_or(0);
-            apply_service_context(self.state.hardware.cpu_mut(), &caller);
+        let current = self.state.bios.kernel().current_thread();
+        if current != Some(frame.thread_id) {
+            return Err(KernelError::IllegalContext.into());
+        }
+        if let Some(requester) = frame.requester {
+            self.state.bios.kernel_mut().complete_module_start(
+                requester,
+                frame.thread_id,
+                frame.module_id,
+                result,
+            )?;
+        }
+        let mut context = bios_context(self.state.hardware.cpu());
+        let schedule = self
+            .state
+            .bios
+            .kernel_mut()
+            .exit_delete_current(&mut context)?;
+        if let Some(stack) = self.state.thread_stacks.remove(&frame.thread_id) {
+            let _ = self.state.bios.memory_mut().free(stack);
+        }
+        if schedule.current.is_some() {
+            apply_bios_context(self.state.hardware.cpu_mut(), &context);
+            self.state.halted = false;
         } else {
-            let mut context = bios_context(self.state.hardware.cpu());
-            let current = self.state.bios.kernel().current_thread();
-            let schedule = self
-                .state
-                .bios
-                .kernel_mut()
-                .exit_delete_current(&mut context)?;
-            if let Some(id) = current
-                && let Some(stack) = self.state.thread_stacks.remove(&id)
-            {
-                let _ = self.state.bios.memory_mut().free(stack);
-            }
-            if schedule.current.is_some() {
-                apply_bios_context(self.state.hardware.cpu_mut(), &context);
-            } else {
-                self.state.halted = true;
-            }
+            self.state.halted = true;
         }
         Ok(MachineStep {
             cycles: 1,
             kind: MachineStepKind::ModuleReturn,
+        })
+    }
+
+    fn handle_thread_return(&mut self) -> Result<MachineStep, MachineError> {
+        let mut context = bios_context(self.state.hardware.cpu());
+        let schedule = self.state.bios.kernel_mut().exit_current(&mut context)?;
+        if schedule.current.is_some() {
+            apply_bios_context(self.state.hardware.cpu_mut(), &context);
+            self.state.halted = false;
+        } else {
+            self.state.halted = true;
+        }
+        Ok(MachineStep {
+            cycles: 1,
+            kind: MachineStepKind::ThreadReturn,
         })
     }
 
@@ -756,15 +782,17 @@ impl Ps2Machine {
             {
                 self.state.timer_callbacks.push_back((timer, callback));
             }
-            if let HardwareEventKind::Timing(TimingEvent::VBlankStart) = event.kind
-                && let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(0)
-            {
-                self.state.callbacks.extend(callbacks);
+            if let HardwareEventKind::Timing(TimingEvent::VBlankStart) = event.kind {
+                self.state.bios.kernel_mut().notify_vblank(0)?;
+                if let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(0) {
+                    self.state.callbacks.extend(callbacks);
+                }
             }
-            if let HardwareEventKind::Timing(TimingEvent::VBlankEnd) = event.kind
-                && let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(1)
-            {
-                self.state.callbacks.extend(callbacks);
+            if let HardwareEventKind::Timing(TimingEvent::VBlankEnd) = event.kind {
+                self.state.bios.kernel_mut().notify_vblank(1)?;
+                if let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(1) {
+                    self.state.callbacks.extend(callbacks);
+                }
             }
         }
         for event in self

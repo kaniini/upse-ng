@@ -23,18 +23,13 @@ use upse_ps2_spu2::{
 };
 
 use crate::{
-    BiosMemoryAdapter, ModuleFrame, bind_module_imports, bios_context_from_service,
-    service_context_from_bios,
+    BiosMemoryAdapter, MODULE_START_PRIORITY, ModuleFrame, bind_module_imports,
+    bios_context_from_service, service_context_from_bios,
 };
 
 const V0: usize = 2;
 const V1: usize = 3;
-const A0: usize = 4;
-const A1: usize = 5;
-const A2: usize = 6;
-const A3: usize = 7;
 const GP: usize = 28;
-const RA: usize = 31;
 const RETURN_ENTRY: u32 = upse_ps2_bios::RETURN_ENTRY;
 const DEFAULT_THREAD_STACK: u32 = 16 * 1024;
 const CORE_STRIDE: u32 = 0x400;
@@ -567,6 +562,17 @@ impl MachineServices<'_> {
         memory: &mut M,
     ) -> Result<BackendResponse, BackendError> {
         let [a0, a1, a2, a3] = request.arguments;
+        if request.family == ServiceFamily::VBlank && matches!(request.import.ordinal, 4..=6) {
+            let phase = u32::from(request.import.ordinal == 5);
+            let mut cpu = bios_context_from_service(context);
+            let action = self
+                .bios
+                .kernel_mut()
+                .wait_vblank(phase, &mut cpu)
+                .map_err(backend)?;
+            service_context_from_bios(&cpu, context);
+            return Ok(schedule_response(&cpu, action.switched));
+        }
         if request.family == ServiceFamily::Interrupt {
             return match request.import.ordinal {
                 3 | 15 | 16 => Ok(BackendResponse::returning(0)),
@@ -719,29 +725,72 @@ impl MachineServices<'_> {
                 .begin_start(id, &mut guest)
                 .map_err(backend)?
         };
+        let requester = self
+            .bios
+            .kernel()
+            .current_thread()
+            .ok_or_else(|| backend(KernelError::IllegalContext))?;
+        let stack = self
+            .bios
+            .memory_mut()
+            .allocate(AllocationMode::First, DEFAULT_THREAD_STACK, 0)
+            .map_err(backend)?;
+        let thread = match self.bios.kernel_mut().create_thread(
+            ThreadSpec {
+                entry: invocation.entry,
+                stack: stack.address,
+                stack_size: stack.requested_size,
+                priority: MODULE_START_PRIORITY,
+                global_pointer: invocation.global_pointer,
+                attributes: 0,
+                option: 0,
+            },
+            guest_range(memory),
+        ) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let _ = self.bios.memory_mut().free(stack.address);
+                let _ = self.bios.memory_mut().free(argument_address);
+                return Err(backend(error));
+            }
+        };
+        let info_address = self
+            .bios
+            .modules()
+            .get(id)
+            .map_or(0, upse_ps2_bios::ModuleRecord::info_address);
+        if let Err(error) = self.bios.kernel_mut().start_thread_with_context(
+            thread,
+            [argument_count, argument_address, 0, info_address],
+            RETURN_ENTRY,
+        ) {
+            let _ = self.bios.kernel_mut().delete_thread(thread);
+            let _ = self.bios.memory_mut().free(stack.address);
+            let _ = self.bios.memory_mut().free(argument_address);
+            return Err(backend(error));
+        }
+        self.thread_stacks.insert(thread, stack.address);
+        let mut cpu = bios_context_from_service(context);
+        let action = self
+            .bios
+            .kernel_mut()
+            .wait_module_start(thread, &mut cpu)
+            .map_err(backend)?;
+        if action.current != Some(thread) {
+            return Err(backend(KernelError::IllegalContext));
+        }
+        service_context_from_bios(&cpu, context);
         self.module_frames.push(ModuleFrame {
             module_id: id,
-            caller: Some(context.clone()),
+            thread_id: thread,
+            requester: Some(requester),
             argument_allocation: Some(argument_address),
             result_address: (result_address != 0).then_some(result_address),
         });
-        context.pc = invocation.entry;
-        context.set_register(A0, argument_count);
-        context.set_register(A1, argument_address);
-        context.set_register(A2, 0);
-        context.set_register(
-            A3,
-            self.bios
-                .modules()
-                .get(id)
-                .map_or(0, upse_ps2_bios::ModuleRecord::info_address),
-        );
-        context.set_register(GP, invocation.global_pointer);
-        context.set_register(RA, RETURN_ENTRY);
         Ok(BackendResponse {
             v0: id,
             v1: None,
-            action: ServiceAction::CallModule,
+            action: ServiceAction::ContextSwitch,
         })
     }
 

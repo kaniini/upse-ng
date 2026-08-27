@@ -16,7 +16,7 @@ pub use allocator::{Allocation, AllocationMode, SYSMEM_QUANTUM, SystemMemory};
 pub use dispatch::{
     CallbackRequest, ControlBlock, CpuContext, DispatchBoundary, DispatchCall, EXCEPTION_ENTRY,
     ExceptionCode, HandlerRegistry, IMPORT_ENTRY, INTERRUPT_ENTRY, ImportCall, RETURN_ENTRY,
-    SYSCALL_ENTRY, Trampoline,
+    SYSCALL_ENTRY, THREAD_RETURN_ENTRY, Trampoline,
 };
 pub use error::{BiosError, KernelError};
 pub use kernel::{

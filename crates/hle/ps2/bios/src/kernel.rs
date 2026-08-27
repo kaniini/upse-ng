@@ -6,12 +6,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use upse_clock::{Deadline, Ticks};
 use upse_scheduler::{EventId, Scheduler};
 
-use crate::dispatch::RETURN_ENTRY;
+use crate::dispatch::{RETURN_ENTRY, THREAD_RETURN_ENTRY};
 use crate::{CallbackRequest, CpuContext, FixedTable, GuestRange, KernelError};
 
 const V0: usize = 2;
 const V1: usize = 3;
 const A0: usize = 4;
+const A1: usize = 5;
+const A2: usize = 6;
+const A3: usize = 7;
 const GP: usize = 28;
 const RA: usize = 31;
 const THREAD_CAPACITY: usize = 64;
@@ -56,6 +59,12 @@ pub enum WaitReason {
     Sleep,
     /// Waiting for a delay deadline.
     Delay,
+    /// Waiting for the start of vertical blanking.
+    VBlankStart,
+    /// Waiting for the end of vertical blanking.
+    VBlankEnd,
+    /// Waiting for a temporary module-start thread to finish.
+    ModuleStart(u32),
     /// Waiting for one semaphore count.
     Semaphore(u32),
     /// Waiting for an event-flag condition.
@@ -394,6 +403,21 @@ impl Kernel {
     ///
     /// Returns an identifier/state error or insertion-sequence exhaustion.
     pub fn start_thread(&mut self, id: u32, argument: u32) -> Result<(), KernelError> {
+        self.start_thread_with_context(id, [argument, 0, 0, 0], THREAD_RETURN_ENTRY)
+    }
+
+    /// Starts a dormant HLE-owned thread with four arguments and a selected
+    /// return sentinel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identifier/state error or insertion-sequence exhaustion.
+    pub fn start_thread_with_context(
+        &mut self,
+        id: u32,
+        arguments: [u32; 4],
+        return_address: u32,
+    ) -> Result<(), KernelError> {
         let state = self
             .threads
             .get(id)
@@ -411,14 +435,58 @@ impl Kernel {
             thread.spec.entry,
             thread.spec.stack.wrapping_add(thread.spec.stack_size),
         );
-        thread.context.set_register(A0, argument);
+        thread.context.set_register(A0, arguments[0]);
+        thread.context.set_register(A1, arguments[1]);
+        thread.context.set_register(A2, arguments[2]);
+        thread.context.set_register(A3, arguments[3]);
         thread.context.set_register(GP, thread.spec.global_pointer);
-        thread.context.set_register(RA, 0);
+        thread.context.set_register(RA, return_address);
         thread.current_priority = thread.spec.priority;
         thread.wakeup_count = 0;
         thread.ready_order = ready_order;
         thread.state = ThreadState::Ready;
         Ok(())
+    }
+
+    /// Blocks the current requester until a temporary module-start thread
+    /// completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identifier, execution-context, or scheduling error.
+    pub fn wait_module_start(
+        &mut self,
+        child: u32,
+        context: &mut CpuContext,
+    ) -> Result<ScheduleAction, KernelError> {
+        if self
+            .threads
+            .get(child)
+            .is_none_or(|thread| thread.state != ThreadState::Ready)
+        {
+            return Err(KernelError::UnknownThreadId);
+        }
+        self.block_current(context, WaitReason::ModuleStart(child), None)
+    }
+
+    /// Completes a module-start wait and installs the two return registers in
+    /// the requester context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identifier or wait-state error.
+    pub fn complete_module_start(
+        &mut self,
+        requester: u32,
+        child: u32,
+        module_id: u32,
+        resident: u32,
+    ) -> Result<(), KernelError> {
+        if !self.wait_matches(requester, WaitReason::ModuleStart(child)) {
+            return Err(KernelError::NotWaiting);
+        }
+        let module_id = i32::try_from(module_id).map_err(|_| KernelError::IllegalObject)?;
+        self.complete_wait(requester, module_id, Some(resident))
     }
 
     /// Deletes a dormant thread.
@@ -591,6 +659,48 @@ impl Kernel {
         let deadline = self.now.checked_advance(ticks)?;
         self.block_current(context, WaitReason::Delay, Some(deadline))
             .map_err(Into::into)
+    }
+
+    /// Blocks the current thread until the selected vertical-blank boundary.
+    ///
+    /// Zero selects `VBlank` start and one selects `VBlank` end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an object, execution-context, or scheduling error.
+    pub fn wait_vblank(
+        &mut self,
+        phase: u32,
+        context: &mut CpuContext,
+    ) -> Result<ScheduleAction, KernelError> {
+        let reason = match phase {
+            0 => WaitReason::VBlankStart,
+            1 => WaitReason::VBlankEnd,
+            _ => return Err(KernelError::IllegalObject),
+        };
+        self.block_current(context, reason, None)
+    }
+
+    /// Makes every thread waiting on one vertical-blank boundary runnable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an object or ready-sequence error.
+    pub fn notify_vblank(&mut self, phase: u32) -> Result<Vec<u32>, KernelError> {
+        let reason = match phase {
+            0 => WaitReason::VBlankStart,
+            1 => WaitReason::VBlankEnd,
+            _ => return Err(KernelError::IllegalObject),
+        };
+        let waiters = self
+            .threads
+            .iter()
+            .filter_map(|(id, thread)| (thread.state == ThreadState::Waiting(reason)).then_some(id))
+            .collect::<Vec<_>>();
+        for id in &waiters {
+            self.complete_wait(*id, 0, None)?;
+        }
+        Ok(waiters)
     }
 
     /// Cancels any wait and makes the thread ready with `KE_RELEASE_WAIT`.
@@ -1506,7 +1616,11 @@ impl Kernel {
 
     fn remove_waiter(&mut self, id: u32, reason: WaitReason) {
         match reason {
-            WaitReason::Sleep | WaitReason::Delay => {}
+            WaitReason::Sleep
+            | WaitReason::Delay
+            | WaitReason::VBlankStart
+            | WaitReason::VBlankEnd
+            | WaitReason::ModuleStart(_) => {}
             WaitReason::Semaphore(object) => {
                 if let Some(value) = self.semaphores.get_mut(object) {
                     value.waiters.retain(|waiter| *waiter != id);
@@ -1738,6 +1852,7 @@ mod tests {
             .unwrap();
         assert_eq!(action.current, Some(low));
         assert_eq!(context.register(A0), Some(0xaa));
+        assert_eq!(context.register(RA), Some(THREAD_RETURN_ENTRY));
         assert_eq!(
             context.register(GP),
             Some(thread_spec(0, 40).global_pointer)
@@ -1814,6 +1929,72 @@ mod tests {
         assert_eq!(kernel.thread(low).unwrap().state(), ThreadState::Dormant);
         kernel.delete_thread(low).unwrap();
         assert!(kernel.thread(low).is_none());
+    }
+
+    #[test]
+    fn vblank_waits_wake_on_the_selected_boundary() {
+        let (mut kernel, mut context, ids) = start_threads(&[10, 20]);
+        assert_eq!(
+            kernel.wait_vblank(0, &mut context).unwrap().current,
+            Some(ids[1])
+        );
+        assert_eq!(
+            kernel.thread(ids[0]).unwrap().state(),
+            ThreadState::Waiting(WaitReason::VBlankStart)
+        );
+        assert!(kernel.notify_vblank(1).unwrap().is_empty());
+        assert_eq!(kernel.notify_vblank(0).unwrap(), [ids[0]]);
+        assert_eq!(
+            kernel
+                .reschedule(&mut context, RescheduleReason::VBlank)
+                .unwrap()
+                .current,
+            Some(ids[0])
+        );
+
+        kernel.wait_vblank(1, &mut context).unwrap();
+        assert!(kernel.notify_vblank(0).unwrap().is_empty());
+        assert_eq!(kernel.notify_vblank(1).unwrap(), [ids[0]]);
+        assert_eq!(
+            kernel.wait_vblank(2, &mut context),
+            Err(KernelError::IllegalObject)
+        );
+    }
+
+    #[test]
+    fn module_start_threads_return_results_to_the_requester() {
+        let mut kernel = Kernel::new();
+        let requester = kernel.create_thread(thread_spec(0, 10), RANGE).unwrap();
+        kernel.start_thread(requester, 0).unwrap();
+        let mut context = CpuContext::reset(0, 0);
+        kernel
+            .reschedule(&mut context, RescheduleReason::HleReturn)
+            .unwrap();
+
+        let child = kernel.create_thread(thread_spec(1, 8), RANGE).unwrap();
+        kernel
+            .start_thread_with_context(child, [1, 2, 3, 4], RETURN_ENTRY)
+            .unwrap();
+        let action = kernel.wait_module_start(child, &mut context).unwrap();
+        assert_eq!(action.current, Some(child));
+        assert_eq!(context.register(A0), Some(1));
+        assert_eq!(context.register(A1), Some(2));
+        assert_eq!(context.register(A2), Some(3));
+        assert_eq!(context.register(A3), Some(4));
+        assert_eq!(context.register(RA), Some(RETURN_ENTRY));
+        assert_eq!(
+            kernel.thread(requester).unwrap().state(),
+            ThreadState::Waiting(WaitReason::ModuleStart(child))
+        );
+
+        kernel
+            .complete_module_start(requester, child, 7, 2)
+            .unwrap();
+        let action = kernel.exit_delete_current(&mut context).unwrap();
+        assert_eq!(action.current, Some(requester));
+        assert_eq!(context.register(V0), Some(7));
+        assert_eq!(context.register(V1), Some(2));
+        assert!(kernel.thread(child).is_none());
     }
 
     #[test]

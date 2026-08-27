@@ -37,6 +37,8 @@ pub const SYSCALL_ENTRY: u32 = 0x0000_0420;
 pub const IMPORT_ENTRY: u32 = 0x0000_0430;
 /// Callback/exception return entry.
 pub const RETURN_ENTRY: u32 = 0x0000_0440;
+/// Thread-entry return address guarded by the machine's HLE trap.
+pub const THREAD_RETURN_ENTRY: u32 = 0x0000_0450;
 /// First dynamically assigned import trampoline.
 pub const IMPORT_TRAMPOLINE_BASE: u32 = 0x0000_0800;
 /// Guest address containing the head of the module-info chain.
