@@ -460,6 +460,13 @@ impl MachineServices<'_> {
                 self.timer_manager.slots[index] = TimerSlot::default();
                 Ok(BackendResponse::returning(0))
             }
+            10 => {
+                let Some(index) = self.timer_manager.index(a0) else {
+                    return Ok(invalid());
+                };
+                let count = self.timers.read_u32(TIMER_BASES[index]).map_err(backend)?;
+                Ok(BackendResponse::returning(count))
+            }
             20 => {
                 let Some(index) = self.timer_manager.index(a0) else {
                     return Ok(invalid());
