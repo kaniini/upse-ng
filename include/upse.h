@@ -24,7 +24,7 @@
 /**
  * Current configuration/header ABI version.
  */
-#define UPSE_ABI_VERSION 1
+#define UPSE_ABI_VERSION 2
 
 /**
  * Opaque owned error handle.
@@ -85,6 +85,14 @@ typedef struct upse_config {
    * Maximum aggregate root/dependency bytes.
    */
   uint64_t max_aggregate_bytes;
+  /**
+   * Consecutive quiet milliseconds which end playback; zero disables detection.
+   */
+  uint64_t trailing_silence_ms;
+  /**
+   * Maximum absolute normalized sample amplitude considered quiet.
+   */
+  float silence_threshold;
 } upse_config;
 
 /**

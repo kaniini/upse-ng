@@ -13,11 +13,13 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     ptr, slice,
+    time::Duration,
 };
 
 use upse::{
     AudioAction, AudioBlock, DependencyLimits, Limits, LoadError, ParseLimits, Player,
     PlayerBuilder, PlayerError, RenderOutcome, ResolvedFile, Resolver, ResolverError,
+    SilenceDetection, SilenceError,
 };
 
 /// Stable C operation result and error category.
@@ -30,7 +32,7 @@ pub type upse_render_kind = u32;
 pub type upse_metadata_field = u32;
 
 /// Current configuration/header ABI version.
-pub const UPSE_ABI_VERSION: u32 = 1;
+pub const UPSE_ABI_VERSION: u32 = 2;
 /// Operation succeeded.
 pub const UPSE_RESULT_OK: upse_result = 0;
 /// A required pointer, size, enum, or UTF-8 string was invalid.
@@ -128,6 +130,10 @@ pub struct upse_config {
     pub max_files: u64,
     /// Maximum aggregate root/dependency bytes.
     pub max_aggregate_bytes: u64,
+    /// Consecutive quiet milliseconds which end playback; zero disables detection.
+    pub trailing_silence_ms: u64,
+    /// Maximum absolute normalized sample amplitude considered quiet.
+    pub silence_threshold: f32,
 }
 
 impl Default for upse_config {
@@ -146,6 +152,8 @@ impl Default for upse_config {
             max_files: u64::try_from(limits.dependencies.max_files).unwrap_or(u64::MAX),
             max_aggregate_bytes: u64::try_from(limits.dependencies.max_aggregate_bytes)
                 .unwrap_or(u64::MAX),
+            trailing_silence_ms: 0,
+            silence_threshold: SilenceDetection::default().threshold,
         }
     }
 }
@@ -613,9 +621,16 @@ fn configured_builder(config: *const upse_config) -> Result<PlayerBuilder, FfiEr
         },
         maximum_quantum: 65_536,
     };
-    Ok(PlayerBuilder::new()
+    let mut builder = PlayerBuilder::new()
         .limits(limits)
-        .callback_quantum(quantum))
+        .callback_quantum(quantum);
+    if config.trailing_silence_ms != 0 {
+        builder = builder.silence_detection(SilenceDetection::new(
+            config.silence_threshold,
+            Duration::from_millis(config.trailing_silence_ms),
+        ));
+    }
+    Ok(builder)
 }
 
 fn wrap_player(player: Player) -> upse_player {
@@ -750,9 +765,13 @@ impl FfiError {
             PlayerError::Duration(_) => UPSE_RESULT_FORMAT,
             PlayerError::UnsupportedVersion => UPSE_RESULT_UNSUPPORTED,
             PlayerError::InvalidQuantum { .. } => UPSE_RESULT_LIMIT,
-            PlayerError::Psf1Machine(_) | PlayerError::Psf2Machine(_) | PlayerError::PostMix(_) => {
-                UPSE_RESULT_EMULATION
-            }
+            PlayerError::Silence(
+                SilenceError::InvalidThreshold | SilenceError::InvalidDuration,
+            ) => UPSE_RESULT_INVALID_ARGUMENT,
+            PlayerError::Psf1Machine(_)
+            | PlayerError::Psf2Machine(_)
+            | PlayerError::PostMix(_)
+            | PlayerError::Silence(_) => UPSE_RESULT_EMULATION,
             PlayerError::Callback { .. } => UPSE_RESULT_CALLBACK_ERROR,
         };
         Self {
@@ -816,7 +835,7 @@ mod tests {
     use super::{
         UPSE_ABI_VERSION, UPSE_METADATA_TITLE, UPSE_RESULT_INVALID_ARGUMENT, UPSE_RESULT_OK,
         upse_abi_version, upse_audio_format, upse_config, upse_config_init, upse_error,
-        upse_error_free, upse_player, upse_player_audio_format, upse_player_free,
+        upse_error_code, upse_error_free, upse_player, upse_player_audio_format, upse_player_free,
         upse_player_metadata, upse_player_open_memory,
     };
 
@@ -876,6 +895,8 @@ mod tests {
             let mut config = upse_config::default();
             assert_eq!(upse_config_init(&raw mut config), UPSE_RESULT_OK);
             assert_eq!(config.abi_version, UPSE_ABI_VERSION);
+            assert_eq!(config.trailing_silence_ms, 0);
+            assert!(config.silence_threshold > 0.0);
             let origin = CString::new("fixture.psf").unwrap();
             let mut player: *mut upse_player = ptr::null_mut();
             let mut error: *mut upse_error = ptr::null_mut();
@@ -908,6 +929,36 @@ mod tests {
             upse_player_free(player);
             assert!(upse_player_metadata(ptr::null(), UPSE_METADATA_TITLE).is_null());
             upse_player_free(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn invalid_silence_configuration_is_a_c_argument_error() {
+        let bytes = fixture();
+        unsafe {
+            let config = upse_config {
+                trailing_silence_ms: 1,
+                silence_threshold: f32::NAN,
+                ..upse_config::default()
+            };
+            let origin = CString::new("fixture.psf").unwrap();
+            let mut player: *mut upse_player = ptr::null_mut();
+            let mut error: *mut upse_error = ptr::null_mut();
+            assert_eq!(
+                upse_player_open_memory(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    origin.as_ptr(),
+                    &raw const config,
+                    ptr::null(),
+                    &raw mut player,
+                    &raw mut error,
+                ),
+                UPSE_RESULT_INVALID_ARGUMENT
+            );
+            assert!(player.is_null());
+            assert_eq!(upse_error_code(error), UPSE_RESULT_INVALID_ARGUMENT);
+            upse_error_free(error);
         }
     }
 }

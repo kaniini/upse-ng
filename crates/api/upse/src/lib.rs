@@ -35,10 +35,11 @@
 //! # }
 //! ```
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use thiserror::Error;
-use upse_audio::{PostMixError, PostMixer};
+pub use upse_audio::SilenceError;
+use upse_audio::{PostMixError, PostMixer, SilenceDetector};
 pub use upse_audio_types::{AudioAction, AudioBlock, AudioFormat, ChannelOrder, RenderOutcome};
 pub use upse_psf::{
     DependencyLimits, LoadError, ParseLimits, PlaybackMetadata as Metadata, ResolvedFile, Resolver,
@@ -57,6 +58,7 @@ use upse_ps2_machine::{
 
 const DEFAULT_QUANTUM: usize = 1024;
 const MAX_QUANTUM: usize = 65_536;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 type Callback = Box<dyn for<'a> FnMut(AudioBlock<'a>) -> AudioAction + Send>;
 
@@ -77,6 +79,38 @@ impl Default for Limits {
             parse: ParseLimits::default(),
             dependencies: DependencyLimits::default(),
             maximum_quantum: MAX_QUANTUM,
+        }
+    }
+}
+
+/// Optional trailing-silence termination policy.
+///
+/// Detection begins only after an audible frame, so leading silence remains
+/// observable. Quiet frames are compared after tag volume and fade processing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SilenceDetection {
+    /// Maximum absolute normalized amplitude considered quiet.
+    pub threshold: f32,
+    /// Continuous quiet duration required to end playback.
+    pub duration: Duration,
+}
+
+impl SilenceDetection {
+    /// Constructs a trailing-silence policy.
+    #[must_use]
+    pub const fn new(threshold: f32, duration: Duration) -> Self {
+        Self {
+            threshold,
+            duration,
+        }
+    }
+}
+
+impl Default for SilenceDetection {
+    fn default() -> Self {
+        Self {
+            threshold: 1.0 / 32_768.0,
+            duration: Duration::from_secs(5),
         }
     }
 }
@@ -120,6 +154,9 @@ pub enum PlayerError {
     /// Final sample conversion failed.
     #[error("audio post-mix failure: {0}")]
     PostMix(#[from] PostMixError),
+    /// Silence detection configuration or render-ahead buffering failed.
+    #[error("audio silence detection failure: {0}")]
+    Silence(#[from] SilenceError),
     /// Audio callback returned [`AudioAction::Error`].
     #[error("audio callback reported failure after {frames} frames")]
     Callback {
@@ -132,6 +169,7 @@ pub enum PlayerError {
 pub struct PlayerBuilder {
     limits: Limits,
     quantum: usize,
+    silence_detection: Option<SilenceDetection>,
     callback: Callback,
 }
 
@@ -148,6 +186,7 @@ impl PlayerBuilder {
         Self {
             limits: Limits::default(),
             quantum: DEFAULT_QUANTUM,
+            silence_detection: None,
             callback: Box::new(|_| AudioAction::Continue),
         }
     }
@@ -163,6 +202,13 @@ impl PlayerBuilder {
     #[must_use]
     pub const fn callback_quantum(mut self, frames: usize) -> Self {
         self.quantum = frames;
+        self
+    }
+
+    /// Enables render-ahead trailing-silence termination.
+    #[must_use]
+    pub const fn silence_detection(mut self, detection: SilenceDetection) -> Self {
+        self.silence_detection = Some(detection);
         self
     }
 
@@ -231,7 +277,7 @@ impl PlayerBuilder {
             self.limits.parse,
             self.limits.dependencies,
         )?;
-        Player::from_plan(plan, self.quantum, self.callback)
+        Player::from_plan(plan, self.quantum, self.silence_detection, self.callback)
     }
 
     fn validate(&self) -> Result<(), PlayerError> {
@@ -251,6 +297,8 @@ pub struct Player {
     metadata: Metadata,
     format: AudioFormat,
     post_mix: PostMixer,
+    silence_detector: Option<SilenceDetector>,
+    delivered_frames: u64,
     callback: Callback,
     #[cfg(any(feature = "psf1", feature = "psf2"))]
     quantum: usize,
@@ -272,7 +320,12 @@ enum Machine {
 
 impl Player {
     #[cfg(any(feature = "psf1", feature = "psf2"))]
-    fn from_plan(plan: LoadPlan, quantum: usize, callback: Callback) -> Result<Self, PlayerError> {
+    fn from_plan(
+        plan: LoadPlan,
+        quantum: usize,
+        silence_detection: Option<SilenceDetection>,
+        callback: Callback,
+    ) -> Result<Self, PlayerError> {
         match plan {
             #[cfg(feature = "psf1")]
             LoadPlan::Psf1(plan) => {
@@ -287,6 +340,8 @@ impl Player {
                 Ok(Self {
                     machine: Machine::Psf1(Box::new(machine)),
                     post_mix: PostMixer::new(metadata.volume, length, fade),
+                    silence_detector: make_silence_detector(silence_detection, format)?,
+                    delivered_frames: 0,
                     metadata,
                     format,
                     callback,
@@ -308,6 +363,8 @@ impl Player {
                 Ok(Self {
                     machine: Machine::Psf2(Box::new(machine)),
                     post_mix: PostMixer::new(metadata.volume, length, fade),
+                    silence_detector: make_silence_detector(silence_detection, format)?,
+                    delivered_frames: 0,
                     metadata,
                     format,
                     callback,
@@ -325,6 +382,7 @@ impl Player {
     fn from_plan(
         _plan: LoadPlan,
         _quantum: usize,
+        _silence_detection: Option<SilenceDetection>,
         _callback: Callback,
     ) -> Result<Self, PlayerError> {
         Err(PlayerError::UnsupportedVersion)
@@ -345,7 +403,7 @@ impl Player {
     /// Returns frames already delivered since open/reset.
     #[must_use]
     pub const fn frames_rendered(&self) -> u64 {
-        self.post_mix.position()
+        self.delivered_frames
     }
 
     /// Replaces the callback without changing emulation or timeline position.
@@ -367,6 +425,10 @@ impl Player {
             Machine::Disabled => {}
         }
         self.post_mix.reset();
+        if let Some(detector) = &mut self.silence_detector {
+            detector.reset();
+        }
+        self.delivered_frames = 0;
     }
 
     /// Delivers at most `max_frames` synchronously in bounded callback blocks.
@@ -382,6 +444,15 @@ impl Player {
     /// [`AudioAction::Error`].
     #[cfg(any(feature = "psf1", feature = "psf2"))]
     pub fn render(&mut self, max_frames: u64) -> Result<RenderOutcome, PlayerError> {
+        if self.silence_detector.is_some() {
+            self.render_detected(max_frames)
+        } else {
+            self.render_direct(max_frames)
+        }
+    }
+
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
+    fn render_direct(&mut self, max_frames: u64) -> Result<RenderOutcome, PlayerError> {
         let mut delivered = 0_u64;
         while delivered < max_frames {
             if self.post_mix.ended() {
@@ -393,28 +464,12 @@ impl Player {
             if frames == 0 {
                 return Ok(RenderOutcome::End { frames: delivered });
             }
-            let frames_usize =
-                usize::try_from(frames).map_err(|_| PostMixError::PositionOverflow)?;
-            let samples = frames_usize
-                .checked_mul(2)
-                .ok_or(PostMixError::PositionOverflow)?;
-            match &mut self.machine {
-                #[cfg(feature = "psf1")]
-                Machine::Psf1(machine) => {
-                    machine.render(frames_usize, &mut self.integer_buffer[..samples])?;
-                }
-                #[cfg(feature = "psf2")]
-                Machine::Psf2(machine) => {
-                    machine.render(frames_usize, &mut self.integer_buffer[..samples])?;
-                }
-                #[cfg(not(any(feature = "psf1", feature = "psf2")))]
-                Machine::Disabled => return Err(PlayerError::UnsupportedVersion),
-            }
-            self.post_mix.process(
-                &self.integer_buffer[..samples],
-                &mut self.float_buffer[..samples],
-            )?;
+            let (frames_usize, samples) = self.generate(frames)?;
             delivered = delivered
+                .checked_add(frames)
+                .ok_or(PostMixError::PositionOverflow)?;
+            self.delivered_frames = self
+                .delivered_frames
                 .checked_add(frames)
                 .ok_or(PostMixError::PositionOverflow)?;
             let block = AudioBlock::new(&self.float_buffer[..samples], frames_usize)
@@ -432,6 +487,115 @@ impl Player {
         }
     }
 
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
+    fn render_detected(&mut self, max_frames: u64) -> Result<RenderOutcome, PlayerError> {
+        let mut delivered = 0_u64;
+        while delivered < max_frames {
+            if self.post_mix.ended() {
+                self.silence_detector
+                    .as_mut()
+                    .expect("selected detected rendering")
+                    .finish()?;
+            }
+            let ready = self
+                .silence_detector
+                .as_ref()
+                .expect("selected detected rendering")
+                .ready_frames();
+            if ready != 0 {
+                let remaining = usize::try_from(max_frames - delivered).unwrap_or(usize::MAX);
+                let frames = ready.min(remaining).min(self.quantum);
+                let samples = frames
+                    .checked_mul(2)
+                    .ok_or(PostMixError::PositionOverflow)?;
+                let drained = self
+                    .silence_detector
+                    .as_mut()
+                    .expect("selected detected rendering")
+                    .drain(&mut self.float_buffer[..samples])?;
+                debug_assert_eq!(drained, frames);
+                let frames = u64::try_from(frames).map_err(|_| PostMixError::PositionOverflow)?;
+                delivered = delivered
+                    .checked_add(frames)
+                    .ok_or(PostMixError::PositionOverflow)?;
+                self.delivered_frames = self
+                    .delivered_frames
+                    .checked_add(frames)
+                    .ok_or(PostMixError::PositionOverflow)?;
+                let block = AudioBlock::new(&self.float_buffer[..samples], drained)
+                    .map_err(|_| PostMixError::OutputSize)?;
+                match (self.callback)(block) {
+                    AudioAction::Continue => {}
+                    AudioAction::Stop => {
+                        return Ok(RenderOutcome::Stopped { frames: delivered });
+                    }
+                    AudioAction::Error => return Err(PlayerError::Callback { frames: delivered }),
+                }
+                continue;
+            }
+
+            let detector_ended = self
+                .silence_detector
+                .as_ref()
+                .expect("selected detected rendering")
+                .ended();
+            if detector_ended || self.post_mix.ended() {
+                return Ok(RenderOutcome::End { frames: delivered });
+            }
+            let quantum = u64::try_from(self.quantum).unwrap_or(u64::MAX);
+            let frames = self.post_mix.available_frames(quantum);
+            if frames == 0 {
+                continue;
+            }
+            let (_, samples) = self.generate(frames)?;
+            self.silence_detector
+                .as_mut()
+                .expect("selected detected rendering")
+                .push(&self.float_buffer[..samples])?;
+        }
+
+        if self.post_mix.ended() {
+            self.silence_detector
+                .as_mut()
+                .expect("selected detected rendering")
+                .finish()?;
+        }
+        let detector = self
+            .silence_detector
+            .as_ref()
+            .expect("selected detected rendering");
+        if detector.ready_frames() == 0 && (detector.ended() || self.post_mix.ended()) {
+            Ok(RenderOutcome::End { frames: delivered })
+        } else {
+            Ok(RenderOutcome::Complete { frames: delivered })
+        }
+    }
+
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
+    fn generate(&mut self, frames: u64) -> Result<(usize, usize), PlayerError> {
+        let frames = usize::try_from(frames).map_err(|_| PostMixError::PositionOverflow)?;
+        let samples = frames
+            .checked_mul(2)
+            .ok_or(PostMixError::PositionOverflow)?;
+        match &mut self.machine {
+            #[cfg(feature = "psf1")]
+            Machine::Psf1(machine) => {
+                machine.render(frames, &mut self.integer_buffer[..samples])?;
+            }
+            #[cfg(feature = "psf2")]
+            Machine::Psf2(machine) => {
+                machine.render(frames, &mut self.integer_buffer[..samples])?;
+            }
+            #[cfg(not(any(feature = "psf1", feature = "psf2")))]
+            Machine::Disabled => return Err(PlayerError::UnsupportedVersion),
+        }
+        self.post_mix.process(
+            &self.integer_buffer[..samples],
+            &mut self.float_buffer[..samples],
+        )?;
+        Ok((frames, samples))
+    }
+
     /// Rejects rendering when no machine feature is enabled.
     ///
     /// # Errors
@@ -443,31 +607,72 @@ impl Player {
     }
 }
 
+fn make_silence_detector(
+    detection: Option<SilenceDetection>,
+    format: AudioFormat,
+) -> Result<Option<SilenceDetector>, PlayerError> {
+    detection
+        .map(|detection| {
+            let seconds = detection
+                .duration
+                .as_secs()
+                .checked_mul(u64::from(format.sample_rate()))
+                .ok_or(SilenceError::InvalidDuration)?;
+            let fractional = u64::from(detection.duration.subsec_nanos())
+                .checked_mul(u64::from(format.sample_rate()))
+                .ok_or(SilenceError::InvalidDuration)?
+                .div_ceil(NANOS_PER_SECOND);
+            let frames = seconds
+                .checked_add(fractional)
+                .ok_or(SilenceError::InvalidDuration)?;
+            SilenceDetector::new(detection.threshold, frames)
+        })
+        .transpose()
+        .map_err(PlayerError::from)
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
     use std::{
         sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use upse_psf::{MemoryResolver, PsfBuilder, PsfVersion};
 
-    use super::{AudioAction, Limits, PlayerBuilder, PlayerError, RenderOutcome, ResolverError};
+    use super::{
+        AudioAction, Limits, PlayerBuilder, PlayerError, RenderOutcome, ResolverError,
+        SilenceDetection, SilenceError,
+    };
 
     fn instruction_lui(rt: u32, immediate: u16) -> u32 {
         (0x0f << 26) | (rt << 16) | u32::from(immediate)
     }
 
     fn instruction_addiu(rt: u32, immediate: i16) -> u32 {
-        (0x09 << 26) | (rt << 16) | u32::from(u16::from_ne_bytes(immediate.to_ne_bytes()))
+        instruction_addiu_from(rt, 0, immediate)
+    }
+
+    fn instruction_addiu_from(rt: u32, rs: u32, immediate: i16) -> u32 {
+        (0x09 << 26)
+            | (rs << 21)
+            | (rt << 16)
+            | u32::from(u16::from_ne_bytes(immediate.to_ne_bytes()))
+    }
+
+    fn instruction_bne(rs: u32, rt: u32, immediate: i16) -> u32 {
+        (0x05 << 26)
+            | (rs << 21)
+            | (rt << 16)
+            | u32::from(u16::from_ne_bytes(immediate.to_ne_bytes()))
     }
 
     fn instruction_sh(rt: u32, offset: u16) -> u32 {
         (0x29 << 26) | (8 << 21) | (rt << 16) | u32::from(offset)
     }
 
-    fn fixture(tags: &[(&str, &str)]) -> Vec<u8> {
+    fn noise_setup() -> Vec<u32> {
         let mut words = vec![instruction_lui(8, 0x1f80)];
         for (value, offset) in [
             (0x3fff_i16, 0x1c00_u16),
@@ -484,11 +689,34 @@ mod tests {
             words.push(instruction_addiu(9, value));
             words.push(instruction_sh(9, offset));
         }
+        words
+    }
+
+    fn fixture(tags: &[(&str, &str)]) -> Vec<u8> {
+        let mut words = noise_setup();
         let loop_address = 0x8001_0000_u32 + u32::try_from(words.len() * 4).unwrap();
         words.push(0x0800_0000 | ((loop_address >> 2) & 0x03ff_ffff));
         words.push(0);
+        build_fixture(&words, tags)
+    }
+
+    fn ending_fixture() -> Vec<u8> {
+        let mut words = noise_setup();
+        words.push(instruction_addiu(10, 10_000));
+        words.push(instruction_addiu_from(10, 10, -1));
+        words.push(instruction_bne(10, 0, -2));
+        words.push(0);
+        words.push(instruction_addiu(9, 1));
+        words.push(instruction_sh(9, 0x1d8c));
+        let loop_address = 0x8001_0000_u32 + u32::try_from(words.len() * 4).unwrap();
+        words.push(0x0800_0000 | ((loop_address >> 2) & 0x03ff_ffff));
+        words.push(0);
+        build_fixture(&words, &[])
+    }
+
+    fn build_fixture(words: &[u32], tags: &[(&str, &str)]) -> Vec<u8> {
         let mut text = vec![0_u8; words.len() * 4];
-        for (index, word) in words.into_iter().enumerate() {
+        for (index, word) in words.iter().copied().enumerate() {
             text[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
         }
         let mut exe = vec![0_u8; 0x800 + text.len()];
@@ -504,6 +732,65 @@ mod tests {
             builder = builder.tag(*key, *value);
         }
         builder.build()
+    }
+
+    #[test]
+    fn configurable_silence_detection_discards_only_the_confirmed_tail() {
+        let bytes = ending_fixture();
+        let whole_samples = Arc::new(Mutex::new(Vec::new()));
+        let mut whole = collecting_builder(64, Arc::clone(&whole_samples))
+            .silence_detection(SilenceDetection::new(0.0, Duration::from_millis(1)))
+            .open_memory("ending.psf", &bytes)
+            .unwrap();
+        let outcome = whole.render(100_000).unwrap();
+        let RenderOutcome::End { frames } = outcome else {
+            panic!("silence detector did not end playback: {outcome:?}");
+        };
+        let samples = whole_samples.lock().unwrap();
+        assert_eq!(samples.len(), usize::try_from(frames).unwrap() * 2);
+        assert_eq!(whole.frames_rendered(), frames);
+        assert!(samples.iter().any(|sample| *sample != 0.0));
+        assert!(
+            samples[samples.len() - 2..]
+                .iter()
+                .any(|sample| *sample != 0.0)
+        );
+        let expected = samples.clone();
+        drop(samples);
+
+        let chunked_samples = Arc::new(Mutex::new(Vec::new()));
+        let mut chunked = collecting_builder(64, Arc::clone(&chunked_samples))
+            .silence_detection(SilenceDetection::new(0.0, Duration::from_millis(1)))
+            .open_memory("ending.psf", &bytes)
+            .unwrap();
+        loop {
+            if matches!(chunked.render(17).unwrap(), RenderOutcome::End { .. }) {
+                break;
+            }
+        }
+        assert_eq!(*chunked_samples.lock().unwrap(), expected);
+        assert_eq!(chunked.frames_rendered(), frames);
+
+        whole.reset();
+        assert_eq!(whole.frames_rendered(), 0);
+    }
+
+    #[test]
+    fn invalid_silence_detection_is_rejected_during_open() {
+        let bytes = fixture(&[]);
+        for detection in [
+            SilenceDetection::new(f32::NAN, Duration::from_secs(1)),
+            SilenceDetection::new(0.0, Duration::ZERO),
+        ] {
+            assert!(matches!(
+                PlayerBuilder::new()
+                    .silence_detection(detection)
+                    .open_memory("invalid.psf", &bytes),
+                Err(PlayerError::Silence(
+                    SilenceError::InvalidThreshold | SilenceError::InvalidDuration
+                ))
+            ));
+        }
     }
 
     fn collecting_builder(quantum: usize, samples: Arc<Mutex<Vec<f32>>>) -> PlayerBuilder {
