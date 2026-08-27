@@ -140,6 +140,19 @@ pub enum LoadDelayMode {
     Interlocked,
 }
 
+/// Handling of misaligned word data accesses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WordAlignmentMode {
+    /// Raise an address exception as required by the R3000A architecture.
+    #[default]
+    Architectural,
+    /// Round word accesses down to their natural alignment.
+    ///
+    /// This reproduces the permissive memory helpers used by historical PSF
+    /// players while leaving the standalone CPU hardware-accurate by default.
+    AlignDown,
+}
+
 /// Handling of a control-transfer instruction in another branch's delay slot.
 ///
 /// MIPS-I leaves this sequence architecturally undefined. Machine profiles can
@@ -287,6 +300,7 @@ pub struct Cpu {
     cop0: Cop0,
     profile: ResetProfile,
     load_delay_mode: LoadDelayMode,
+    word_alignment_mode: WordAlignmentMode,
     delay_slot_branch_mode: DelaySlotBranchMode,
 }
 
@@ -315,15 +329,23 @@ impl Cpu {
             },
             profile,
             load_delay_mode,
+            word_alignment_mode: WordAlignmentMode::Architectural,
             delay_slot_branch_mode: DelaySlotBranchMode::Preserve,
         }
     }
 
     /// Restores architectural reset state.
     pub fn reset(&mut self) {
+        let word_alignment_mode = self.word_alignment_mode;
         let delay_slot_branch_mode = self.delay_slot_branch_mode;
         *self = Self::with_load_delay_mode(self.profile, self.load_delay_mode);
+        self.word_alignment_mode = word_alignment_mode;
         self.delay_slot_branch_mode = delay_slot_branch_mode;
+    }
+
+    /// Selects handling for misaligned word data accesses.
+    pub fn set_word_alignment_mode(&mut self, mode: WordAlignmentMode) {
+        self.word_alignment_mode = mode;
     }
 
     /// Selects handling for a branch encountered in another branch's delay slot.
@@ -661,10 +683,11 @@ impl Cpu {
             }
             0x23 => {
                 let address = left.wrapping_add_signed(i32::from(signed_immediate));
-                if address & 3 != 0 {
+                if address & 3 != 0 && self.word_alignment_mode == WordAlignmentMode::Architectural
+                {
                     result.address_exception(Exception::AddressLoad, address);
                 } else {
-                    result.load(rt, Self::load_u32(bus, pc, address)?);
+                    result.load(rt, Self::load_u32(bus, pc, address & !3)?);
                 }
             }
             0x24 => {
@@ -720,10 +743,11 @@ impl Cpu {
             }
             0x2b => {
                 let address = left.wrapping_add_signed(i32::from(signed_immediate));
-                if address & 3 != 0 {
+                if address & 3 != 0 && self.word_alignment_mode == WordAlignmentMode::Architectural
+                {
                     result.address_exception(Exception::AddressStore, address);
                 } else {
-                    Self::store_u32(bus, pc, address, right)?;
+                    Self::store_u32(bus, pc, address & !3, right)?;
                     result.cycles = 2;
                 }
             }
@@ -1025,7 +1049,7 @@ impl Cpu {
 mod tests {
     use super::{
         Bus, BusFault, CAUSE_BD, CAUSE_IP2, Cpu, DelaySlotBranchMode, Exception, LoadDelayMode,
-        ResetProfile, StepEvent,
+        ResetProfile, StepEvent, WordAlignmentMode,
     };
 
     struct TestBus {
@@ -1375,6 +1399,26 @@ mod tests {
         assert_eq!(cpu.register(7), Some(0xffff_8001));
         assert_eq!(cpu.register(8), Some(0x8001));
         assert_eq!(cpu.register(9), Some(0x89ab_cdef));
+    }
+
+    #[test]
+    fn permissive_word_alignment_rounds_loads_and_stores_down() {
+        let words = [i(0x23, 1, 2, 2), 0, i(0x2b, 1, 3, 14)];
+        let mut bus = TestBus::new(&words);
+        bus.write_u32(0x100, 0x89ab_cdef).unwrap();
+        let mut cpu = Cpu::new(profile());
+        cpu.set_word_alignment_mode(WordAlignmentMode::AlignDown);
+        cpu.set_register(1, 0x100);
+        cpu.set_register(3, 0x5566_7788);
+        for _ in words {
+            assert_eq!(cpu.step(&mut bus).unwrap().event, StepEvent::Instruction);
+        }
+        assert_eq!(cpu.register(2), Some(0x89ab_cdef));
+        assert_eq!(bus.read_u32(0x10c).unwrap(), 0x5566_7788);
+
+        cpu.reset();
+        cpu.set_register(1, 0x100);
+        assert_eq!(cpu.step(&mut bus).unwrap().event, StepEvent::Instruction);
     }
 
     #[test]
