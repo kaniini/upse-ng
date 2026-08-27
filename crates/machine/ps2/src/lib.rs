@@ -45,7 +45,7 @@ use services::{MachineServices, TimerManager};
 const IOP_CLOCK_HZ: u64 = 36_864_000;
 const AUDIO_CHUNK_FRAMES: usize = 256;
 const IDLE_ADVANCE_CYCLES: u64 = 768;
-const ROOT_STACK_SIZE: u32 = 64 * 1024;
+const MODULE_START_STACK_SIZE: u32 = 16 * 1024;
 const ARGUMENT_BLOCK_SIZE: u32 = 256;
 const MODULE_START_PRIORITY: u32 = 8;
 const RA: usize = 31;
@@ -270,9 +270,9 @@ impl Ps2Machine {
             let mut guest = IopRam(hardware.memory_mut());
             bios.modules_mut().begin_start(root_id, &mut guest)?
         };
-        let stack = bios
-            .memory_mut()
-            .allocate(AllocationMode::First, ROOT_STACK_SIZE, 0)?;
+        let stack =
+            bios.memory_mut()
+                .allocate(AllocationMode::First, MODULE_START_STACK_SIZE, 0)?;
         let arguments =
             bios.memory_mut()
                 .allocate(AllocationMode::First, ARGUMENT_BLOCK_SIZE, 0)?;

@@ -23,8 +23,8 @@ use upse_ps2_spu2::{
 };
 
 use crate::{
-    BiosMemoryAdapter, MODULE_START_PRIORITY, ModuleFrame, bind_module_imports,
-    bios_context_from_service, service_context_from_bios,
+    BiosMemoryAdapter, MODULE_START_PRIORITY, MODULE_START_STACK_SIZE, ModuleFrame,
+    bind_module_imports, bios_context_from_service, service_context_from_bios,
 };
 
 const V0: usize = 2;
@@ -720,7 +720,7 @@ impl MachineServices<'_> {
         let stack = self
             .bios
             .memory_mut()
-            .allocate(AllocationMode::First, DEFAULT_THREAD_STACK, 0)
+            .allocate(AllocationMode::First, MODULE_START_STACK_SIZE, 0)
             .map_err(backend)?;
         let thread = match self.bios.kernel_mut().create_thread(
             ThreadSpec {
