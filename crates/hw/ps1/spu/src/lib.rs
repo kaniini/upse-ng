@@ -139,7 +139,6 @@ struct Voice {
     pitch_counter: PitchCounter,
     decoded: [i16; 28],
     decoded_flags: AdpcmFlags,
-    previous_sample: i16,
     prepared: Option<PreparedBlock>,
     sample_index: usize,
     decoded_valid: bool,
@@ -167,7 +166,6 @@ impl Default for Voice {
                 repeat: false,
                 loop_start: false,
             },
-            previous_sample: 0,
             prepared: None,
             sample_index: 0,
             decoded_valid: false,
@@ -190,7 +188,6 @@ impl Voice {
         self.envelope.key_on();
         self.history = AdpcmHistory::default();
         self.pitch_counter.reset();
-        self.previous_sample = 0;
         self.prepared = None;
         self.sample_index = 0;
         self.decoded_valid = false;
@@ -218,9 +215,9 @@ impl Voice {
             if !self.decoded_valid {
                 fetched = Some(self.decode_current(ram)?);
             }
-            // The four-tap interpolation window reaches two samples beyond
+            // The four-tap interpolation window reaches three samples beyond
             // the current position, including into the following block.
-            if self.sample_index + 2 >= self.decoded.len()
+            if self.sample_index + 3 >= self.decoded.len()
                 && let Some(address) = self.prepare_next(ram)?
             {
                 fetched = Some(address);
@@ -267,12 +264,8 @@ impl Voice {
     }
 
     fn interpolation_window(&self) -> [i16; 4] {
-        let sample = |relative: isize| {
-            let index = isize::try_from(self.sample_index).unwrap_or(0) + relative;
-            if index < 0 {
-                return self.previous_sample;
-            }
-            let index = usize::try_from(index).unwrap_or(0);
+        let sample = |relative: usize| {
+            let index = self.sample_index + relative;
             if let Some(sample) = self.decoded.get(index) {
                 return *sample;
             }
@@ -282,7 +275,7 @@ impl Voice {
                 .copied()
                 .unwrap_or(self.decoded[self.decoded.len() - 1])
         };
-        [sample(-1), sample(0), sample(1), sample(2)]
+        [sample(0), sample(1), sample(2), sample(3)]
     }
 
     fn decode_current(&mut self, ram: &[u8]) -> Result<usize, (usize, AdpcmError)> {
@@ -334,7 +327,6 @@ impl Voice {
 
     fn finish_block(&mut self) -> bool {
         let flags = self.decoded_flags;
-        self.previous_sample = self.decoded[self.decoded.len() - 1];
         self.decoded_valid = false;
         self.sample_index = 0;
         let next_address = if flags.end {
@@ -903,8 +895,8 @@ mod tests {
         assert_eq!(
             output,
             [
-                1_491, 1_491, 3_582, 3_582, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093,
-                4_093, 4_093, 4_093, 4_093
+                1_781, 1_781, 3_565, 3_565, 4_074, 4_074, 4_074, 4_074, 4_074, 4_074, 4_074, 4_074,
+                4_074, 4_074, 4_074, 4_074
             ]
         );
     }
@@ -919,12 +911,15 @@ mod tests {
         voice.sample_index = 27;
 
         assert_eq!(voice.prepare_next(&ram).unwrap(), Some(16));
-        assert_eq!(voice.interpolation_window(), [4_096, 4_096, 28_672, 28_672]);
+        assert_eq!(
+            voice.interpolation_window(),
+            [4_096, 28_672, 28_672, 28_672]
+        );
 
         assert!(!voice.finish_block());
         assert_eq!(
             voice.interpolation_window(),
-            [4_096, 28_672, 28_672, 28_672]
+            [28_672, 28_672, 28_672, 28_672]
         );
     }
 

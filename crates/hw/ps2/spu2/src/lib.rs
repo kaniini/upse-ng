@@ -221,7 +221,6 @@ struct Voice {
     decoded_valid: bool,
     prepared: Option<PreparedBlock>,
     sample_index: usize,
-    previous_sample: i16,
     history: AdpcmHistory,
     envelope: Envelope,
     pitch_counter: PitchCounter,
@@ -246,7 +245,6 @@ impl Default for Voice {
             decoded_valid: false,
             prepared: None,
             sample_index: 0,
-            previous_sample: 0,
             history: AdpcmHistory::default(),
             envelope: Envelope::new(),
             pitch_counter: PitchCounter::new(),
@@ -270,7 +268,6 @@ impl Voice {
         self.decoded_valid = false;
         self.prepared = None;
         self.sample_index = 0;
-        self.previous_sample = 0;
         self.history = AdpcmHistory::default();
         self.envelope.key_on();
         self.pitch_counter.reset();
@@ -298,7 +295,7 @@ impl Voice {
             if !self.decoded_valid {
                 fetched = Some(self.decode_current(ram)?);
             }
-            if self.sample_index + 2 >= self.decoded.len()
+            if self.sample_index + 3 >= self.decoded.len()
                 && let Some(address) = self.prepare_next(ram)?
             {
                 fetched = Some(address);
@@ -344,12 +341,8 @@ impl Voice {
     }
 
     fn interpolation_window(&self) -> [i16; 4] {
-        let sample = |relative: isize| {
-            let index = isize::try_from(self.sample_index).unwrap_or(0) + relative;
-            if index < 0 {
-                return self.previous_sample;
-            }
-            let index = usize::try_from(index).unwrap_or(0);
+        let sample = |relative: usize| {
+            let index = self.sample_index + relative;
             if let Some(sample) = self.decoded.get(index) {
                 return *sample;
             }
@@ -359,7 +352,7 @@ impl Voice {
                 .copied()
                 .unwrap_or(self.decoded[self.decoded.len() - 1])
         };
-        [sample(-1), sample(0), sample(1), sample(2)]
+        [sample(0), sample(1), sample(2), sample(3)]
     }
 
     fn decode_current(&mut self, ram: &[u8]) -> Result<usize, (usize, AdpcmError)> {
@@ -410,7 +403,6 @@ impl Voice {
 
     fn finish_block(&mut self) -> bool {
         let flags = self.decoded_flags;
-        self.previous_sample = self.decoded[self.decoded.len() - 1];
         self.decoded_valid = false;
         self.sample_index = 0;
         let next_address = if flags.end {
@@ -1351,17 +1343,17 @@ mod tests {
         }
         assert_eq!(
             core0,
-            [1_491, 3_582, 4_093, 4_093, 4_093, 4_093, 4_093, 4_093]
+            [1_781, 3_565, 4_074, 4_074, 4_074, 4_074, 4_074, 4_074]
         );
         assert_eq!(
             core1,
-            [1_489, 3_580, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091]
+            [1_779, 3_563, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072]
         );
         assert_eq!(
             output,
             [
-                1_489, 1_489, 3_580, 3_580, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091,
-                4_091, 4_091, 4_091, 4_091,
+                1_779, 1_779, 3_563, 3_563, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072,
+                4_072, 4_072, 4_072, 4_072,
             ]
         );
     }
@@ -1378,8 +1370,8 @@ mod tests {
         assert_eq!(
             output,
             [
-                1_489, 1_489, 3_580, 3_580, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091, 4_091,
-                4_091, 4_091, 4_091, 4_091,
+                1_779, 1_779, 3_563, 3_563, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072, 4_072,
+                4_072, 4_072, 4_072, 4_072,
             ]
         );
     }
@@ -1621,8 +1613,8 @@ mod tests {
         assert_eq!(
             &wet_output[..16],
             &[
-                2_977, 2_978, 7_159, 7_160, 8_181, 8_182, 8_181, 8_182, 8_181, 8_182, 8_181, 8_182,
-                8_181, 8_182, 8_181, 8_182
+                3_557, 3_558, 7_125, 7_126, 8_143, 8_144, 8_143, 8_144, 8_143, 8_144, 8_143, 8_144,
+                8_143, 8_144, 8_143, 8_144
             ]
         );
         assert!(wet.ram()[0x1f_0000..].iter().any(|&byte| byte != 0));

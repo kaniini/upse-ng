@@ -98,9 +98,9 @@ pub fn decode_block(
             i32::from(nibble) - 16
         };
         let source = (signed << 12) >> shift;
-        let predicted = (i32::from(history.previous) * positive) >> 6;
-        let predicted2 = (i32::from(history.previous2) * negative) >> 6;
-        let sample = clamp_i16(source.saturating_add(predicted).saturating_add(predicted2));
+        let predicted =
+            i32::from(history.previous) * positive + i32::from(history.previous2) * negative;
+        let sample = clamp_i16(source.saturating_add((predicted + 32) >> 6));
         history.previous2 = history.previous;
         history.previous = sample;
         *output = sample;
@@ -146,9 +146,8 @@ mod tests {
         first[2] = 7;
         let mut history = AdpcmHistory::default();
         let decoded = decode_block(&first, &mut history).unwrap();
-        assert_eq!(&decoded.samples[..8], &[7, 6, 5, 4, 3, 2, 1, 0]);
-        assert!(decoded.samples[8..].iter().all(|&sample| sample == 0));
-        assert_eq!(history, AdpcmHistory::default());
+        assert!(decoded.samples.iter().all(|&sample| sample == 7));
+        assert_eq!(history, AdpcmHistory::new(7, 7));
 
         let block = [
             0x40, 0, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
