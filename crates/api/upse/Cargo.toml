@@ -22,3 +22,7 @@ upse-ps2-machine = { path = "../../machine/ps2", optional = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "render"
+harness = false
