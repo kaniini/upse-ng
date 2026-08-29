@@ -238,6 +238,23 @@ impl PostMixer {
         self.position = 0;
     }
 
+    /// Advances the timeline without converting samples.
+    ///
+    /// The returned count is limited to the declared length-plus-fade boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostMixError::PositionOverflow`] if the new position cannot be
+    /// represented.
+    pub fn advance(&mut self, requested: u64) -> Result<u64, PostMixError> {
+        let frames = self.available_frames(requested);
+        self.position = self
+            .position
+            .checked_add(frames)
+            .ok_or(PostMixError::PositionOverflow)?;
+        Ok(frames)
+    }
+
     /// Converts interleaved signed 16-bit samples to floating point in place.
     ///
     /// Volume is deliberately not clipped; negative and over-unity tag values
@@ -373,6 +390,17 @@ mod tests {
         assert_eq!(output, [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.5, -0.5]);
         assert!(mixer.ended());
         assert_eq!(mixer.end_frame(), Some(4));
+    }
+
+    #[test]
+    fn timeline_advance_stops_at_the_end_without_converting_samples() {
+        let mut mixer = PostMixer::new(2.0, Some(3), 2);
+        assert_eq!(mixer.advance(4), Ok(4));
+        assert_eq!(mixer.position(), 4);
+        assert_eq!(mixer.advance(10), Ok(1));
+        assert_eq!(mixer.position(), 5);
+        assert!(mixer.ended());
+        assert_eq!(mixer.advance(1), Ok(0));
     }
 
     #[test]

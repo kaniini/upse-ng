@@ -7,6 +7,7 @@
     upse_player_open_path;
     upse_player_set_callback;
     upse_player_render;
+    upse_player_advance;
     upse_player_reset;
     upse_player_audio_format;
     upse_player_metadata;

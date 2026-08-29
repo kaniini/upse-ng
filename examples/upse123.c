@@ -287,14 +287,6 @@ static int16_t float_to_pcm16(float sample) {
   return (int16_t)(sample * 32768.0f - 0.5f);
 }
 
-static upse_audio_action discard_audio(void *userdata, const float *samples,
-                                       size_t frames) {
-  (void)userdata;
-  (void)samples;
-  (void)frames;
-  return UPSE_CALLBACK_CONTINUE;
-}
-
 static upse_audio_action play_audio(void *userdata, const float *samples,
                                     size_t frames) {
   struct audio_sink *sink = userdata;
@@ -335,11 +327,6 @@ static int fast_forward(upse_player *player, uint64_t target) {
   upse_result result;
   uint64_t remaining = target;
 
-  result = upse_player_set_callback(player, discard_audio, NULL, &error);
-  if (result != UPSE_RESULT_OK) {
-    report_upse_error("install discard callback", result, &error);
-    return 0;
-  }
   result = upse_player_reset(player, &error);
   if (result != UPSE_RESULT_OK) {
     report_upse_error("reset before seek", result, &error);
@@ -349,7 +336,7 @@ static int fast_forward(upse_player *player, uint64_t target) {
     uint64_t request = remaining < RENDER_QUANTUM ? remaining : RENDER_QUANTUM;
     upse_render_outcome outcome = {sizeof(outcome), 0, 0};
 
-    result = upse_player_render(player, request, &outcome, &error);
+    result = upse_player_advance(player, request, &outcome, &error);
     if (result != UPSE_RESULT_OK) {
       report_upse_error("fast-forward render", result, &error);
       return 0;

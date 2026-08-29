@@ -458,6 +458,39 @@ pub unsafe extern "C" fn upse_player_render(
     })
 }
 
+/// Advances at most `max_frames` without invoking the audio callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn upse_player_advance(
+    player: *mut upse_player,
+    max_frames: u64,
+    outcome: *mut upse_render_outcome,
+    error: *mut *mut upse_error,
+) -> upse_result {
+    boundary(error, || {
+        let player = player_mut(player)?;
+        if outcome.is_null() {
+            return Err(FfiError::invalid("render outcome is null"));
+        }
+        let size = unsafe { (*outcome).size };
+        require_size::<upse_render_outcome>(size, "upse_render_outcome")
+            .map_err(FfiError::invalid)?;
+        let rendered = player
+            .player
+            .advance(max_frames)
+            .map_err(|error| FfiError::player(&error))?;
+        let (kind, frames) = match rendered {
+            RenderOutcome::Complete { frames } => (UPSE_RENDER_COMPLETE, frames),
+            RenderOutcome::End { frames } => (UPSE_RENDER_END, frames),
+            RenderOutcome::Stopped { frames } => (UPSE_RENDER_STOPPED, frames),
+        };
+        unsafe {
+            (*outcome).kind = kind;
+            (*outcome).frames = frames;
+        }
+        Ok(())
+    })
+}
+
 /// Restores the opened module to frame zero.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn upse_player_reset(
@@ -537,7 +570,7 @@ pub unsafe extern "C" fn upse_player_fade_frames(
     optional_duration_frames(player, output, false)
 }
 
-/// Returns frames delivered since open/reset, or zero for a null player.
+/// Returns timeline frames rendered or advanced since open/reset.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn upse_player_frames_rendered(player: *const upse_player) -> u64 {
     catch_unwind(AssertUnwindSafe(|| {

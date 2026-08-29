@@ -425,18 +425,10 @@ private:
     {
         at_end = false;
         upse_error * error = nullptr;
-        upse_result result =
-            upse_player_set_callback(player, nullptr, nullptr, &error);
-        if (result != UPSE_RESULT_OK)
-        {
-            report_error("install seek callback", result, error);
-            return false;
-        }
-        result = upse_player_reset(player, &error);
+        upse_result result = upse_player_reset(player, &error);
         if (result != UPSE_RESULT_OK)
         {
             report_error("reset before seek", result, error);
-            (void)bind_audio_callback(player);
             return false;
         }
 
@@ -449,17 +441,15 @@ private:
                 remaining < SeekQuantum ? remaining : SeekQuantum;
             upse_render_outcome outcome = {sizeof(outcome), 0, 0};
             error = nullptr;
-            result = upse_player_render(player, request, &outcome, &error);
+            result = upse_player_advance(player, request, &outcome, &error);
             if (result != UPSE_RESULT_OK)
             {
                 report_error("seek", result, error);
-                (void)bind_audio_callback(player);
                 return false;
             }
             if (outcome.frames == 0 || outcome.frames > remaining)
             {
                 AUDERR("upse-ng: invalid progress while seeking\n");
-                (void)bind_audio_callback(player);
                 return false;
             }
             remaining -= outcome.frames;
@@ -469,7 +459,7 @@ private:
                 break;
             }
         }
-        return bind_audio_callback(player);
+        return true;
     }
 };
 

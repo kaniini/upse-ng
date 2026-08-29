@@ -21,6 +21,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 struct Config {
     cargo_bench: bool,
+    advance: bool,
     seconds: u64,
     warmup_seconds: u64,
     runs: usize,
@@ -50,6 +51,7 @@ fn parse_count(name: &str, value: Option<String>, allow_zero: bool) -> Result<u6
 fn parse_args() -> Result<Option<Config>, String> {
     let mut config = Config {
         cargo_bench: false,
+        advance: false,
         seconds: DEFAULT_SECONDS,
         warmup_seconds: DEFAULT_WARMUP_SECONDS,
         runs: DEFAULT_RUNS,
@@ -73,6 +75,7 @@ fn parse_args() -> Result<Option<Config>, String> {
                 return Ok(None);
             }
             "--" => positional = true,
+            "--advance" => config.advance = true,
             "--seconds" => config.seconds = parse_count("--seconds", args.next(), false)?,
             "--warmup-seconds" => {
                 config.warmup_seconds = parse_count("--warmup-seconds", args.next(), true)?;
@@ -103,7 +106,8 @@ fn usage() {
            --seconds COUNT         measured emulated seconds (default: 10)\n\
            --warmup-seconds COUNT  unmeasured emulated seconds (default: 1)\n\
            --runs COUNT            independent runs per module (default: 3)\n\
-           --quantum COUNT         callback frames per block (default: 1024)"
+           --quantum COUNT         callback frames per block (default: 1024)\n\
+           --advance               measure callback-free advancement"
     );
 }
 
@@ -118,7 +122,11 @@ fn benchmark(path: &Path, config: &Config) -> Result<Measurement, Box<dyn Error>
         .warmup_seconds
         .checked_mul(sample_rate)
         .ok_or("warmup frame count overflow")?;
-    let warmup = player.render(warmup_frames)?;
+    let warmup = if config.advance {
+        player.advance(warmup_frames)?
+    } else {
+        player.render(warmup_frames)?
+    };
     if warmup.frames() != warmup_frames {
         return Err(format!(
             "module ended after {} of {warmup_frames} warmup frames",
@@ -144,11 +152,21 @@ fn benchmark(path: &Path, config: &Config) -> Result<Measurement, Box<dyn Error>
         .checked_mul(sample_rate)
         .ok_or("measured frame count overflow")?;
     let render_start = Instant::now();
-    let outcome = player.render(requested)?;
+    let outcome = if config.advance {
+        player.advance(requested)?
+    } else {
+        player.render(requested)?
+    };
     let render = render_start.elapsed();
     let frames = outcome.frames();
     if frames == 0 {
         return Err("module ended before the measured interval".into());
+    }
+    if config.advance {
+        let verification = player.render(1024)?;
+        if verification.frames() != 1024 {
+            return Err("module ended before the verification window".into());
+        }
     }
     Ok(Measurement {
         open,
@@ -170,7 +188,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     for path in &config.paths {
-        println!("{}", path.display());
+        println!(
+            "{} ({})",
+            path.display(),
+            if config.advance { "advance" } else { "render" }
+        );
         let mut samples = Vec::with_capacity(config.runs);
         let mut expected_checksum = None;
         for run in 1..=config.runs {

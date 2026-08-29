@@ -400,7 +400,7 @@ impl Player {
         self.format
     }
 
-    /// Returns frames already delivered since open/reset.
+    /// Returns timeline frames rendered or advanced since open/reset.
     #[must_use]
     pub const fn frames_rendered(&self) -> u64 {
         self.delivered_frames
@@ -448,6 +448,46 @@ impl Player {
             self.render_detected(max_frames)
         } else {
             self.render_direct(max_frames)
+        }
+    }
+
+    /// Advances emulation without converting or delivering audio.
+    ///
+    /// All machine and sound state is retained exactly. Trailing-silence
+    /// detection restarts at the new position because discarded samples are
+    /// intentionally not passed through the post-mix detector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError`] for emulation, timeline, or clock failure.
+    #[cfg(any(feature = "psf1", feature = "psf2"))]
+    pub fn advance(&mut self, max_frames: u64) -> Result<RenderOutcome, PlayerError> {
+        if let Some(detector) = &mut self.silence_detector {
+            detector.reset();
+        }
+        let frames = self.post_mix.available_frames(max_frames);
+        let mut remaining = frames;
+        while remaining != 0 {
+            let maximum = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
+            let chunk = usize::try_from(remaining.min(maximum))
+                .map_err(|_| PostMixError::PositionOverflow)?;
+            match &mut self.machine {
+                #[cfg(feature = "psf1")]
+                Machine::Psf1(machine) => machine.advance(chunk)?,
+                #[cfg(feature = "psf2")]
+                Machine::Psf2(machine) => machine.advance(chunk)?,
+                #[cfg(not(any(feature = "psf1", feature = "psf2")))]
+                Machine::Disabled => return Err(PlayerError::UnsupportedVersion),
+            }
+            remaining -= u64::try_from(chunk).map_err(|_| PostMixError::PositionOverflow)?;
+        }
+        let advanced = self.post_mix.advance(frames)?;
+        debug_assert_eq!(advanced, frames);
+        self.delivered_frames = self.post_mix.position();
+        if self.post_mix.ended() {
+            Ok(RenderOutcome::End { frames })
+        } else {
+            Ok(RenderOutcome::Complete { frames })
         }
     }
 
@@ -603,6 +643,16 @@ impl Player {
     /// Always returns [`PlayerError::UnsupportedVersion`].
     #[cfg(not(any(feature = "psf1", feature = "psf2")))]
     pub fn render(&mut self, _max_frames: u64) -> Result<RenderOutcome, PlayerError> {
+        Err(PlayerError::UnsupportedVersion)
+    }
+
+    /// Rejects advancement when no machine feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`PlayerError::UnsupportedVersion`].
+    #[cfg(not(any(feature = "psf1", feature = "psf2")))]
+    pub fn advance(&mut self, _max_frames: u64) -> Result<RenderOutcome, PlayerError> {
         Err(PlayerError::UnsupportedVersion)
     }
 }
@@ -835,6 +885,45 @@ mod tests {
         assert_eq!(
             *first_samples.lock().unwrap(),
             *second_samples.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn advance_bypasses_callbacks_and_preserves_following_samples() {
+        const TARGET: u64 = 97;
+        const WINDOW: u64 = 131;
+
+        let bytes = fixture(&[]);
+        let reference_samples = Arc::new(Mutex::new(Vec::new()));
+        let mut reference = collecting_builder(31, Arc::clone(&reference_samples))
+            .open_memory("reference.psf", &bytes)
+            .unwrap();
+        assert_eq!(
+            reference.render(TARGET + WINDOW).unwrap(),
+            RenderOutcome::Complete {
+                frames: TARGET + WINDOW
+            }
+        );
+
+        let advanced_samples = Arc::new(Mutex::new(Vec::new()));
+        let mut advanced = collecting_builder(31, Arc::clone(&advanced_samples))
+            .open_memory("advanced.psf", &bytes)
+            .unwrap();
+        assert_eq!(
+            advanced.advance(TARGET).unwrap(),
+            RenderOutcome::Complete { frames: TARGET }
+        );
+        assert!(advanced_samples.lock().unwrap().is_empty());
+        assert_eq!(advanced.frames_rendered(), TARGET);
+        assert_eq!(
+            advanced.render(WINDOW).unwrap(),
+            RenderOutcome::Complete { frames: WINDOW }
+        );
+
+        let reference = reference_samples.lock().unwrap();
+        assert_eq!(
+            &advanced_samples.lock().unwrap()[..],
+            &reference[usize::try_from(TARGET * 2).unwrap()..]
         );
     }
 

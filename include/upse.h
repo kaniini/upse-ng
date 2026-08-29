@@ -381,6 +381,15 @@ upse_result upse_player_render(struct upse_player *player,
                                struct upse_error **error);
 
 /**
+ * Advances at most `max_frames` without invoking the audio callback.
+ */
+UPSE_API
+upse_result upse_player_advance(struct upse_player *player,
+                                uint64_t max_frames,
+                                struct upse_render_outcome *outcome,
+                                struct upse_error **error);
+
+/**
  * Restores the opened module to frame zero.
  */
 UPSE_API upse_result upse_player_reset(struct upse_player *player, struct upse_error **error);
@@ -416,7 +425,7 @@ UPSE_API int32_t upse_player_length_frames(const struct upse_player *player, uin
 UPSE_API int32_t upse_player_fade_frames(const struct upse_player *player, uint64_t *output);
 
 /**
- * Returns frames delivered since open/reset, or zero for a null player.
+ * Returns timeline frames rendered or advanced since open/reset.
  */
 UPSE_API uint64_t upse_player_frames_rendered(const struct upse_player *player);
 

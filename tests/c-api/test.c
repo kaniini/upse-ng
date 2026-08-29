@@ -92,14 +92,6 @@ static upse_audio_action collect_audio(void *userdata, const float *samples,
   return collector->action;
 }
 
-static upse_audio_action discard_audio(void *userdata, const float *samples,
-                                       size_t frames) {
-  (void)userdata;
-  (void)samples;
-  (void)frames;
-  return UPSE_CALLBACK_CONTINUE;
-}
-
 static void release_blob(void *userdata, const uint8_t *data, size_t size) {
   struct resolver_context *context = userdata;
   (void)data;
@@ -220,6 +212,17 @@ static int test_success_and_callbacks(const struct bytes *module,
     upse_player_free(player);
     return 0;
   }
+  collector.calls = 0;
+  outcome.size = sizeof(outcome);
+  result = upse_player_advance(player, 16, &outcome, &error);
+  if (!check(result == UPSE_RESULT_OK && outcome.frames == 16 &&
+                 outcome.kind == UPSE_RENDER_COMPLETE && collector.calls == 0 &&
+                 upse_player_frames_rendered(player) == 16,
+             "advance bypasses callback")) {
+    upse_error_free(error);
+    upse_player_free(player);
+    return 0;
+  }
   upse_player_free(player);
 
   player = open_memory(module, 17);
@@ -319,16 +322,14 @@ static int discard_frames(upse_player *player, uint64_t frames,
                           uint64_t partition) {
   upse_error *error = NULL;
 
-  if (upse_player_set_callback(player, discard_audio, NULL, &error) !=
-          UPSE_RESULT_OK ||
-      upse_player_reset(player, &error) != UPSE_RESULT_OK) {
+  if (upse_player_reset(player, &error) != UPSE_RESULT_OK) {
     upse_error_free(error);
     return 0;
   }
   while (frames != 0) {
     uint64_t request = frames < partition ? frames : partition;
     upse_render_outcome outcome = {sizeof(outcome), 0, 0};
-    if (upse_player_render(player, request, &outcome, &error) !=
+    if (upse_player_advance(player, request, &outcome, &error) !=
             UPSE_RESULT_OK ||
         outcome.frames != request || outcome.kind != UPSE_RENDER_COMPLETE) {
       upse_error_free(error);

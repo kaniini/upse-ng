@@ -203,6 +203,7 @@ struct MachineState {
     sample_clock: RateConverter,
     pending_audio: VecDeque<i16>,
     audio_buffer: [i16; AUDIO_CHUNK_FRAMES * 2],
+    discard_audio_frames: u64,
     module_frames: Vec<ModuleFrame>,
     thread_stacks: BTreeMap<u32, u32>,
     callbacks: VecDeque<upse_ps2_bios::CallbackRequest>,
@@ -316,6 +317,7 @@ impl Ps2Machine {
             sample_clock: RateConverter::new(IOP_CLOCK_HZ, u64::from(SAMPLE_RATE))?,
             pending_audio: VecDeque::new(),
             audio_buffer: [0; AUDIO_CHUNK_FRAMES * 2],
+            discard_audio_frames: 0,
             module_frames: vec![ModuleFrame {
                 module_id: root_id,
                 thread_id: loader_thread,
@@ -509,6 +511,39 @@ impl Ps2Machine {
                 .pending_audio
                 .pop_front()
                 .ok_or(MachineError::ClockOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Advances exactly `frames` native-rate frames without retaining output.
+    ///
+    /// Sound synthesis and all device side effects remain active so subsequent
+    /// rendered samples are identical to rendering and discarding the interval.
+    ///
+    /// # Errors
+    ///
+    /// Propagates CPU, HLE, device, clock, and SPU2 failures.
+    pub fn advance(&mut self, frames: usize) -> Result<(), MachineError> {
+        let mut remaining = u64::try_from(frames).map_err(|_| MachineError::ClockOverflow)?;
+        let queued = u64::try_from(self.state.pending_audio.len() / 2)
+            .map_err(|_| MachineError::ClockOverflow)?;
+        let queued = queued.min(remaining);
+        let queued_samples =
+            usize::try_from(queued.checked_mul(2).ok_or(MachineError::ClockOverflow)?)
+                .map_err(|_| MachineError::ClockOverflow)?;
+        self.state.pending_audio.drain(..queued_samples);
+        remaining -= queued;
+        if remaining == 0 {
+            return Ok(());
+        }
+
+        debug_assert_eq!(self.state.discard_audio_frames, 0);
+        self.state.discard_audio_frames = remaining;
+        while self.state.discard_audio_frames != 0 {
+            if let Err(error) = self.step() {
+                self.state.discard_audio_frames = 0;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -844,9 +879,19 @@ impl Ps2Machine {
                 .hardware
                 .sound_mut()
                 .render(chunk, &mut self.state.audio_buffer[..samples])?;
-            self.state
-                .pending_audio
-                .extend(self.state.audio_buffer[..samples].iter().copied());
+            let discarded = usize::try_from(
+                frames
+                    .min(self.state.discard_audio_frames)
+                    .min(u64::try_from(chunk).unwrap_or(u64::MAX)),
+            )
+            .map_err(|_| MachineError::ClockOverflow)?;
+            self.state.discard_audio_frames -=
+                u64::try_from(discarded).map_err(|_| MachineError::ClockOverflow)?;
+            self.state.pending_audio.extend(
+                self.state.audio_buffer[discarded * 2..samples]
+                    .iter()
+                    .copied(),
+            );
             frames -= chunk as u64;
         }
         Ok(())
