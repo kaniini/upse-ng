@@ -213,6 +213,7 @@ struct MachineState {
     sample_clock: RateConverter,
     deferred_device_ticks: u64,
     pending_audio: VecDeque<i16>,
+    audio_buffer: [i16; AUDIO_CHUNK_FRAMES * 2],
     callback_cpu: Option<Cpu>,
     libc_cpu: Option<Cpu>,
     interrupt_cpu: Option<Cpu>,
@@ -282,6 +283,7 @@ impl Ps1Machine {
             sample_clock: RateConverter::new(CPU_HZ, u64::from(SAMPLE_RATE))?,
             deferred_device_ticks: 0,
             pending_audio: VecDeque::new(),
+            audio_buffer: [0; AUDIO_CHUNK_FRAMES * 2],
             callback_cpu: None,
             libc_cpu: None,
             interrupt_cpu: None,
@@ -420,16 +422,24 @@ impl Ps1Machine {
         if let Some(vector) = bios_vector(self.state.cpu.pc()) {
             return self.step_bios(vector);
         }
-        if !synchronize_devices && self.in_idle_loop()? {
-            self.advance_devices(IDLE_ADVANCE_CYCLES, true)?;
-            return Ok(MachineStep {
-                cycles: IDLE_ADVANCE_CYCLES,
-                kind: MachineStepKind::Idle,
-            });
-        }
+        let prefetched_instruction = if synchronize_devices {
+            None
+        } else {
+            let (idle, instruction) = self.probe_idle_loop()?;
+            if idle {
+                self.advance_devices(IDLE_ADVANCE_CYCLES, true)?;
+                return Ok(MachineStep {
+                    cycles: IDLE_ADVANCE_CYCLES,
+                    kind: MachineStepKind::Idle,
+                });
+            }
+            instruction
+        };
 
         let outcome = {
             let state = &mut *self.state;
+            let prefetched_instruction =
+                prefetched_instruction.map(|instruction| (state.cpu.pc(), instruction));
             let mut bus = MachineBus {
                 memory: &mut state.memory,
                 cdrom: &mut state.cdrom,
@@ -441,6 +451,7 @@ impl Ps1Machine {
                 spu: &mut state.spu,
                 scheduler: &mut state.scheduler,
                 now: state.now,
+                prefetched_instruction,
             };
             state.cpu.step_without_external_interrupts(&mut bus)?
         };
@@ -500,19 +511,22 @@ impl Ps1Machine {
         Ok(())
     }
 
-    fn in_idle_loop(&self) -> Result<bool, MachineError> {
+    fn probe_idle_loop(&self) -> Result<(bool, Option<u32>), MachineError> {
         let pc = self.state.cpu.pc();
         if pc & 3 != 0 {
-            return Ok(false);
+            return Ok((false, None));
         }
         let instruction = self.state.memory.read_u32(pc)?;
         let branch_to_self = instruction == 0x1000_ffff;
         let jump_to_self = instruction >> 26 == 2
             && ((pc.wrapping_add(4) & 0xf000_0000) | ((instruction & 0x03ff_ffff) << 2)) == pc;
         if !branch_to_self && !jump_to_self {
-            return Ok(false);
+            return Ok((false, Some(instruction)));
         }
-        Ok(self.state.memory.read_u32(pc.wrapping_add(4))? == 0)
+        Ok((
+            self.state.memory.read_u32(pc.wrapping_add(4))? == 0,
+            Some(instruction),
+        ))
     }
 
     fn handle_default_interrupt(&mut self) -> Result<Option<InterruptSource>, MachineError> {
@@ -739,15 +753,16 @@ impl Ps1Machine {
     }
 
     fn render_due_frames(&mut self, mut frames: u64) -> Result<(), MachineError> {
-        let mut buffer = [0_i16; AUDIO_CHUNK_FRAMES * 2];
         while frames != 0 {
             let chunk = frames.min(u64::try_from(AUDIO_CHUNK_FRAMES).unwrap_or(256));
             let chunk = usize::try_from(chunk).map_err(|_| MachineError::ClockOverflow)?;
             let samples = chunk * 2;
-            self.state.spu.render(chunk, &mut buffer[..samples])?;
+            self.state
+                .spu
+                .render(chunk, &mut self.state.audio_buffer[..samples])?;
             self.state
                 .pending_audio
-                .extend(buffer[..samples].iter().copied());
+                .extend(self.state.audio_buffer[..samples].iter().copied());
             frames -= u64::try_from(chunk).map_err(|_| MachineError::ClockOverflow)?;
         }
         Ok(())
@@ -816,6 +831,7 @@ struct MachineBus<'a> {
     spu: &'a mut Spu,
     scheduler: &'a mut Scheduler,
     now: Deadline,
+    prefetched_instruction: Option<(u32, u32)>,
 }
 
 impl MachineBus<'_> {
@@ -934,6 +950,12 @@ impl Bus for MachineBus<'_> {
     }
 
     fn read_u32(&mut self, address: u32) -> Result<u32, BusFault> {
+        if let Some((prefetched_address, instruction)) = self.prefetched_instruction
+            && prefetched_address == address
+        {
+            self.prefetched_instruction = None;
+            return Ok(instruction);
+        }
         let region = Self::physical_region(address)?;
         match region {
             MemoryRegion::Mmio { physical } => match physical {

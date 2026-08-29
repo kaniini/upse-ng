@@ -373,6 +373,10 @@ impl IopTimers {
         sink: &mut S,
         observer: &mut O,
     ) -> Result<(), TimerError> {
+        if cycles == 1 {
+            self.advance_single_cpu_cycle(sink, observer);
+            return Ok(());
+        }
         for timer in TimerId::ALL {
             let counter = self.counters[timer.index()];
             if counter.mode & MODE_EXTERNAL_CLOCK != 0 || !counter.running() {
@@ -384,6 +388,40 @@ impl IopTimers {
             self.advance_counter(timer, total / divisor, sink, observer)?;
         }
         Ok(())
+    }
+
+    fn advance_single_cpu_cycle<S: InterruptSink, O: TimingObserver>(
+        &mut self,
+        sink: &mut S,
+        observer: &mut O,
+    ) {
+        for timer in TimerId::ALL {
+            let counter = self.counters[timer.index()];
+            if counter.mode & MODE_EXTERNAL_CLOCK != 0 || !counter.running() {
+                continue;
+            }
+            let divisor = prescale(timer, counter.mode);
+            if u64::from(counter.prescale_remainder) + 1 < divisor {
+                self.counters[timer.index()].prescale_remainder += 1;
+                continue;
+            }
+            self.counters[timer.index()].prescale_remainder = 0;
+
+            let mask = timer.width_mask();
+            let hit_overflow = counter.count == mask;
+            let count = counter.count.wrapping_add(1) & mask;
+            let hit_target = count == counter.target;
+            self.counters[timer.index()].count = count;
+            if hit_target {
+                self.boundary(timer, CounterBoundary::Target, sink, observer);
+                if self.counters[timer.index()].mode & MODE_RESET_ON_TARGET != 0 {
+                    self.counters[timer.index()].count = 0;
+                }
+            }
+            if hit_overflow {
+                self.boundary(timer, CounterBoundary::Overflow, sink, observer);
+            }
+        }
     }
 
     /// Advances an explicitly clocked counter input.
@@ -693,6 +731,50 @@ mod tests {
             .advance_external(TimerId::Timer3, 2, &mut irq, &mut events)
             .unwrap();
         assert_eq!(timers.count(TimerId::Timer3), 2);
+    }
+
+    #[test]
+    fn single_cycle_path_matches_bulk_advancement() {
+        for (base, count, target, mode, cycles) in [
+            (TIMER0_BASE, 0xfff0, 3, (1 << 5) | (1 << 6), 100),
+            (
+                TIMER2_BASE,
+                0,
+                3,
+                (1 << 3) | (1 << 4) | (1 << 6) | (1 << 9),
+                48,
+            ),
+            (
+                TIMER3_BASE,
+                0xffff_fff0,
+                2,
+                (1 << 4) | (1 << 5) | (1 << 6),
+                100,
+            ),
+        ] {
+            let mut bulk = IopTimers::new();
+            bulk.write_u32(base, count).unwrap();
+            bulk.write_u32(base + 8, target).unwrap();
+            bulk.write_u32(base + 4, mode).unwrap();
+            bulk.write_u32(base, count).unwrap();
+            let mut stepped = bulk.clone();
+            let mut bulk_irq = InterruptController::new();
+            let mut stepped_irq = InterruptController::new();
+            let mut bulk_events = Vec::new();
+            let mut stepped_events = Vec::new();
+
+            bulk.advance_cpu(cycles, &mut bulk_irq, &mut bulk_events)
+                .unwrap();
+            for _ in 0..cycles {
+                stepped
+                    .advance_cpu(1, &mut stepped_irq, &mut stepped_events)
+                    .unwrap();
+            }
+
+            assert_eq!(stepped, bulk);
+            assert_eq!(stepped_irq.status(), bulk_irq.status());
+            assert_eq!(stepped_events, bulk_events);
+        }
     }
 
     #[test]

@@ -124,6 +124,7 @@ pub struct IopMachine<E> {
     sound: E,
     now: Deadline,
     hardware_events: Vec<HardwareEvent>,
+    timing_events: Vec<TimingEvent>,
 }
 
 impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
@@ -146,6 +147,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
             sound,
             now: Deadline::ZERO,
             hardware_events: Vec::new(),
+            timing_events: Vec::new(),
         }
     }
 
@@ -300,6 +302,12 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
         std::mem::take(&mut self.hardware_events)
     }
 
+    /// Reports whether timestamped hardware events are waiting to be removed.
+    #[must_use]
+    pub fn has_hardware_events(&self) -> bool {
+        !self.hardware_events.is_empty()
+    }
+
     /// Executes one R3000 boundary, then services same-cycle DMA, counters, and
     /// refresh in that stable order.
     ///
@@ -307,7 +315,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
     ///
     /// Returns a structured CPU, DMA, timer, endpoint, or clock diagnostic.
     pub fn step(&mut self) -> Result<MachineStep, MachineError> {
-        self.step_inner(true)
+        self.step_inner(true, None)
     }
 
     /// Executes one instruction without letting the CPU enter a firmware
@@ -320,10 +328,31 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
     ///
     /// Returns the same structured diagnostics as [`Self::step`].
     pub fn step_without_external_interrupts(&mut self) -> Result<MachineStep, MachineError> {
-        self.step_inner(false)
+        self.step_inner(false, None)
     }
 
-    fn step_inner(&mut self, sample_external_interrupt: bool) -> Result<MachineStep, MachineError> {
+    /// Executes one instruction using a value already read from the current PC.
+    ///
+    /// This avoids fetching the instruction twice when a composed machine has
+    /// already inspected it at the same execution boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured diagnostics as [`Self::step`].
+    pub fn step_without_external_interrupts_prefetched(
+        &mut self,
+        instruction: u32,
+    ) -> Result<MachineStep, MachineError> {
+        self.step_inner(false, Some(instruction))
+    }
+
+    fn step_inner(
+        &mut self,
+        sample_external_interrupt: bool,
+        prefetched_instruction: Option<u32>,
+    ) -> Result<MachineStep, MachineError> {
+        let prefetched_instruction =
+            prefetched_instruction.map(|instruction| (self.cpu.pc(), instruction));
         let mut outcome = {
             let mut bus = MachineBus {
                 memory: &mut self.memory,
@@ -335,6 +364,7 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
                 sound: &mut self.sound,
                 now: self.now,
                 events: &mut self.hardware_events,
+                prefetched_instruction,
             };
             if sample_external_interrupt {
                 self.cpu.step(&mut bus)?
@@ -383,11 +413,12 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> IopMachine<E> {
             )?;
         }
 
-        let mut timing = Vec::new();
+        self.timing_events.clear();
         self.timers
-            .advance_cpu(cycles, &mut self.irq, &mut timing)?;
-        self.refresh.advance(cycles, &mut self.irq, &mut timing)?;
-        for event in timing {
+            .advance_cpu(cycles, &mut self.irq, &mut self.timing_events)?;
+        self.refresh
+            .advance(cycles, &mut self.irq, &mut self.timing_events)?;
+        for event in self.timing_events.drain(..) {
             match event {
                 TimingEvent::VBlankStart => {
                     self.timers.set_gate(upse_iop_timers::TimerId::Timer1, true);
@@ -434,6 +465,7 @@ struct MachineBus<'a, E> {
     sound: &'a mut E,
     now: Deadline,
     events: &'a mut Vec<HardwareEvent>,
+    prefetched_instruction: Option<(u32, u32)>,
 }
 
 impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> MachineBus<'_, E> {
@@ -530,6 +562,12 @@ impl<E: Spu2DmaEndpoint + Spu2MmioEndpoint> Bus for MachineBus<'_, E> {
     }
 
     fn read_u32(&mut self, address: u32) -> Result<u32, BusFault> {
+        if let Some((prefetched_address, instruction)) = self.prefetched_instruction
+            && prefetched_address == address
+        {
+            self.prefetched_instruction = None;
+            return Ok(instruction);
+        }
         match IopMemory::classify(address).map_err(bus_fault)? {
             MemoryRegion::Mmio { physical } => match physical {
                 I_STAT | I_MASK => self.irq.read(physical).map_err(bus_fault),

@@ -202,6 +202,7 @@ struct MachineState {
     services: IopServices<Psf2Vfs>,
     sample_clock: RateConverter,
     pending_audio: VecDeque<i16>,
+    audio_buffer: [i16; AUDIO_CHUNK_FRAMES * 2],
     module_frames: Vec<ModuleFrame>,
     thread_stacks: BTreeMap<u32, u32>,
     callbacks: VecDeque<upse_ps2_bios::CallbackRequest>,
@@ -314,6 +315,7 @@ impl Ps2Machine {
             services: IopServices::new(vfs),
             sample_clock: RateConverter::new(IOP_CLOCK_HZ, u64::from(SAMPLE_RATE))?,
             pending_audio: VecDeque::new(),
+            audio_buffer: [0; AUDIO_CHUNK_FRAMES * 2],
             module_frames: vec![ModuleFrame {
                 module_id: root_id,
                 thread_id: loader_thread,
@@ -423,15 +425,36 @@ impl Ps2Machine {
                 });
             }
         }
-        if self.state.halted || self.in_idle_loop()? {
+        let prefetched_instruction = if self.state.halted {
+            None
+        } else {
+            let (idle, instruction) = self.probe_idle_loop()?;
+            if idle {
+                self.advance_idle(IDLE_ADVANCE_CYCLES)?;
+                return Ok(MachineStep {
+                    cycles: IDLE_ADVANCE_CYCLES,
+                    kind: MachineStepKind::Idle,
+                });
+            }
+            instruction
+        };
+        if self.state.halted {
             self.advance_idle(IDLE_ADVANCE_CYCLES)?;
             return Ok(MachineStep {
                 cycles: IDLE_ADVANCE_CYCLES,
                 kind: MachineStepKind::Idle,
             });
         }
-        let before = self.state.hardware.cpu().clone();
-        let result = self.state.hardware.step_without_external_interrupts()?;
+        let before = prefetched_instruction
+            .is_some_and(|instruction| instruction & 0xfc00_003f == 0x0000_000d)
+            .then(|| self.state.hardware.cpu().clone());
+        let result = if let Some(instruction) = prefetched_instruction {
+            self.state
+                .hardware
+                .step_without_external_interrupts_prefetched(instruction)?
+        } else {
+            self.state.hardware.step_without_external_interrupts()?
+        };
         let cycles = u64::from(result.cpu.cycles);
         self.after_device_advance(cycles)?;
         match result.cpu.event {
@@ -441,6 +464,10 @@ impl Ps2Machine {
             }),
             StepEvent::Exception(Exception::Break) => {
                 let entry = result.cpu.pc;
+                let before = before.ok_or(MachineError::UnhandledException {
+                    exception: Exception::Break,
+                    pc: entry,
+                })?;
                 let service_cycles = self.dispatch_import(&before, entry)?;
                 Ok(MachineStep {
                     cycles: cycles
@@ -727,19 +754,22 @@ impl Ps2Machine {
         Ok(())
     }
 
-    fn in_idle_loop(&self) -> Result<bool, MachineError> {
+    fn probe_idle_loop(&self) -> Result<(bool, Option<u32>), MachineError> {
         let pc = self.state.hardware.cpu().pc();
         if pc & 3 != 0 {
-            return Ok(false);
+            return Ok((false, None));
         }
         let instruction = self.state.hardware.memory().read_u32(pc)?;
         let branch_to_self = instruction == 0x1000_ffff;
         let jump_to_self = instruction >> 26 == 2
             && ((pc.wrapping_add(4) & 0xf000_0000) | ((instruction & 0x03ff_ffff) << 2)) == pc;
         if !branch_to_self && !jump_to_self {
-            return Ok(false);
+            return Ok((false, Some(instruction)));
         }
-        Ok(self.state.hardware.memory().read_u32(pc.wrapping_add(4))? == 0)
+        Ok((
+            self.state.hardware.memory().read_u32(pc.wrapping_add(4))? == 0,
+            Some(instruction),
+        ))
     }
 
     fn advance_idle(&mut self, cycles: u64) -> Result<(), MachineError> {
@@ -754,40 +784,42 @@ impl Ps2Machine {
             let (sound, irq) = self.state.hardware.sound_and_interrupt_controller_mut();
             sound.drain_irq(irq);
         }
-        let events = self.state.hardware.take_hardware_events();
-        for event in events {
-            if matches!(event.kind, HardwareEventKind::Dma(_)) {
-                self.state.dma_events = self.state.dma_events.saturating_add(1);
-            }
-            if let HardwareEventKind::Dma(DmaEvent::Completed { channel, .. }) = event.kind {
-                let interrupt = match channel {
-                    SoundDmaChannel::Core0 => 36,
-                    SoundDmaChannel::Core1 => 40,
-                };
-                if self.state.enabled_interrupts.contains(&interrupt)
-                    && let Ok(callback) = self.state.bios.handlers().dispatch_interrupt(interrupt)
+        if self.state.hardware.has_hardware_events() {
+            for event in self.state.hardware.take_hardware_events() {
+                if matches!(event.kind, HardwareEventKind::Dma(_)) {
+                    self.state.dma_events = self.state.dma_events.saturating_add(1);
+                }
+                if let HardwareEventKind::Dma(DmaEvent::Completed { channel, .. }) = event.kind {
+                    let interrupt = match channel {
+                        SoundDmaChannel::Core0 => 36,
+                        SoundDmaChannel::Core1 => 40,
+                    };
+                    if self.state.enabled_interrupts.contains(&interrupt)
+                        && let Ok(callback) =
+                            self.state.bios.handlers().dispatch_interrupt(interrupt)
+                    {
+                        self.state.interrupt_callbacks.push_back(callback);
+                    }
+                }
+                if let HardwareEventKind::Timing(TimingEvent::Counter {
+                    timer,
+                    boundary: CounterBoundary::Target,
+                }) = event.kind
+                    && let Some(callback) = self.state.timer_manager.callback(timer)
                 {
-                    self.state.interrupt_callbacks.push_back(callback);
+                    self.state.timer_callbacks.push_back((timer, callback));
                 }
-            }
-            if let HardwareEventKind::Timing(TimingEvent::Counter {
-                timer,
-                boundary: CounterBoundary::Target,
-            }) = event.kind
-                && let Some(callback) = self.state.timer_manager.callback(timer)
-            {
-                self.state.timer_callbacks.push_back((timer, callback));
-            }
-            if let HardwareEventKind::Timing(TimingEvent::VBlankStart) = event.kind {
-                self.state.bios.kernel_mut().notify_vblank(0)?;
-                if let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(0) {
-                    self.state.callbacks.extend(callbacks);
+                if let HardwareEventKind::Timing(TimingEvent::VBlankStart) = event.kind {
+                    self.state.bios.kernel_mut().notify_vblank(0)?;
+                    if let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(0) {
+                        self.state.callbacks.extend(callbacks);
+                    }
                 }
-            }
-            if let HardwareEventKind::Timing(TimingEvent::VBlankEnd) = event.kind {
-                self.state.bios.kernel_mut().notify_vblank(1)?;
-                if let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(1) {
-                    self.state.callbacks.extend(callbacks);
+                if let HardwareEventKind::Timing(TimingEvent::VBlankEnd) = event.kind {
+                    self.state.bios.kernel_mut().notify_vblank(1)?;
+                    if let Ok(callbacks) = self.state.bios.handlers().dispatch_vblank(1) {
+                        self.state.callbacks.extend(callbacks);
+                    }
                 }
             }
         }
@@ -805,17 +837,16 @@ impl Ps2Machine {
     }
 
     fn render_due_frames(&mut self, mut frames: u64) -> Result<(), MachineError> {
-        let mut buffer = [0_i16; AUDIO_CHUNK_FRAMES * 2];
         while frames != 0 {
             let chunk = frames.min(AUDIO_CHUNK_FRAMES as u64) as usize;
             let samples = chunk * 2;
             self.state
                 .hardware
                 .sound_mut()
-                .render(chunk, &mut buffer[..samples])?;
+                .render(chunk, &mut self.state.audio_buffer[..samples])?;
             self.state
                 .pending_audio
-                .extend(buffer[..samples].iter().copied());
+                .extend(self.state.audio_buffer[..samples].iter().copied());
             frames -= chunk as u64;
         }
         Ok(())
