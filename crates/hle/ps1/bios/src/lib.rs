@@ -352,6 +352,14 @@ struct CardState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PadState {
+    initialized: bool,
+    started: bool,
+    buffers: [(u32, u32); 2],
+    button_destination: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct KernelHandlerState {
     timer_and_vblank: Option<u32>,
     syscall: Option<u32>,
@@ -418,6 +426,7 @@ pub struct BiosHle {
     kernel_handlers: KernelHandlerState,
     resident_file: Option<ResidentFile>,
     card: CardState,
+    pad: PadState,
     tables: BiosTableState,
     strtok_next: Option<u32>,
     libc_operation: Option<LibcOperation>,
@@ -452,6 +461,7 @@ impl BiosHle {
             kernel_handlers: KernelHandlerState::default(),
             resident_file: None,
             card: CardState::default(),
+            pad: PadState::default(),
             tables: BiosTableState::default(),
             strtok_next: None,
             libc_operation: None,
@@ -642,6 +652,11 @@ impl BiosHle {
             (BiosVector::B0, 0x0b) => self.test_event(context),
             (BiosVector::B0, 0x0c) => self.enable_event(context, true),
             (BiosVector::B0, 0x0d) => self.enable_event(context, false),
+            (BiosVector::B0, 0x12) => self.initialize_pad(context, memory)?,
+            (BiosVector::B0, 0x13) => self.start_pad(memory)?,
+            (BiosVector::B0, 0x14) => self.stop_pad(),
+            (BiosVector::B0, 0x15) => self.initialize_high_level_pad(context, memory)?,
+            (BiosVector::B0, 0x16) => self.read_high_level_pad(context, memory)?,
             (BiosVector::B0, 0x17) => {
                 context.return_value(1);
                 action = HleAction::ReturnFromException;
@@ -1321,6 +1336,94 @@ impl BiosHle {
             context.return_value(u32::MAX);
         }
         6
+    }
+
+    fn initialize_pad<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        let buffers = [
+            (context.argument(0), context.argument(1)),
+            (context.argument(2), context.argument(3)),
+        ];
+        let total_size = buffers[0]
+            .1
+            .checked_add(buffers[1].1)
+            .ok_or(BiosError::AddressOverflow)?;
+        self.check_memory_size(total_size)?;
+        for (address, size) in buffers {
+            for offset in 0..size {
+                write_byte(memory, address, offset, 0)?;
+            }
+        }
+        self.pad = PadState {
+            initialized: true,
+            started: false,
+            buffers,
+            button_destination: 0,
+        };
+        self.card.pad_enabled = true;
+        context.return_value(1);
+        Ok(memory_cycles(total_size))
+    }
+
+    fn start_pad<M: GuestMemory>(&mut self, memory: &mut M) -> Result<u32, BiosError> {
+        let mut writes = 0;
+        if self.pad.initialized {
+            for (address, size) in self.pad.buffers {
+                if size != 0 {
+                    // No controller source exists in an audio-only player, so
+                    // expose the timeout status produced by an empty port.
+                    write_byte(memory, address, 0, 0xff)?;
+                    writes += 1;
+                }
+            }
+        }
+        self.pad.started = true;
+        Ok(memory_cycles(writes))
+    }
+
+    fn stop_pad(&mut self) -> u32 {
+        self.pad.started = false;
+        self.card.started = false;
+        12
+    }
+
+    fn initialize_high_level_pad<M: GuestMemory>(
+        &mut self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        if !matches!(context.argument(0), 0x2000_0000 | 0x2000_0001) {
+            context.return_value(0);
+            return Ok(12);
+        }
+        let button_destination = context.argument(1);
+        if button_destination != 0 {
+            write_word(memory, button_destination, 0, u32::MAX)?;
+        }
+        self.pad = PadState {
+            initialized: true,
+            started: true,
+            buffers: [(0, 0); 2],
+            button_destination,
+        };
+        self.card.pad_enabled = true;
+        context.return_value(2);
+        Ok(24)
+    }
+
+    fn read_high_level_pad<M: GuestMemory>(
+        &self,
+        context: &mut CpuContext,
+        memory: &mut M,
+    ) -> Result<u32, BiosError> {
+        if self.pad.button_destination != 0 {
+            write_word(memory, self.pad.button_destination, 0, u32::MAX)?;
+        }
+        context.return_value(u32::MAX);
+        Ok(12)
     }
 
     fn initialize_card(&mut self, context: &CpuContext) -> u32 {
@@ -2913,6 +3016,55 @@ mod tests {
 
         call(&mut bios, BiosVector::B0, 0x4c, [0; 4], &mut memory).unwrap();
         assert!(!bios.card.started);
+    }
+
+    #[test]
+    fn pad_services_expose_disconnected_controllers_and_track_lifecycle() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0xaa; 128]);
+        let (initialized, _) =
+            call(&mut bios, BiosVector::B0, 0x12, [16, 4, 32, 4], &mut memory).unwrap();
+        assert_eq!(initialized.register(V0), Some(1));
+        assert_eq!(&memory.0[16..20], &[0; 4]);
+        assert_eq!(&memory.0[32..36], &[0; 4]);
+        assert!(bios.pad.initialized);
+        assert!(!bios.pad.started);
+        assert!(bios.card.pad_enabled);
+
+        call(&mut bios, BiosVector::B0, 0x13, [0; 4], &mut memory).unwrap();
+        assert_eq!(memory.0[16], 0xff);
+        assert_eq!(memory.0[32], 0xff);
+        assert!(bios.pad.started);
+
+        call(&mut bios, BiosVector::B0, 0x14, [0; 4], &mut memory).unwrap();
+        assert!(!bios.pad.started);
+
+        let (rejected, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x15,
+            [0x1000_0001, 64, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(rejected.register(V0), Some(0));
+
+        let (high_level, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x15,
+            [0x2000_0001, 64, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(high_level.register(V0), Some(2));
+        assert_eq!(&memory.0[64..68], &u32::MAX.to_le_bytes());
+        assert!(bios.pad.started);
+
+        memory.0[64..68].fill(0);
+        let (read, _) = call(&mut bios, BiosVector::B0, 0x16, [0; 4], &mut memory).unwrap();
+        assert_eq!(read.register(V0), Some(u32::MAX));
+        assert_eq!(&memory.0[64..68], &u32::MAX.to_le_bytes());
     }
 
     #[test]
