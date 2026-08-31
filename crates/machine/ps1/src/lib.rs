@@ -1115,25 +1115,12 @@ impl Bus for MachineBus<'_> {
 
 fn bios_interrupt_events(source: InterruptSource) -> &'static [(u32, u32)] {
     match source {
-        InterruptSource::VBlank => &[
-            (0xf200_0003, EVENT_SPEC_INTERRUPTED),
-            (0xf000_0001, EVENT_SPEC_INTERRUPT),
-        ],
+        InterruptSource::VBlank => &[(0xf000_0001, EVENT_SPEC_INTERRUPT)],
         InterruptSource::Gpu => &[(0xf000_0002, EVENT_SPEC_INTERRUPT)],
         InterruptSource::CdRom => &[(0xf000_0003, EVENT_SPEC_INTERRUPT)],
         InterruptSource::Dma => &[(0xf000_0004, EVENT_SPEC_INTERRUPT)],
-        InterruptSource::Timer0 => &[
-            (0xf200_0000, EVENT_SPEC_INTERRUPTED),
-            (0xf000_0005, EVENT_SPEC_INTERRUPT),
-        ],
-        InterruptSource::Timer1 => &[
-            (0xf200_0001, EVENT_SPEC_INTERRUPTED),
-            (0xf000_0006, EVENT_SPEC_INTERRUPT),
-        ],
-        InterruptSource::Timer2 => &[
-            (0xf200_0002, EVENT_SPEC_INTERRUPTED),
-            (0xf000_0006, EVENT_SPEC_INTERRUPT),
-        ],
+        InterruptSource::Timer0 => &[(0xf000_0005, EVENT_SPEC_INTERRUPT)],
+        InterruptSource::Timer1 | InterruptSource::Timer2 => &[(0xf000_0006, EVENT_SPEC_INTERRUPT)],
         InterruptSource::Controller => &[(0xf000_0008, EVENT_SPEC_INTERRUPT)],
         InterruptSource::Sio => &[(0xf000_000b, EVENT_SPEC_INTERRUPT)],
         InterruptSource::Spu => &[(EVENT_CLASS_SPU, EVENT_SPEC_INTERRUPT)],
@@ -1183,6 +1170,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use upse_clock::{Deadline, Ticks};
+    use upse_ps1_bios::{BiosVector, CpuContext};
     use upse_ps1_dma::{D4_BCR, D4_CHCR, D4_MADR, DICR, DICR_CHANNEL4_MASK, DPCR};
     use upse_ps1_irq::InterruptSource;
     use upse_ps1_memory::OpenBusPolicy;
@@ -1193,8 +1181,8 @@ mod tests {
     use upse_scheduler::Scheduler;
 
     use super::{
-        CPU_HZ, IDLE_ADVANCE_CYCLES, MachineConfig, MachineEvent, MachineStepKind, Ps1Machine,
-        StepEvent, VideoStandard,
+        BiosMemory, CPU_HZ, EVENT_SPEC_INTERRUPTED, IDLE_ADVANCE_CYCLES, MachineConfig,
+        MachineEvent, MachineStepKind, Ps1Machine, StepEvent, VideoStandard,
     };
 
     #[test]
@@ -1321,6 +1309,21 @@ mod tests {
             LoadPlan::Psf1(plan) => plan,
             LoadPlan::Psf2(_) => unreachable!(),
         }
+    }
+
+    fn call_bios(machine: &mut Ps1Machine, function: u32, arguments: [u32; 4]) -> CpuContext {
+        let mut context = CpuContext::reset(machine.pc(), 0x801f_ff00);
+        context.set_register(9, function);
+        for (index, argument) in arguments.into_iter().enumerate() {
+            context.set_register(4 + index, argument);
+        }
+        let mut memory = BiosMemory(&mut machine.state.memory);
+        machine
+            .state
+            .bios
+            .dispatch(BiosVector::B0, &mut context, &mut memory)
+            .unwrap();
+        context
     }
 
     #[test]
@@ -1558,6 +1561,43 @@ mod tests {
         );
         assert_eq!(machine.state.irq.status(), 0);
         assert_eq!(machine.pc(), pc);
+    }
+
+    #[test]
+    fn root_counter_events_are_delivered_once_by_the_default_handler() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let callback = 0x8001_2000;
+        let opened = call_bios(
+            &mut machine,
+            0x08,
+            [0xf200_0002, EVENT_SPEC_INTERRUPTED, 0x1000, callback],
+        );
+        let handle = opened.register(2).unwrap();
+        call_bios(&mut machine, 0x0c, [handle, 0, 0, 0]);
+
+        machine
+            .state
+            .timers
+            .write_register(TimerId::Timer2, TimerRegister::Target, 1000);
+        machine.state.timers.write_register(
+            TimerId::Timer2,
+            TimerRegister::Mode,
+            (1 << 3) | (1 << 4) | (1 << 6),
+        );
+        machine.state.irq.set_mask(InterruptSource::Timer2.bit());
+        machine.advance_devices(1000, true).unwrap();
+        assert!(machine.state.bios.take_callback().is_none());
+
+        assert_eq!(
+            machine.step().unwrap().kind,
+            MachineStepKind::Interrupt(InterruptSource::Timer2)
+        );
+        assert_eq!(
+            machine.state.bios.take_callback().unwrap().address,
+            callback
+        );
+        assert!(machine.state.bios.take_callback().is_none());
     }
 
     #[test]
