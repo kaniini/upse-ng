@@ -205,6 +205,7 @@ struct MachineState {
     irq: InterruptController,
     timers: RootCounters,
     refresh: VBlankClock,
+    hblank_clock: RateConverter,
     dma: DmaController,
     bios: BiosHle,
     spu: Spu,
@@ -276,6 +277,7 @@ impl Ps1Machine {
             irq: InterruptController::new(),
             timers: RootCounters::new(),
             refresh: VBlankClock::new(standard),
+            hblank_clock: RateConverter::new(CPU_HZ, standard.hblank_hz())?,
             dma: DmaController::new(),
             bios,
             spu: Spu::new(),
@@ -735,6 +737,10 @@ impl Ps1Machine {
             self.state
                 .timers
                 .advance(ClockInput::System, ticks, &mut sink)?;
+            let hblank_edges = self.state.hblank_clock.advance(ticks)?;
+            self.state
+                .timers
+                .advance(ClockInput::HBlank, hblank_edges, &mut sink)?;
             self.state.refresh.advance(ticks, &mut sink)?;
         }
         while let Some(event) = self.state.scheduler.pop_due(self.state.now) {
@@ -1187,8 +1193,8 @@ mod tests {
     use upse_scheduler::Scheduler;
 
     use super::{
-        IDLE_ADVANCE_CYCLES, MachineConfig, MachineEvent, MachineStepKind, Ps1Machine, StepEvent,
-        VideoStandard,
+        CPU_HZ, IDLE_ADVANCE_CYCLES, MachineConfig, MachineEvent, MachineStepKind, Ps1Machine,
+        StepEvent, VideoStandard,
     };
 
     #[test]
@@ -1552,6 +1558,30 @@ mod tests {
         );
         assert_eq!(machine.state.irq.status(), 0);
         assert_eq!(machine.pc(), pc);
+    }
+
+    #[test]
+    fn machine_supplies_hblank_edges_to_timer_one() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        machine
+            .state
+            .timers
+            .write_register(TimerId::Timer1, TimerRegister::Target, 3);
+        machine.state.timers.write_register(
+            TimerId::Timer1,
+            TimerRegister::Mode,
+            (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8),
+        );
+        let hblank_hz = VideoStandard::Ntsc.hblank_hz();
+        let cycles = (3 * CPU_HZ).div_ceil(hblank_hz);
+        machine
+            .advance_devices(u32::try_from(cycles).unwrap(), true)
+            .unwrap();
+        assert_ne!(
+            machine.state.irq.status() & InterruptSource::Timer1.bit(),
+            0
+        );
     }
 
     #[test]

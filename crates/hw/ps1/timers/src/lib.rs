@@ -112,6 +112,21 @@ impl VideoStandard {
     pub const fn cycles_per_vblank(self) -> u64 {
         CPU_HZ / self.refresh_hz()
     }
+
+    /// Returns the number of scanlines in one video frame.
+    #[must_use]
+    pub const fn scanlines_per_frame(self) -> u64 {
+        match self {
+            Self::Ntsc => 263,
+            Self::Pal => 314,
+        }
+    }
+
+    /// Returns the horizontal-blank edge rate used by root counter 1.
+    #[must_use]
+    pub const fn hblank_hz(self) -> u64 {
+        self.refresh_hz() * self.scanlines_per_frame()
+    }
 }
 
 /// Invalid register, timer, or clock arithmetic.
