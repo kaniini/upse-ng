@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const REGISTER_COUNT: usize = 32;
 const V0: usize = 2;
+const V1: usize = 3;
 const A0: usize = 4;
 const S0: usize = 16;
 const GP: usize = 28;
@@ -2498,7 +2499,12 @@ impl BiosHle {
             }
             delivered
         });
-        context.return_value(u32::from(delivered));
+        let delivered = u32::from(delivered);
+        context.return_value(delivered);
+        // The retail routine also leaves the readiness result in v1. The
+        // shared Crash Bandicoot 2 and 3 PSF driver relies on this undocumented
+        // clobber after calling SpuIsTransferCompleted.
+        context.set_register(V1, delivered);
         8
     }
 
@@ -2762,7 +2768,7 @@ mod tests {
         C0_EXCEPTION_STUB_ADDRESS, C0_STUB_ADDRESS, C0_TABLE_ADDRESS, CpuContext, FP, GP,
         GuestMemory, GuestMemoryError, HleAction, HleLimits, KERNEL_CONFIG_ADDRESS,
         KERNEL_MEMORY_ADDRESS, KERNEL_MEMORY_SIZE, RA, RESIDENT_FILE_DESCRIPTOR, S0, SP,
-        STRTOK_BUFFER_ADDRESS, T1, V0,
+        STRTOK_BUFFER_ADDRESS, T1, V0, V1,
     };
 
     struct Memory(Vec<u8>);
@@ -3683,6 +3689,59 @@ mod tests {
         assert_eq!(result.register(V0), Some(1));
         let (result, _) = call(&mut bios, BiosVector::B0, 0x09, [0, 0, 0, 0], &mut memory).unwrap();
         assert_eq!(result.register(V0), Some(1));
+    }
+
+    #[test]
+    fn test_event_mirrors_the_readiness_result_into_v1() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 16]);
+        let (opened, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x08,
+            [0xf000_0009, 0x20, 0x2000, 0],
+            &mut memory,
+        )
+        .unwrap();
+        let handle = opened.register(V0).unwrap();
+        call(
+            &mut bios,
+            BiosVector::B0,
+            0x0c,
+            [handle, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        call(
+            &mut bios,
+            BiosVector::B0,
+            0x07,
+            [0xf000_0009, 0x20, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+
+        let (ready, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x0b,
+            [handle, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(ready.register(V0), Some(1));
+        assert_eq!(ready.register(V1), Some(1));
+
+        let (idle, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x0b,
+            [handle, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(idle.register(V0), Some(0));
+        assert_eq!(idle.register(V1), Some(0));
     }
 
     #[test]
