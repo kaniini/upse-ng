@@ -14,6 +14,9 @@
     upse_player_volume;
     upse_player_length_frames;
     upse_player_fade_frames;
+    upse_player_effective_gain;
+    upse_player_effective_length_frames;
+    upse_player_effective_fade_frames;
     upse_player_frames_rendered;
     upse_player_free;
     upse_error_message;

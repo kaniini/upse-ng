@@ -58,6 +58,7 @@ use upse_ps2_machine::{
 
 const DEFAULT_QUANTUM: usize = 1024;
 const MAX_QUANTUM: usize = 65_536;
+#[cfg(any(feature = "psf1", feature = "psf2"))]
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 type Callback = Box<dyn for<'a> FnMut(AudioBlock<'a>) -> AudioAction + Send>;
@@ -86,7 +87,8 @@ impl Default for Limits {
 /// Optional trailing-silence termination policy.
 ///
 /// Detection begins only after an audible frame, so leading silence remains
-/// observable. Quiet frames are compared after tag volume and fade processing.
+/// observable. Quiet frames are compared after configured gain and fade
+/// processing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SilenceDetection {
     /// Maximum absolute normalized amplitude considered quiet.
@@ -113,6 +115,43 @@ impl Default for SilenceDetection {
             duration: Duration::from_secs(5),
         }
     }
+}
+
+/// Selects the gain applied after emulation and before delivery.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum GainPolicy {
+    /// Apply the PSF `volume` tag, including its implicit unity default.
+    #[default]
+    Tag,
+    /// Ignore the tag and apply the supplied linear amplitude coefficient.
+    Override(f64),
+}
+
+/// Selects how a PSF `length` or `fade` tag controls playback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DurationPolicy {
+    /// Use the tag and retain its format-defined default when absent.
+    #[default]
+    Tag,
+    /// Use the tag when present, otherwise use the supplied duration.
+    TagOr(Duration),
+    /// Ignore the tag and always use the supplied duration.
+    Override(Duration),
+    /// Ignore the tag and disable this part of the timeline.
+    ///
+    /// For length this means indefinite playback. For fade this means no fade.
+    Ignore,
+}
+
+/// Gain, length, and fade policy for one PSF format version.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlaybackConfig {
+    /// Post-emulation gain policy.
+    pub gain: GainPolicy,
+    /// Playback length policy.
+    pub length: DurationPolicy,
+    /// Fade duration policy.
+    pub fade: DurationPolicy,
 }
 
 /// High-level open, timeline, callback, or emulation failure.
@@ -143,6 +182,12 @@ pub enum PlayerError {
         /// Configured maximum frames per callback.
         maximum: usize,
     },
+    /// A configured gain override was not finite.
+    #[error("playback gain override must be finite")]
+    InvalidGain,
+    /// A configured playback duration could not map to native frames.
+    #[error("configured playback duration exceeds the native timeline")]
+    PlaybackDurationOverflow,
     /// End-to-end PSF1 machine execution failed.
     #[cfg(feature = "psf1")]
     #[error("PSF1 machine failure: {0}")]
@@ -165,11 +210,13 @@ pub enum PlayerError {
     },
 }
 
-/// Configures limits, callback quantum, and the initial callback before open.
+/// Configures limits, per-format playback policy, and the initial callback.
 pub struct PlayerBuilder {
     limits: Limits,
     quantum: usize,
     silence_detection: Option<SilenceDetection>,
+    psf1_playback: PlaybackConfig,
+    psf2_playback: PlaybackConfig,
     callback: Callback,
 }
 
@@ -187,6 +234,8 @@ impl PlayerBuilder {
             limits: Limits::default(),
             quantum: DEFAULT_QUANTUM,
             silence_detection: None,
+            psf1_playback: PlaybackConfig::default(),
+            psf2_playback: PlaybackConfig::default(),
             callback: Box::new(|_| AudioAction::Continue),
         }
     }
@@ -209,6 +258,20 @@ impl PlayerBuilder {
     #[must_use]
     pub const fn silence_detection(mut self, detection: SilenceDetection) -> Self {
         self.silence_detection = Some(detection);
+        self
+    }
+
+    /// Sets gain and timeline handling for PSF1 files.
+    #[must_use]
+    pub const fn psf1_playback(mut self, config: PlaybackConfig) -> Self {
+        self.psf1_playback = config;
+        self
+    }
+
+    /// Sets gain and timeline handling for PSF2 files.
+    #[must_use]
+    pub const fn psf2_playback(mut self, config: PlaybackConfig) -> Self {
+        self.psf2_playback = config;
         self
     }
 
@@ -277,7 +340,14 @@ impl PlayerBuilder {
             self.limits.parse,
             self.limits.dependencies,
         )?;
-        Player::from_plan(plan, self.quantum, self.silence_detection, self.callback)
+        Player::from_plan(
+            plan,
+            self.quantum,
+            self.silence_detection,
+            self.psf1_playback,
+            self.psf2_playback,
+            self.callback,
+        )
     }
 
     fn validate(&self) -> Result<(), PlayerError> {
@@ -286,6 +356,13 @@ impl PlayerBuilder {
                 quantum: self.quantum,
                 maximum: self.limits.maximum_quantum,
             });
+        }
+        for config in [self.psf1_playback, self.psf2_playback] {
+            if let GainPolicy::Override(gain) = config.gain
+                && !gain.is_finite()
+            {
+                return Err(PlayerError::InvalidGain);
+            }
         }
         Ok(())
     }
@@ -324,22 +401,24 @@ impl Player {
         plan: LoadPlan,
         quantum: usize,
         silence_detection: Option<SilenceDetection>,
+        psf1_playback: PlaybackConfig,
+        psf2_playback: PlaybackConfig,
         callback: Callback,
     ) -> Result<Self, PlayerError> {
+        #[cfg(not(feature = "psf1"))]
+        let _ = psf1_playback;
+        #[cfg(not(feature = "psf2"))]
+        let _ = psf2_playback;
         match plan {
             #[cfg(feature = "psf1")]
             LoadPlan::Psf1(plan) => {
                 let metadata = plan.metadata.clone();
                 let format = AudioFormat::stereo(44_100);
-                let length = metadata
-                    .length
-                    .map(|duration| duration.to_frames_floor(format.sample_rate()))
-                    .transpose()?;
-                let fade = metadata.fade.to_frames_floor(format.sample_rate())?;
+                let (gain, length, fade) = resolve_playback(&metadata, format, psf1_playback)?;
                 let machine = Ps1Machine::from_plan(&plan, Ps1MachineConfig::default())?;
                 Ok(Self {
                     machine: Machine::Psf1(Box::new(machine)),
-                    post_mix: PostMixer::new(metadata.volume, length, fade),
+                    post_mix: PostMixer::new(gain, length, fade),
                     silence_detector: make_silence_detector(silence_detection, format)?,
                     delivered_frames: 0,
                     metadata,
@@ -354,15 +433,11 @@ impl Player {
             LoadPlan::Psf2(plan) => {
                 let metadata = plan.metadata.clone();
                 let format = AudioFormat::stereo(48_000);
-                let length = metadata
-                    .length
-                    .map(|duration| duration.to_frames_floor(format.sample_rate()))
-                    .transpose()?;
-                let fade = metadata.fade.to_frames_floor(format.sample_rate())?;
+                let (gain, length, fade) = resolve_playback(&metadata, format, psf2_playback)?;
                 let machine = Ps2Machine::from_plan(&plan, Ps2MachineConfig::default())?;
                 Ok(Self {
                     machine: Machine::Psf2(Box::new(machine)),
-                    post_mix: PostMixer::new(metadata.volume, length, fade),
+                    post_mix: PostMixer::new(gain, length, fade),
                     silence_detector: make_silence_detector(silence_detection, format)?,
                     delivered_frames: 0,
                     metadata,
@@ -383,6 +458,8 @@ impl Player {
         _plan: LoadPlan,
         _quantum: usize,
         _silence_detection: Option<SilenceDetection>,
+        _psf1_playback: PlaybackConfig,
+        _psf2_playback: PlaybackConfig,
         _callback: Callback,
     ) -> Result<Self, PlayerError> {
         Err(PlayerError::UnsupportedVersion)
@@ -398,6 +475,24 @@ impl Player {
     #[must_use]
     pub const fn audio_format(&self) -> AudioFormat {
         self.format
+    }
+
+    /// Returns the resolved gain applied to delivered samples.
+    #[must_use]
+    pub const fn effective_gain(&self) -> f64 {
+        self.post_mix.volume()
+    }
+
+    /// Returns the resolved pre-fade length, or no automatic ending.
+    #[must_use]
+    pub const fn effective_length_frames(&self) -> Option<u64> {
+        self.post_mix.length_frames()
+    }
+
+    /// Returns the resolved fade duration in native frames.
+    #[must_use]
+    pub const fn effective_fade_frames(&self) -> u64 {
+        self.post_mix.fade_frames()
     }
 
     /// Returns timeline frames rendered or advanced since open/reset.
@@ -433,10 +528,11 @@ impl Player {
 
     /// Delivers at most `max_frames` synchronously in bounded callback blocks.
     ///
-    /// Missing `length` metadata means this method never returns
-    /// [`RenderOutcome::End`] automatically. A callback stop includes the
-    /// current block in its returned frame count. There is intentionally no
-    /// seek method; consumers reset and render to a discard callback.
+    /// A length policy which resolves to no duration means this method never
+    /// returns [`RenderOutcome::End`] from the timeline. A callback stop
+    /// includes the current block in its returned frame count. There is
+    /// intentionally no seek method; consumers reset and advance or render to
+    /// a discard callback.
     ///
     /// # Errors
     ///
@@ -657,6 +753,67 @@ impl Player {
     }
 }
 
+#[cfg(any(feature = "psf1", feature = "psf2"))]
+fn resolve_playback(
+    metadata: &Metadata,
+    format: AudioFormat,
+    config: PlaybackConfig,
+) -> Result<(f64, Option<u64>, u64), PlayerError> {
+    let gain = match config.gain {
+        GainPolicy::Tag => metadata.volume,
+        GainPolicy::Override(gain) => gain,
+    };
+    let sample_rate = format.sample_rate();
+    let length = resolve_duration(config.length, metadata.length, sample_rate)?;
+    let tagged_fade = metadata
+        .raw_tags()
+        .iter()
+        .any(|tag| tag.key().eq_ignore_ascii_case("fade"))
+        .then_some(metadata.fade);
+    let fade = resolve_duration(config.fade, tagged_fade, sample_rate)?.unwrap_or(0);
+    Ok((gain, length, fade))
+}
+
+#[cfg(any(feature = "psf1", feature = "psf2"))]
+fn resolve_duration(
+    policy: DurationPolicy,
+    tagged: Option<upse_psf::Duration>,
+    sample_rate: u32,
+) -> Result<Option<u64>, PlayerError> {
+    match policy {
+        DurationPolicy::Tag => tagged
+            .map(|duration| duration.to_frames_floor(sample_rate))
+            .transpose()
+            .map_err(PlayerError::from),
+        DurationPolicy::TagOr(fallback) => tagged.map_or_else(
+            || configured_duration_frames(fallback, sample_rate).map(Some),
+            |duration| {
+                duration
+                    .to_frames_floor(sample_rate)
+                    .map(Some)
+                    .map_err(PlayerError::from)
+            },
+        ),
+        DurationPolicy::Override(duration) => {
+            configured_duration_frames(duration, sample_rate).map(Some)
+        }
+        DurationPolicy::Ignore => Ok(None),
+    }
+}
+
+#[cfg(any(feature = "psf1", feature = "psf2"))]
+fn configured_duration_frames(duration: Duration, sample_rate: u32) -> Result<u64, PlayerError> {
+    let whole = duration
+        .as_secs()
+        .checked_mul(u64::from(sample_rate))
+        .ok_or(PlayerError::PlaybackDurationOverflow)?;
+    let fractional = u64::from(duration.subsec_nanos()) * u64::from(sample_rate) / NANOS_PER_SECOND;
+    whole
+        .checked_add(fractional)
+        .ok_or(PlayerError::PlaybackDurationOverflow)
+}
+
+#[cfg(any(feature = "psf1", feature = "psf2"))]
 fn make_silence_detector(
     detection: Option<SilenceDetection>,
     format: AudioFormat,
@@ -692,8 +849,8 @@ mod tests {
     use upse_psf::{MemoryResolver, PsfBuilder, PsfVersion};
 
     use super::{
-        AudioAction, Limits, PlayerBuilder, PlayerError, RenderOutcome, ResolverError,
-        SilenceDetection, SilenceError,
+        AudioAction, DurationPolicy, GainPolicy, Limits, PlaybackConfig, PlayerBuilder,
+        PlayerError, RenderOutcome, ResolverError, SilenceDetection, SilenceError,
     };
 
     fn instruction_lui(rt: u32, immediate: u16) -> u32 {
@@ -983,6 +1140,109 @@ mod tests {
             assert_eq!(left, -right);
         }
         assert!(positive.iter().any(|sample| sample.abs() > 1.0));
+    }
+
+    #[test]
+    fn per_format_playback_policy_controls_gain_length_and_fade() {
+        let tagged_bytes = fixture(&[("volume", "2"), ("length", "0.01"), ("fade", "0.005")]);
+        let tagged_samples = Arc::new(Mutex::new(Vec::new()));
+        let mut tagged = collecting_builder(32, Arc::clone(&tagged_samples))
+            .psf1_playback(PlaybackConfig {
+                gain: GainPolicy::Tag,
+                length: DurationPolicy::TagOr(Duration::from_millis(100)),
+                fade: DurationPolicy::TagOr(Duration::from_millis(100)),
+            })
+            .open_memory("tagged.psf", &tagged_bytes)
+            .unwrap();
+        assert_eq!(tagged.effective_gain(), 2.0);
+        assert_eq!(tagged.effective_length_frames(), Some(441));
+        assert_eq!(tagged.effective_fade_frames(), 220);
+        assert_eq!(
+            tagged.render(2_000).unwrap(),
+            RenderOutcome::End { frames: 661 }
+        );
+
+        let overridden_samples = Arc::new(Mutex::new(Vec::new()));
+        let mut overridden = collecting_builder(32, Arc::clone(&overridden_samples))
+            .psf1_playback(PlaybackConfig {
+                gain: GainPolicy::Override(1.0),
+                length: DurationPolicy::Override(Duration::from_millis(4)),
+                fade: DurationPolicy::Override(Duration::from_millis(1)),
+            })
+            .open_memory("overridden.psf", &tagged_bytes)
+            .unwrap();
+        assert_eq!(overridden.effective_gain(), 1.0);
+        assert_eq!(overridden.effective_length_frames(), Some(176));
+        assert_eq!(overridden.effective_fade_frames(), 44);
+        assert_eq!(
+            overridden.render(2_000).unwrap(),
+            RenderOutcome::End { frames: 220 }
+        );
+        let tagged_samples = tagged_samples.lock().unwrap();
+        let overridden_samples = overridden_samples.lock().unwrap();
+        assert_eq!(overridden_samples.len(), 440);
+        assert!(overridden_samples.iter().any(|sample| *sample != 0.0));
+        for (&tagged, &overridden) in tagged_samples
+            .iter()
+            .zip(overridden_samples.iter())
+            .take(352)
+        {
+            assert!((tagged - overridden * 2.0).abs() <= f32::EPSILON);
+        }
+        drop(tagged_samples);
+        drop(overridden_samples);
+
+        let untagged_bytes = fixture(&[]);
+        let mut fallback = PlayerBuilder::new()
+            .psf1_playback(PlaybackConfig {
+                gain: GainPolicy::Tag,
+                length: DurationPolicy::TagOr(Duration::from_millis(10)),
+                fade: DurationPolicy::TagOr(Duration::from_millis(5)),
+            })
+            .open_memory("fallback.psf", &untagged_bytes)
+            .unwrap();
+        assert_eq!(
+            fallback.render(2_000).unwrap(),
+            RenderOutcome::End { frames: 661 }
+        );
+
+        let mut endless = PlayerBuilder::new()
+            .psf1_playback(PlaybackConfig {
+                gain: GainPolicy::Tag,
+                length: DurationPolicy::Ignore,
+                fade: DurationPolicy::Ignore,
+            })
+            .open_memory("endless.psf", &tagged_bytes)
+            .unwrap();
+        assert_eq!(endless.effective_length_frames(), None);
+        assert_eq!(endless.effective_fade_frames(), 0);
+        assert_eq!(
+            endless.render(2_000).unwrap(),
+            RenderOutcome::Complete { frames: 2_000 }
+        );
+    }
+
+    #[test]
+    fn invalid_playback_overrides_are_rejected() {
+        let bytes = fixture(&[]);
+        assert!(matches!(
+            PlayerBuilder::new()
+                .psf2_playback(PlaybackConfig {
+                    gain: GainPolicy::Override(f64::NAN),
+                    ..PlaybackConfig::default()
+                })
+                .open_memory("invalid.psf", &bytes),
+            Err(PlayerError::InvalidGain)
+        ));
+        assert!(matches!(
+            PlayerBuilder::new()
+                .psf1_playback(PlaybackConfig {
+                    length: DurationPolicy::Override(Duration::new(u64::MAX, 999_999_999)),
+                    ..PlaybackConfig::default()
+                })
+                .open_memory("invalid.psf", &bytes),
+            Err(PlayerError::PlaybackDurationOverflow)
+        ));
     }
 
     #[test]

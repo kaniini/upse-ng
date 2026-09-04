@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Final signed-integer conversion, tag volume, fade timeline, and silence detection.
+//! Final signed-integer conversion, gain, fade timeline, and silence detection.
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
@@ -184,7 +184,7 @@ pub enum PostMixError {
     PositionOverflow,
 }
 
-/// Chunk-independent PSF volume, length, and fade state.
+/// Chunk-independent gain, length, and fade state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PostMixer {
     volume: f64,
@@ -203,6 +203,24 @@ impl PostMixer {
             fade_frames,
             position: 0,
         }
+    }
+
+    /// Returns the configured linear gain coefficient.
+    #[must_use]
+    pub const fn volume(&self) -> f64 {
+        self.volume
+    }
+
+    /// Returns the configured pre-fade length, or no automatic ending.
+    #[must_use]
+    pub const fn length_frames(&self) -> Option<u64> {
+        self.length_frames
+    }
+
+    /// Returns the configured fade duration.
+    #[must_use]
+    pub const fn fade_frames(&self) -> u64 {
+        self.fade_frames
     }
 
     /// Returns the number of frames already converted.

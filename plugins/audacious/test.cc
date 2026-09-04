@@ -4,6 +4,8 @@
 #include <libaudcore/plugin.h>
 #include <libaudcore/runtime.h>
 
+#include <upse.h>
+
 #include <dlfcn.h>
 
 #include <cstdio>
@@ -35,7 +37,8 @@ bool string_field_equals(const Tuple & tuple, Tuple::Field field,
 }
 
 bool check_fixture(InputPlugin * plugin, const char * path,
-                   const char * title, const char * codec)
+                   const char * title, const char * codec,
+                   int expected_length)
 {
     StringBuf uri = filename_to_uri(path);
     const char * uri_text = uri;
@@ -65,7 +68,7 @@ bool check_fixture(InputPlugin * plugin, const char * path,
         !string_field_equals(tuple, Tuple::Album, "Generated fixture") ||
         !string_field_equals(tuple, Tuple::Artist, "UPSE-NG tests") ||
         !string_field_equals(tuple, Tuple::Codec, codec) ||
-        tuple.get_int(Tuple::Length) != 25 ||
+        tuple.get_int(Tuple::Length) != expected_length ||
         tuple.get_int(Tuple::Channels) != 2)
     {
         std::fprintf(stderr, "unexpected fixture metadata: %s\n", path);
@@ -108,14 +111,34 @@ int main(int argc, char ** argv)
     if (!valid_plugin)
         std::fprintf(stderr, "invalid Audacious input plugin descriptor\n");
 
-    const bool valid_fixtures =
+    bool valid_fixtures =
         valid_plugin && plugin->init() &&
         check_fixture(plugin, argv[2], "UPSE-NG synthetic noise",
-                      "PlayStation Sound Format (PSF)") &&
+                      "PlayStation Sound Format (PSF)", 25) &&
         check_fixture(plugin, argv[3], "UPSE-NG synthetic noise",
-                      "PlayStation Sound Format (PSF)") &&
+                      "PlayStation Sound Format (PSF)", 25) &&
         check_fixture(plugin, argv[4], "UPSE-NG synthetic PSF2",
-                      "PlayStation 2 Sound Format (PSF2)");
+                      "PlayStation 2 Sound Format (PSF2)", 25);
+
+    if (valid_fixtures)
+    {
+        aud_set_int("upse-ng", "psf1_length_policy",
+                    UPSE_DURATION_OVERRIDE);
+        aud_set_int("upse-ng", "psf1_length_seconds", 1);
+        aud_set_int("upse-ng", "psf1_fade_policy",
+                    UPSE_DURATION_IGNORE);
+        aud_set_int("upse-ng", "psf2_length_policy",
+                    UPSE_DURATION_OVERRIDE);
+        aud_set_int("upse-ng", "psf2_length_seconds", 2);
+        aud_set_int("upse-ng", "psf2_fade_policy",
+                    UPSE_DURATION_IGNORE);
+
+        valid_fixtures =
+            check_fixture(plugin, argv[2], "UPSE-NG synthetic noise",
+                          "PlayStation Sound Format (PSF)", 1000) &&
+            check_fixture(plugin, argv[4], "UPSE-NG synthetic PSF2",
+                          "PlayStation 2 Sound Format (PSF2)", 2000);
+    }
 
     if (valid_plugin)
         plugin->cleanup();

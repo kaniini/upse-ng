@@ -23,14 +23,107 @@ constexpr uint64_t RenderQuantum = 4096;
 constexpr uint64_t SeekQuantum = 65536;
 constexpr const char * ConfigSection = "upse-ng";
 
+struct PlaybackPreferenceKeys
+{
+    const char * gain_policy;
+    const char * length_policy;
+    const char * length_seconds;
+    const char * fade_policy;
+    const char * fade_seconds;
+    const char * name;
+};
+
+constexpr PlaybackPreferenceKeys Psf1PreferenceKeys = {
+    "psf1_gain_policy",
+    "psf1_length_policy",
+    "psf1_length_seconds",
+    "psf1_fade_policy",
+    "psf1_fade_seconds",
+    "PSF1",
+};
+
+constexpr PlaybackPreferenceKeys Psf2PreferenceKeys = {
+    "psf2_gain_policy",
+    "psf2_length_policy",
+    "psf2_length_seconds",
+    "psf2_fade_policy",
+    "psf2_fade_seconds",
+    "PSF2",
+};
+
 const char * const ConfigDefaults[] = {
+    "psf1_gain_policy", "0",
+    "psf1_length_policy", "0",
+    "psf1_length_seconds", "180",
+    "psf1_fade_policy", "0",
+    "psf1_fade_seconds", "10",
+    "psf2_gain_policy", "0",
+    "psf2_length_policy", "0",
+    "psf2_length_seconds", "180",
+    "psf2_fade_policy", "0",
+    "psf2_fade_seconds", "10",
     "detect_silence", "FALSE",
     "silence_duration", "5000",
     "silence_threshold", "0.000030517578125",
     nullptr,
 };
 
-const PreferencesWidget PreferenceWidgets[] = {
+const ComboItem GainPolicies[] = {
+    {"Apply volume tag", UPSE_GAIN_TAG},
+    {"Ignore volume tag (unity gain)", UPSE_GAIN_OVERRIDE},
+};
+
+const ComboItem LengthPolicies[] = {
+    {"Use tag", UPSE_DURATION_TAG},
+    {"Use tag or setting", UPSE_DURATION_TAG_OR_DEFAULT},
+    {"Always use setting", UPSE_DURATION_OVERRIDE},
+    {"Ignore (play forever)", UPSE_DURATION_IGNORE},
+};
+
+const ComboItem FadePolicies[] = {
+    {"Use tag", UPSE_DURATION_TAG},
+    {"Use tag or setting", UPSE_DURATION_TAG_OR_DEFAULT},
+    {"Always use setting", UPSE_DURATION_OVERRIDE},
+    {"Ignore (no fade)", UPSE_DURATION_IGNORE},
+};
+
+const PreferencesWidget Psf1PreferenceWidgets[] = {
+    WidgetCombo("Gain handling:",
+                WidgetInt(ConfigSection, "psf1_gain_policy"),
+                {GainPolicies, nullptr}),
+    WidgetCombo("Length handling:",
+                WidgetInt(ConfigSection, "psf1_length_policy"),
+                {LengthPolicies, nullptr}),
+    WidgetSpin("Length setting:",
+               WidgetInt(ConfigSection, "psf1_length_seconds"),
+               {0, 86400, 1, "seconds"}),
+    WidgetCombo("Fade handling:",
+                WidgetInt(ConfigSection, "psf1_fade_policy"),
+                {FadePolicies, nullptr}),
+    WidgetSpin("Fade setting:",
+               WidgetInt(ConfigSection, "psf1_fade_seconds"),
+               {0, 3600, 1, "seconds"}),
+};
+
+const PreferencesWidget Psf2PreferenceWidgets[] = {
+    WidgetCombo("Gain handling:",
+                WidgetInt(ConfigSection, "psf2_gain_policy"),
+                {GainPolicies, nullptr}),
+    WidgetCombo("Length handling:",
+                WidgetInt(ConfigSection, "psf2_length_policy"),
+                {LengthPolicies, nullptr}),
+    WidgetSpin("Length setting:",
+               WidgetInt(ConfigSection, "psf2_length_seconds"),
+               {0, 86400, 1, "seconds"}),
+    WidgetCombo("Fade handling:",
+                WidgetInt(ConfigSection, "psf2_fade_policy"),
+                {FadePolicies, nullptr}),
+    WidgetSpin("Fade setting:",
+               WidgetInt(ConfigSection, "psf2_fade_seconds"),
+               {0, 3600, 1, "seconds"}),
+};
+
+const PreferencesWidget GeneralPreferenceWidgets[] = {
     WidgetLabel("<b>Silence detection</b>"),
     WidgetCheck("Stop playback after trailing silence",
                 WidgetBool(ConfigSection, "detect_silence")),
@@ -40,6 +133,16 @@ const PreferencesWidget PreferenceWidgets[] = {
     WidgetSpin("Quiet threshold:",
                WidgetFloat(ConfigSection, "silence_threshold"),
                {0.0, 1.0, 0.00001, "normalized amplitude"}),
+};
+
+const NotebookTab PreferenceTabs[] = {
+    {"PSF1", {Psf1PreferenceWidgets}},
+    {"PSF2", {Psf2PreferenceWidgets}},
+    {"General", {GeneralPreferenceWidgets}},
+};
+
+const PreferencesWidget PreferenceWidgets[] = {
+    WidgetNotebook({PreferenceTabs}),
 };
 
 const PluginPreferences Preferences = {
@@ -126,6 +229,45 @@ bool read_root(VFSFile & file, Index<char> & bytes)
     return bytes.len() >= 4;
 }
 
+bool valid_duration_policy(int policy)
+{
+    return policy >= static_cast<int>(UPSE_DURATION_TAG) &&
+           policy <= static_cast<int>(UPSE_DURATION_IGNORE);
+}
+
+bool configure_playback(upse_playback_config & config,
+                        const PlaybackPreferenceKeys & keys)
+{
+    const int gain_policy =
+        aud_get_int(ConfigSection, keys.gain_policy);
+    const int length_policy =
+        aud_get_int(ConfigSection, keys.length_policy);
+    const int fade_policy =
+        aud_get_int(ConfigSection, keys.fade_policy);
+    const int length_seconds =
+        aud_get_int(ConfigSection, keys.length_seconds);
+    const int fade_seconds =
+        aud_get_int(ConfigSection, keys.fade_seconds);
+    if ((gain_policy != static_cast<int>(UPSE_GAIN_TAG) &&
+         gain_policy != static_cast<int>(UPSE_GAIN_OVERRIDE)) ||
+        !valid_duration_policy(length_policy) ||
+        !valid_duration_policy(fade_policy) || length_seconds < 0 ||
+        fade_seconds < 0)
+    {
+        AUDERR("upse-ng: invalid %s playback settings\n", keys.name);
+        return false;
+    }
+
+    config.gain_policy = static_cast<upse_gain_policy>(gain_policy);
+    config.gain = 1.0;
+    config.length_policy =
+        static_cast<upse_duration_policy>(length_policy);
+    config.length_ms = static_cast<uint64_t>(length_seconds) * 1000;
+    config.fade_policy = static_cast<upse_duration_policy>(fade_policy);
+    config.fade_ms = static_cast<uint64_t>(fade_seconds) * 1000;
+    return true;
+}
+
 PlayerPtr open_player(const char * filename, const Index<char> & bytes,
                       bool playback)
 {
@@ -137,6 +279,12 @@ PlayerPtr open_player(const char * filename, const Index<char> & bytes,
         report_error("initialize configuration", result, nullptr);
         return player;
     }
+
+    if (!configure_playback(config.psf1_playback,
+                            Psf1PreferenceKeys) ||
+        !configure_playback(config.psf2_playback,
+                            Psf2PreferenceKeys))
+        return player;
 
     if (playback && aud_get_bool(ConfigSection, "detect_silence"))
     {
@@ -260,10 +408,10 @@ void fill_tuple(Tuple & tuple, upse_player * player,
     }
 
     uint64_t length = 0;
-    if (upse_player_length_frames(player, &length))
+    if (upse_player_effective_length_frames(player, &length))
     {
         uint64_t fade = 0;
-        if (upse_player_fade_frames(player, &fade))
+        if (upse_player_effective_fade_frames(player, &fade))
             length = UINT64_MAX - length < fade ? UINT64_MAX : length + fade;
         tuple.set_int(Tuple::Length,
                       frames_to_milliseconds(length, format.sample_rate));

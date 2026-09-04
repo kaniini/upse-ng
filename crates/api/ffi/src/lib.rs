@@ -17,9 +17,9 @@ use std::{
 };
 
 use upse::{
-    AudioAction, AudioBlock, DependencyLimits, Limits, LoadError, ParseLimits, Player,
-    PlayerBuilder, PlayerError, RenderOutcome, ResolvedFile, Resolver, ResolverError,
-    SilenceDetection, SilenceError,
+    AudioAction, AudioBlock, DependencyLimits, DurationPolicy, GainPolicy, Limits, LoadError,
+    ParseLimits, PlaybackConfig, Player, PlayerBuilder, PlayerError, RenderOutcome, ResolvedFile,
+    Resolver, ResolverError, SilenceDetection, SilenceError,
 };
 
 /// Stable C operation result and error category.
@@ -30,9 +30,13 @@ pub type upse_audio_action = i32;
 pub type upse_render_kind = u32;
 /// Stable metadata field identifier.
 pub type upse_metadata_field = u32;
+/// Stable post-emulation gain policy.
+pub type upse_gain_policy = u32;
+/// Stable length or fade duration policy.
+pub type upse_duration_policy = u32;
 
 /// Current configuration/header ABI version.
-pub const UPSE_ABI_VERSION: u32 = 2;
+pub const UPSE_ABI_VERSION: u32 = 3;
 /// Operation succeeded.
 pub const UPSE_RESULT_OK: upse_result = 0;
 /// A required pointer, size, enum, or UTF-8 string was invalid.
@@ -61,7 +65,7 @@ pub const UPSE_CALLBACK_ERROR: upse_audio_action = 2;
 
 /// Render delivered the requested frame count.
 pub const UPSE_RENDER_COMPLETE: upse_render_kind = 0;
-/// Render reached the declared length-plus-fade end.
+/// Render reached the configured length-plus-fade end.
 pub const UPSE_RENDER_END: upse_render_kind = 1;
 /// Callback stopped rendering after consuming its current block.
 pub const UPSE_RENDER_STOPPED: upse_render_kind = 2;
@@ -82,6 +86,20 @@ pub const UPSE_METADATA_COMMENT: upse_metadata_field = 5;
 pub const UPSE_METADATA_COPYRIGHT: upse_metadata_field = 6;
 /// Ripper metadata field.
 pub const UPSE_METADATA_PSF_BY: upse_metadata_field = 7;
+
+/// Apply the PSF `volume` tag.
+pub const UPSE_GAIN_TAG: upse_gain_policy = 0;
+/// Ignore the tag and apply the configured gain coefficient.
+pub const UPSE_GAIN_OVERRIDE: upse_gain_policy = 1;
+
+/// Use the PSF duration tag and its format-defined absent default.
+pub const UPSE_DURATION_TAG: upse_duration_policy = 0;
+/// Use the PSF duration tag or the configured fallback when absent.
+pub const UPSE_DURATION_TAG_OR_DEFAULT: upse_duration_policy = 1;
+/// Ignore the tag and use the configured duration.
+pub const UPSE_DURATION_OVERRIDE: upse_duration_policy = 2;
+/// Ignore the tag; length becomes indefinite and fade becomes zero.
+pub const UPSE_DURATION_IGNORE: upse_duration_policy = 3;
 
 /// C callback invoked synchronously with borrowed stereo floating-point frames.
 pub type upse_audio_callback = Option<
@@ -106,7 +124,38 @@ pub type upse_resolve_callback = Option<
     ) -> upse_result,
 >;
 
-/// Sized root/parser/dependency configuration.
+/// Gain, length, and fade policy for one PSF format version.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct upse_playback_config {
+    /// Gain coefficient used by [`UPSE_GAIN_OVERRIDE`].
+    pub gain: f64,
+    /// Length in milliseconds used by a configured duration policy.
+    pub length_ms: u64,
+    /// Fade in milliseconds used by a configured duration policy.
+    pub fade_ms: u64,
+    /// One of the `UPSE_GAIN_*` constants.
+    pub gain_policy: upse_gain_policy,
+    /// One of the `UPSE_DURATION_*` constants.
+    pub length_policy: upse_duration_policy,
+    /// One of the `UPSE_DURATION_*` constants.
+    pub fade_policy: upse_duration_policy,
+}
+
+impl Default for upse_playback_config {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            length_ms: 0,
+            fade_ms: 0,
+            gain_policy: UPSE_GAIN_TAG,
+            length_policy: UPSE_DURATION_TAG,
+            fade_policy: UPSE_DURATION_TAG,
+        }
+    }
+}
+
+/// Sized parser, dependency, and per-format playback configuration.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct upse_config {
@@ -134,6 +183,10 @@ pub struct upse_config {
     pub trailing_silence_ms: u64,
     /// Maximum absolute normalized sample amplitude considered quiet.
     pub silence_threshold: f32,
+    /// Gain and timeline policy selected for PSF1 files.
+    pub psf1_playback: upse_playback_config,
+    /// Gain and timeline policy selected for PSF2 files.
+    pub psf2_playback: upse_playback_config,
 }
 
 impl Default for upse_config {
@@ -154,6 +207,8 @@ impl Default for upse_config {
                 .unwrap_or(u64::MAX),
             trailing_silence_ms: 0,
             silence_threshold: SilenceDetection::default().threshold,
+            psf1_playback: upse_playback_config::default(),
+            psf2_playback: upse_playback_config::default(),
         }
     }
 }
@@ -543,7 +598,7 @@ pub unsafe extern "C" fn upse_player_metadata(
     })
 }
 
-/// Returns the parsed post-mix volume or zero for a null player.
+/// Returns the parsed `volume` tag coefficient or zero for a null player.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn upse_player_volume(player: *const upse_player) -> f64 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -568,6 +623,33 @@ pub unsafe extern "C" fn upse_player_fade_frames(
     output: *mut u64,
 ) -> i32 {
     optional_duration_frames(player, output, false)
+}
+
+/// Returns the resolved gain or zero for a null player.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn upse_player_effective_gain(player: *const upse_player) -> f64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        player_ref(player).map_or(0.0, |player| player.player.effective_gain())
+    }))
+    .unwrap_or(0.0)
+}
+
+/// Writes the resolved native length and returns one when playback is finite.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn upse_player_effective_length_frames(
+    player: *const upse_player,
+    output: *mut u64,
+) -> i32 {
+    effective_duration_frames(player, output, true)
+}
+
+/// Writes the resolved native fade and returns one for a valid player.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn upse_player_effective_fade_frames(
+    player: *const upse_player,
+    output: *mut u64,
+) -> i32 {
+    effective_duration_frames(player, output, false)
 }
 
 /// Returns timeline frames rendered or advanced since open/reset.
@@ -656,7 +738,9 @@ fn configured_builder(config: *const upse_config) -> Result<PlayerBuilder, FfiEr
     };
     let mut builder = PlayerBuilder::new()
         .limits(limits)
-        .callback_quantum(quantum);
+        .callback_quantum(quantum)
+        .psf1_playback(playback_config(config.psf1_playback, "PSF1")?)
+        .psf2_playback(playback_config(config.psf2_playback, "PSF2")?);
     if config.trailing_silence_ms != 0 {
         builder = builder.silence_detection(SilenceDetection::new(
             config.silence_threshold,
@@ -664,6 +748,41 @@ fn configured_builder(config: *const upse_config) -> Result<PlayerBuilder, FfiEr
         ));
     }
     Ok(builder)
+}
+
+fn playback_config(config: upse_playback_config, format: &str) -> Result<PlaybackConfig, FfiError> {
+    let gain = match config.gain_policy {
+        UPSE_GAIN_TAG => GainPolicy::Tag,
+        UPSE_GAIN_OVERRIDE => GainPolicy::Override(config.gain),
+        policy => {
+            return Err(FfiError::invalid(format!(
+                "invalid {format} gain policy {policy}"
+            )));
+        }
+    };
+    Ok(PlaybackConfig {
+        gain,
+        length: duration_policy(config.length_policy, config.length_ms, format, "length")?,
+        fade: duration_policy(config.fade_policy, config.fade_ms, format, "fade")?,
+    })
+}
+
+fn duration_policy(
+    policy: upse_duration_policy,
+    milliseconds: u64,
+    format: &str,
+    field: &str,
+) -> Result<DurationPolicy, FfiError> {
+    let duration = Duration::from_millis(milliseconds);
+    match policy {
+        UPSE_DURATION_TAG => Ok(DurationPolicy::Tag),
+        UPSE_DURATION_TAG_OR_DEFAULT => Ok(DurationPolicy::TagOr(duration)),
+        UPSE_DURATION_OVERRIDE => Ok(DurationPolicy::Override(duration)),
+        UPSE_DURATION_IGNORE => Ok(DurationPolicy::Ignore),
+        policy => Err(FfiError::invalid(format!(
+            "invalid {format} {field} policy {policy}"
+        ))),
+    }
 }
 
 fn wrap_player(player: Player) -> upse_player {
@@ -702,6 +821,26 @@ fn optional_duration_frames(player: *const upse_player, output: *mut u64, length
         let Ok(frames) = duration.to_frames_floor(player.player.audio_format().sample_rate())
         else {
             return 0;
+        };
+        unsafe { ptr::write(output, frames) };
+        1
+    }))
+    .unwrap_or(0)
+}
+
+fn effective_duration_frames(player: *const upse_player, output: *mut u64, length: bool) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if player.is_null() || output.is_null() {
+            return 0;
+        }
+        let player = unsafe { &*player };
+        let frames = if length {
+            let Some(frames) = player.player.effective_length_frames() else {
+                return 0;
+            };
+            frames
+        } else {
+            player.player.effective_fade_frames()
         };
         unsafe { ptr::write(output, frames) };
         1
@@ -798,6 +937,9 @@ impl FfiError {
             PlayerError::Duration(_) => UPSE_RESULT_FORMAT,
             PlayerError::UnsupportedVersion => UPSE_RESULT_UNSUPPORTED,
             PlayerError::InvalidQuantum { .. } => UPSE_RESULT_LIMIT,
+            PlayerError::InvalidGain | PlayerError::PlaybackDurationOverflow => {
+                UPSE_RESULT_INVALID_ARGUMENT
+            }
             PlayerError::Silence(
                 SilenceError::InvalidThreshold | SilenceError::InvalidDuration,
             ) => UPSE_RESULT_INVALID_ARGUMENT,
@@ -866,10 +1008,10 @@ mod tests {
     use upse_psf::{PsfBuilder, PsfVersion};
 
     use super::{
-        UPSE_ABI_VERSION, UPSE_METADATA_TITLE, UPSE_RESULT_INVALID_ARGUMENT, UPSE_RESULT_OK,
-        upse_abi_version, upse_audio_format, upse_config, upse_config_init, upse_error,
-        upse_error_code, upse_error_free, upse_player, upse_player_audio_format, upse_player_free,
-        upse_player_metadata, upse_player_open_memory,
+        UPSE_ABI_VERSION, UPSE_GAIN_OVERRIDE, UPSE_METADATA_TITLE, UPSE_RESULT_INVALID_ARGUMENT,
+        UPSE_RESULT_OK, upse_abi_version, upse_audio_format, upse_config, upse_config_init,
+        upse_error, upse_error_code, upse_error_free, upse_player, upse_player_audio_format,
+        upse_player_free, upse_player_metadata, upse_player_open_memory,
     };
 
     fn fixture() -> Vec<u8> {
@@ -930,6 +1072,11 @@ mod tests {
             assert_eq!(config.abi_version, UPSE_ABI_VERSION);
             assert_eq!(config.trailing_silence_ms, 0);
             assert!(config.silence_threshold > 0.0);
+            assert_eq!(config.psf1_playback.gain_policy, 0);
+            assert!((config.psf1_playback.gain - 1.0).abs() < f64::EPSILON);
+            assert_eq!(config.psf1_playback.length_policy, 0);
+            assert_eq!(config.psf1_playback.fade_policy, 0);
+            assert_eq!(config.psf2_playback.gain_policy, 0);
             let origin = CString::new("fixture.psf").unwrap();
             let mut player: *mut upse_player = ptr::null_mut();
             let mut error: *mut upse_error = ptr::null_mut();
@@ -992,6 +1139,49 @@ mod tests {
             assert!(player.is_null());
             assert_eq!(upse_error_code(error), UPSE_RESULT_INVALID_ARGUMENT);
             upse_error_free(error);
+        }
+    }
+
+    #[test]
+    fn invalid_playback_configuration_is_a_c_argument_error() {
+        let bytes = fixture();
+        for config in [
+            upse_config {
+                psf1_playback: super::upse_playback_config {
+                    length_policy: u32::MAX,
+                    ..super::upse_playback_config::default()
+                },
+                ..upse_config::default()
+            },
+            upse_config {
+                psf2_playback: super::upse_playback_config {
+                    gain: f64::INFINITY,
+                    gain_policy: UPSE_GAIN_OVERRIDE,
+                    ..super::upse_playback_config::default()
+                },
+                ..upse_config::default()
+            },
+        ] {
+            unsafe {
+                let origin = CString::new("fixture.psf").unwrap();
+                let mut player: *mut upse_player = ptr::null_mut();
+                let mut error: *mut upse_error = ptr::null_mut();
+                assert_eq!(
+                    upse_player_open_memory(
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        origin.as_ptr(),
+                        &raw const config,
+                        ptr::null(),
+                        &raw mut player,
+                        &raw mut error,
+                    ),
+                    UPSE_RESULT_INVALID_ARGUMENT
+                );
+                assert!(player.is_null());
+                assert_eq!(upse_error_code(error), UPSE_RESULT_INVALID_ARGUMENT);
+                upse_error_free(error);
+            }
         }
     }
 }

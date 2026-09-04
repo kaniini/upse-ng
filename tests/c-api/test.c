@@ -407,6 +407,103 @@ static int test_seek_equivalence(const struct bytes *module) {
   return passed;
 }
 
+static int test_playback_configuration(const struct bytes *psf1,
+                                       const struct bytes *psf2) {
+  float psf1_samples[256];
+  float psf2_samples[2600];
+  struct collector psf1_collector = {
+      psf1_samples, ARRAY_LENGTH(psf1_samples), 0, 0, UPSE_CALLBACK_CONTINUE};
+  struct collector psf2_collector = {
+      psf2_samples, ARRAY_LENGTH(psf2_samples), 0, 0, UPSE_CALLBACK_CONTINUE};
+  upse_config config;
+  upse_player *psf1_player = NULL;
+  upse_player *psf2_player = NULL;
+  upse_error *error = NULL;
+  upse_render_outcome outcome = {sizeof(outcome), 0, 0};
+  uint64_t duration_frames;
+  size_t index;
+  int passed = 1;
+
+  if (!check(upse_config_init(&config) == UPSE_RESULT_OK,
+             "playback config init")) {
+    return 0;
+  }
+  config.callback_quantum = 64;
+  config.psf1_playback.gain_policy = UPSE_GAIN_OVERRIDE;
+  config.psf1_playback.gain = 0.0;
+  config.psf1_playback.length_policy = UPSE_DURATION_OVERRIDE;
+  config.psf1_playback.length_ms = 1;
+  config.psf1_playback.fade_policy = UPSE_DURATION_IGNORE;
+  config.psf2_playback.length_policy = UPSE_DURATION_IGNORE;
+  config.psf2_playback.fade_policy = UPSE_DURATION_IGNORE;
+
+  if (!check(upse_player_open_memory(psf1->data, psf1->size,
+                                     "configured.psf", &config, NULL,
+                                     &psf1_player, &error) == UPSE_RESULT_OK,
+             "configured PSF1 open") ||
+      !check(upse_player_set_callback(psf1_player, collect_audio,
+                                      &psf1_collector,
+                                      &error) == UPSE_RESULT_OK,
+             "configured PSF1 callback") ||
+      !check(upse_player_effective_gain(psf1_player) == 0.0,
+             "configured PSF1 effective gain") ||
+      !check(upse_player_effective_length_frames(psf1_player,
+                                                 &duration_frames) &&
+                 duration_frames == 44,
+             "configured PSF1 effective length") ||
+      !check(upse_player_effective_fade_frames(psf1_player,
+                                               &duration_frames) &&
+                 duration_frames == 0,
+             "configured PSF1 effective fade") ||
+      !check(upse_player_render(psf1_player, 100, &outcome, &error) ==
+                     UPSE_RESULT_OK &&
+                 outcome.kind == UPSE_RENDER_END && outcome.frames == 44,
+             "configured PSF1 length")) {
+    passed = 0;
+    goto cleanup;
+  }
+  for (index = 0; index < psf1_collector.count; ++index) {
+    if (psf1_collector.samples[index] != 0.0f) {
+      passed = check(0, "configured PSF1 gain");
+      goto cleanup;
+    }
+  }
+
+  outcome.size = sizeof(outcome);
+  if (!check(upse_player_open_memory(psf2->data, psf2->size,
+                                     "configured.psf2", &config, NULL,
+                                     &psf2_player, &error) == UPSE_RESULT_OK,
+             "configured PSF2 open") ||
+      !check(upse_player_set_callback(psf2_player, collect_audio,
+                                      &psf2_collector,
+                                      &error) == UPSE_RESULT_OK,
+             "configured PSF2 callback") ||
+      !check(!upse_player_effective_length_frames(psf2_player,
+                                                  &duration_frames),
+             "configured PSF2 effective length") ||
+      !check(upse_player_effective_fade_frames(psf2_player,
+                                               &duration_frames) &&
+                 duration_frames == 0,
+             "configured PSF2 effective fade") ||
+      !check(upse_player_render(psf2_player, 1300, &outcome, &error) ==
+                     UPSE_RESULT_OK &&
+                 outcome.kind == UPSE_RENDER_COMPLETE &&
+                 outcome.frames == 1300,
+             "configured PSF2 indefinite length")) {
+    passed = 0;
+  }
+
+cleanup:
+  if (!passed && error != NULL) {
+    fprintf(stderr, "playback configuration diagnostic: %s\n",
+            upse_error_message(error));
+  }
+  upse_error_free(error);
+  upse_player_free(psf1_player);
+  upse_player_free(psf2_player);
+  return passed;
+}
+
 static uint64_t hash_samples(const float *samples, size_t count) {
   const unsigned char *bytes = (const unsigned char *)samples;
   uint64_t hash = UINT64_C(1469598103934665603);
@@ -580,7 +677,9 @@ int main(int argc, char **argv) {
   }
   passed = test_success_and_callbacks(&module, argv[1]) &&
            test_nulls_and_sizes() && test_resolver_ownership(&root, &library) &&
-           test_seek_equivalence(&module) && test_parallel_handles(&module) &&
+           test_seek_equivalence(&module) &&
+           test_playback_configuration(&module, &psf2_module) &&
+           test_parallel_handles(&module) &&
            test_psf2(&psf2_module, argv[4]) &&
            test_parallel_formats(&module, &psf2_module);
   free(module.data);

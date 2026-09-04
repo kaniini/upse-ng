@@ -24,7 +24,7 @@
 /**
  * Current configuration/header ABI version.
  */
-#define UPSE_ABI_VERSION 2
+#define UPSE_ABI_VERSION 3
 
 /**
  * Opaque owned error handle.
@@ -42,7 +42,47 @@ typedef struct upse_player upse_player;
 typedef int32_t upse_result;
 
 /**
- * Sized root/parser/dependency configuration.
+ * Stable post-emulation gain policy.
+ */
+typedef uint32_t upse_gain_policy;
+
+/**
+ * Stable length or fade duration policy.
+ */
+typedef uint32_t upse_duration_policy;
+
+/**
+ * Gain, length, and fade policy for one PSF format version.
+ */
+typedef struct upse_playback_config {
+  /**
+   * Gain coefficient used by [`UPSE_GAIN_OVERRIDE`].
+   */
+  double gain;
+  /**
+   * Length in milliseconds used by a configured duration policy.
+   */
+  uint64_t length_ms;
+  /**
+   * Fade in milliseconds used by a configured duration policy.
+   */
+  uint64_t fade_ms;
+  /**
+   * One of the `UPSE_GAIN_*` constants.
+   */
+  upse_gain_policy gain_policy;
+  /**
+   * One of the `UPSE_DURATION_*` constants.
+   */
+  upse_duration_policy length_policy;
+  /**
+   * One of the `UPSE_DURATION_*` constants.
+   */
+  upse_duration_policy fade_policy;
+} upse_playback_config;
+
+/**
+ * Sized parser, dependency, and per-format playback configuration.
  */
 typedef struct upse_config {
   /**
@@ -93,6 +133,14 @@ typedef struct upse_config {
    * Maximum absolute normalized sample amplitude considered quiet.
    */
   float silence_threshold;
+  /**
+   * Gain and timeline policy selected for PSF1 files.
+   */
+  struct upse_playback_config psf1_playback;
+  /**
+   * Gain and timeline policy selected for PSF2 files.
+   */
+  struct upse_playback_config psf2_playback;
 } upse_config;
 
 /**
@@ -278,7 +326,7 @@ typedef uint32_t upse_metadata_field;
 #define UPSE_RENDER_COMPLETE 0
 
 /**
- * Render reached the declared length-plus-fade end.
+ * Render reached the configured length-plus-fade end.
  */
 #define UPSE_RENDER_END 1
 
@@ -326,6 +374,36 @@ typedef uint32_t upse_metadata_field;
  * Ripper metadata field.
  */
 #define UPSE_METADATA_PSF_BY 7
+
+/**
+ * Apply the PSF `volume` tag.
+ */
+#define UPSE_GAIN_TAG 0
+
+/**
+ * Ignore the tag and apply the configured gain coefficient.
+ */
+#define UPSE_GAIN_OVERRIDE 1
+
+/**
+ * Use the PSF duration tag and its format-defined absent default.
+ */
+#define UPSE_DURATION_TAG 0
+
+/**
+ * Use the PSF duration tag or the configured fallback when absent.
+ */
+#define UPSE_DURATION_TAG_OR_DEFAULT 1
+
+/**
+ * Ignore the tag and use the configured duration.
+ */
+#define UPSE_DURATION_OVERRIDE 2
+
+/**
+ * Ignore the tag; length becomes indefinite and fade becomes zero.
+ */
+#define UPSE_DURATION_IGNORE 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -410,7 +488,7 @@ const char *upse_player_metadata(const struct upse_player *player,
                                  upse_metadata_field field);
 
 /**
- * Returns the parsed post-mix volume or zero for a null player.
+ * Returns the parsed `volume` tag coefficient or zero for a null player.
  */
 UPSE_API double upse_player_volume(const struct upse_player *player);
 
@@ -423,6 +501,25 @@ UPSE_API int32_t upse_player_length_frames(const struct upse_player *player, uin
  * Writes exact native fade frames and returns one for a valid player.
  */
 UPSE_API int32_t upse_player_fade_frames(const struct upse_player *player, uint64_t *output);
+
+/**
+ * Returns the resolved gain or zero for a null player.
+ */
+UPSE_API double upse_player_effective_gain(const struct upse_player *player);
+
+/**
+ * Writes the resolved native length and returns one when playback is finite.
+ */
+UPSE_API
+int32_t upse_player_effective_length_frames(const struct upse_player *player,
+                                            uint64_t *output);
+
+/**
+ * Writes the resolved native fade and returns one for a valid player.
+ */
+UPSE_API
+int32_t upse_player_effective_fade_frames(const struct upse_player *player,
+                                          uint64_t *output);
 
 /**
  * Returns timeline frames rendered or advanced since open/reset.
