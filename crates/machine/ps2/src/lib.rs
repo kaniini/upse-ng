@@ -228,10 +228,18 @@ fn new_hardware(open_bus: OpenBusPolicy) -> Box<IopMachine<Spu2>> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActiveCallback {
+enum ActiveCallbackKind {
     Kernel,
     Interrupt,
     Timer(TimerId),
+}
+
+#[derive(Clone, Debug)]
+struct ActiveCallback {
+    kind: ActiveCallbackKind,
+    // Host callbacks can interrupt a branch or load delay slot, which is not
+    // represented by the BIOS-visible register context.
+    interrupted_cpu: Cpu,
 }
 
 /// Fully composed IOP-only PSF2 machine with a post-load reset snapshot.
@@ -616,23 +624,23 @@ impl Ps2Machine {
     }
 
     fn handle_return(&mut self) -> Result<MachineStep, MachineError> {
-        if let Some(active) = self.state.callback_active {
+        if let Some(active) = self.state.callback_active.as_ref() {
             let mut context = bios_context(self.state.hardware.cpu());
-            match active {
-                ActiveCallback::Kernel => {
+            match active.kind {
+                ActiveCallbackKind::Kernel => {
                     self.state
                         .bios
                         .kernel_mut()
                         .return_from_callback(&mut context)?;
                 }
-                ActiveCallback::Interrupt => {
+                ActiveCallbackKind::Interrupt => {
                     let memory = IopRam(self.state.hardware.memory_mut());
                     self.state
                         .bios
                         .dispatch_mut()
                         .return_from_exception(&mut context, &memory)?;
                 }
-                ActiveCallback::Timer(timer) => {
+                ActiveCallbackKind::Timer(timer) => {
                     self.state
                         .bios
                         .kernel_mut()
@@ -647,8 +655,14 @@ impl Ps2Machine {
                         .acknowledge(retained);
                 }
             }
-            apply_bios_context(self.state.hardware.cpu_mut(), &context);
-            self.state.callback_active = None;
+            let active = self
+                .state
+                .callback_active
+                .take()
+                .ok_or(MachineError::UnexpectedReturn { pc: RETURN_ENTRY })?;
+            let mut interrupted_cpu = active.interrupted_cpu;
+            apply_bios_context_preserving_pipeline(&mut interrupted_cpu, &context);
+            *self.state.hardware.cpu_mut() = interrupted_cpu;
             return Ok(MachineStep {
                 cycles: 1,
                 kind: MachineStepKind::CallbackReturn,
@@ -740,6 +754,7 @@ impl Ps2Machine {
         if let Some(source) = self.state.hardware.interrupt_controller().first_pending()
             && let Ok(callback) = self.state.bios.handlers().dispatch_interrupt(source as u32)
         {
+            let interrupted_cpu = self.state.hardware.cpu().clone();
             let mut context = bios_context(self.state.hardware.cpu());
             {
                 let mut memory = IopRam(self.state.hardware.memory_mut());
@@ -750,10 +765,14 @@ impl Ps2Machine {
             }
             callback.apply(&mut context);
             apply_bios_context(self.state.hardware.cpu_mut(), &context);
-            self.state.callback_active = Some(ActiveCallback::Interrupt);
+            self.state.callback_active = Some(ActiveCallback {
+                kind: ActiveCallbackKind::Interrupt,
+                interrupted_cpu,
+            });
             return Ok(());
         }
         if let Some(callback) = self.state.interrupt_callbacks.pop_front() {
+            let interrupted_cpu = self.state.hardware.cpu().clone();
             let mut context = bios_context(self.state.hardware.cpu());
             {
                 let mut memory = IopRam(self.state.hardware.memory_mut());
@@ -764,27 +783,38 @@ impl Ps2Machine {
             }
             callback.apply(&mut context);
             apply_bios_context(self.state.hardware.cpu_mut(), &context);
-            self.state.callback_active = Some(ActiveCallback::Interrupt);
+            self.state.callback_active = Some(ActiveCallback {
+                kind: ActiveCallbackKind::Interrupt,
+                interrupted_cpu,
+            });
             return Ok(());
         }
         if let Some((timer, callback)) = self.state.timer_callbacks.pop_front() {
+            let interrupted_cpu = self.state.hardware.cpu().clone();
             let mut context = bios_context(self.state.hardware.cpu());
             self.state
                 .bios
                 .kernel_mut()
                 .enter_callback(&mut context, callback)?;
             apply_bios_context(self.state.hardware.cpu_mut(), &context);
-            self.state.callback_active = Some(ActiveCallback::Timer(timer));
+            self.state.callback_active = Some(ActiveCallback {
+                kind: ActiveCallbackKind::Timer(timer),
+                interrupted_cpu,
+            });
             return Ok(());
         }
         if let Some(callback) = self.state.callbacks.pop_front() {
+            let interrupted_cpu = self.state.hardware.cpu().clone();
             let mut context = bios_context(self.state.hardware.cpu());
             self.state
                 .bios
                 .kernel_mut()
                 .enter_callback(&mut context, callback)?;
             apply_bios_context(self.state.hardware.cpu_mut(), &context);
-            self.state.callback_active = Some(ActiveCallback::Kernel);
+            self.state.callback_active = Some(ActiveCallback {
+                kind: ActiveCallbackKind::Kernel,
+                interrupted_cpu,
+            });
         }
         Ok(())
     }
@@ -1087,6 +1117,20 @@ fn apply_bios_context(cpu: &mut Cpu, context: &CpuContext) {
     apply_service_context(cpu, &service);
 }
 
+fn apply_bios_context_preserving_pipeline(cpu: &mut Cpu, context: &CpuContext) {
+    let interrupted_pc = cpu.pc();
+    for (index, value) in context.registers().iter().copied().enumerate() {
+        cpu.set_register(index, value);
+    }
+    cpu.set_hi_lo(context.hi, context.lo);
+    cpu.cop0_mut().status = context.status;
+    cpu.cop0_mut().cause = context.cause;
+    cpu.cop0_mut().epc = context.epc;
+    if context.pc != interrupted_pc {
+        cpu.set_pc(context.pc);
+    }
+}
+
 const fn timer_interrupt(timer: TimerId) -> upse_iop_irq::InterruptSource {
     match timer {
         TimerId::Timer0 => upse_iop_irq::InterruptSource::Timer0,
@@ -1103,6 +1147,8 @@ mod tests {
     use std::io::Write;
 
     use flate2::{Compression, write::ZlibEncoder};
+    use upse_iop_timers::TimerId;
+    use upse_ps2_bios::RETURN_ENTRY;
     use upse_ps2_bios::{ModuleState, ThreadState};
     use upse_psf::{
         DependencyLimits, LoadPlan, MemoryResolver, ParseLimits, PsfBuilder, PsfVersion, load_plan,
@@ -1316,6 +1362,52 @@ mod tests {
             std::mem::size_of::<Ps2Machine>(),
             2 * std::mem::size_of::<usize>()
         );
+    }
+
+    #[test]
+    fn timer_callbacks_preserve_an_interrupted_branch_delay_slot() {
+        const BRANCH: u32 = 0x001f_0000;
+        const TARGET: u32 = BRANCH + 0x20;
+        const CALLBACK: u32 = BRANCH + 0x100;
+
+        let mut machine = Ps2Machine::from_plan(&fixture_plan(), MachineConfig::default()).unwrap();
+        let memory = machine.state.hardware.memory_mut();
+        memory
+            .write_u32(BRANCH, 0x0800_0000 | ((TARGET >> 2) & 0x03ff_ffff))
+            .unwrap();
+        memory.write_u32(BRANCH + 4, 0x2408_0001).unwrap();
+        memory.write_u32(BRANCH + 8, 0x0007_000d).unwrap();
+        memory.write_u32(TARGET, 0x2409_0002).unwrap();
+        memory.write_u32(CALLBACK, 0x03e0_0008).unwrap();
+        memory.write_u32(CALLBACK + 4, 0).unwrap();
+        machine.state.hardware.cpu_mut().set_pc(BRANCH);
+
+        machine.step().unwrap();
+        assert_eq!(machine.pc(), BRANCH + 4);
+        machine.state.timer_callbacks.push_back((
+            TimerId::Timer4,
+            upse_ps2_bios::CallbackRequest {
+                entry: CALLBACK,
+                argument: 0,
+                return_address: RETURN_ENTRY,
+                source: TimerId::Timer4 as u32,
+            },
+        ));
+
+        machine.step().unwrap();
+        machine.step().unwrap();
+        assert_eq!(machine.pc(), RETURN_ENTRY);
+        assert_eq!(
+            machine.step().unwrap().kind,
+            super::MachineStepKind::CallbackReturn
+        );
+        assert_eq!(machine.pc(), BRANCH + 4);
+
+        machine.step().unwrap();
+        assert_eq!(machine.pc(), TARGET);
+        machine.step().unwrap();
+        assert_eq!(machine.state.hardware.cpu().register(8), Some(1));
+        assert_eq!(machine.state.hardware.cpu().register(9), Some(2));
     }
 
     fn generated_irx() -> Vec<u8> {
