@@ -635,8 +635,11 @@ impl BiosHle {
             (BiosVector::A0, 0x3d) | (BiosVector::B0, 0x3e) => Self::gets(context, memory)?,
             (BiosVector::A0, 0x3e) | (BiosVector::B0, 0x3f) => self.puts(context, memory)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
+            (BiosVector::A0, 0x43) | (BiosVector::B0, 0x5b) => 6,
             (BiosVector::A0, 0x44) => 12,
-            (BiosVector::A0, 0x5a | 0x8e | 0x8f) => {
+            (BiosVector::A0, 0x5a | 0x65..=0x6f | 0x8e..=0x8f | 0x97 | 0xab..=0xaf)
+            | (BiosVector::B0, 0x4d..=0x50 | 0x58 | 0x5c..=0x5d)
+            | (BiosVector::C0, 0x1a | 0x1d) => {
                 context.return_value(0);
                 6
             }
@@ -682,7 +685,6 @@ impl BiosHle {
             (BiosVector::B0, 0x4c) => self.stop_card(),
             (BiosVector::B0, 0x56) => self.get_function_table(context, memory, BiosVector::C0)?,
             (BiosVector::B0, 0x57) => self.get_function_table(context, memory, BiosVector::B0)?,
-            (BiosVector::B0, 0x5b) => 6,
             (BiosVector::C0, 0x00) => self.initialize_timer_and_vblank_handlers(context),
             (BiosVector::C0, 0x01) => self.initialize_syscall_handler(context),
             (BiosVector::C0, 0x02) => self.enqueue_interrupt(context)?,
@@ -4050,6 +4052,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.register(V0), Some(0));
+    }
+
+    #[test]
+    fn exec_and_memory_card_calls_are_non_failing_stubs() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 8]);
+        let mut context = CpuContext::reset(0x00a0, 0x200);
+        context.set_register(RA, 0x500);
+        context.set_register(T1, 0x43);
+        context.set_register(V0, 0xfeed_beef);
+        bios.dispatch(BiosVector::A0, &mut context, &mut memory)
+            .unwrap();
+        assert_eq!(context.register(V0), Some(0xfeed_beef));
+        assert_eq!(context.pc, 0x500);
+
+        let calls = [
+            (BiosVector::A0, 0x65),
+            (BiosVector::A0, 0x66),
+            (BiosVector::A0, 0x6f),
+            (BiosVector::A0, 0x97),
+            (BiosVector::A0, 0xab),
+            (BiosVector::A0, 0xad),
+            (BiosVector::A0, 0xae),
+            (BiosVector::A0, 0xaf),
+            (BiosVector::B0, 0x4d),
+            (BiosVector::B0, 0x50),
+            (BiosVector::B0, 0x58),
+            (BiosVector::B0, 0x5c),
+            (BiosVector::B0, 0x5d),
+            (BiosVector::C0, 0x1a),
+            (BiosVector::C0, 0x1d),
+        ];
+        for (vector, function) in calls {
+            context.pc = 0x100;
+            context.set_register(RA, 0x500);
+            context.set_register(T1, function);
+            context.set_register(V0, 0xfeed_beef);
+            bios.dispatch(vector, &mut context, &mut memory).unwrap();
+            assert_eq!(context.register(V0), Some(0));
+            assert_eq!(context.pc, 0x500);
+        }
     }
 
     #[test]
