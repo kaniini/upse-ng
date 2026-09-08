@@ -45,6 +45,13 @@ const EVENT_SPEC_INTERRUPTED: u32 = 0x0000_0002;
 const EVENT_SPEC_COMMAND_COMPLETE: u32 = 0x0000_0020;
 const EVENT_SPEC_INTERRUPT: u32 = 0x0000_1000;
 const EVENT_CLASS_SPU: u32 = 0xf000_0009;
+// Some executables identify retail, development, and emulator BIOSes by
+// probing these fixed words. Keep the HLE ROM strict outside this identity.
+const BIOS_KERNEL_PADDING_WORD: u32 = 0x1fc0_00fc;
+const BIOS_KERNEL_NAME_WORD: u32 = 0x1fc0_012c;
+const BIOS_KERNEL_NAME_VALUE: u32 = 0x2d58_4543;
+const BIOS_KERNEL_CODE_WORD: u32 = 0x1fc0_1000;
+const BIOS_KERNEL_CODE_VALUE: u32 = 0x2673_0004;
 const BIOS_REGION_BYTE: u32 = 0x1fc7_ff52;
 const AKAO_DRIVER_EVENT_RETURN: u32 = 0x8005_b0d0;
 const AKAO_DRIVER_EVENT_HANDLE: u32 = 0xf100_0001;
@@ -1053,6 +1060,15 @@ impl Bus for MachineBus<'_> {
                     "unmodeled PS1 MMIO read at {physical:#010x}"
                 ))),
             },
+            MemoryRegion::HleRom { physical } => match physical {
+                BIOS_KERNEL_PADDING_WORD => Ok(0),
+                BIOS_KERNEL_NAME_WORD => Ok(BIOS_KERNEL_NAME_VALUE),
+                BIOS_KERNEL_CODE_WORD => Ok(BIOS_KERNEL_CODE_VALUE),
+                _ => self
+                    .memory
+                    .read_decoded_u32(address, region)
+                    .map_err(bus_fault),
+            },
             _ => self
                 .memory
                 .read_decoded_u32(address, region)
@@ -1203,8 +1219,9 @@ mod tests {
     use upse_scheduler::Scheduler;
 
     use super::{
-        BiosMemory, CPU_HZ, EVENT_SPEC_INTERRUPTED, GP1, IDLE_ADVANCE_CYCLES, MachineConfig,
-        MachineEvent, MachineStepKind, Ps1Machine, StepEvent, VBlankClock, VideoStandard,
+        BIOS_KERNEL_CODE_VALUE, BIOS_KERNEL_NAME_VALUE, BiosMemory, CPU_HZ, EVENT_SPEC_INTERRUPTED,
+        GP1, IDLE_ADVANCE_CYCLES, MachineConfig, MachineEvent, MachineStepKind, Ps1Machine,
+        StepEvent, VBlankClock, VideoStandard,
     };
 
     #[test]
@@ -1394,6 +1411,42 @@ mod tests {
 
             assert_eq!(machine.state.cpu.register(9), Some(expected));
         }
+    }
+
+    #[test]
+    fn bios_identity_words_describe_a_retail_kernel() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let program = 0x8001_8000;
+        machine
+            .state
+            .memory
+            .write_u32(program, instruction_lui(8, 0xbfc0))
+            .unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(program + 4, instruction_lw(9, 0x00fc, 8))
+            .unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(program + 8, instruction_lw(10, 0x012c, 8))
+            .unwrap();
+        machine
+            .state
+            .memory
+            .write_u32(program + 12, instruction_lw(11, 0x1000, 8))
+            .unwrap();
+        machine.state.cpu.set_pc(program);
+
+        for _ in 0..4 {
+            machine.step().unwrap();
+        }
+
+        assert_eq!(machine.state.cpu.register(9), Some(0));
+        assert_eq!(machine.state.cpu.register(10), Some(BIOS_KERNEL_NAME_VALUE));
+        assert_eq!(machine.state.cpu.register(11), Some(BIOS_KERNEL_CODE_VALUE));
     }
 
     #[test]
