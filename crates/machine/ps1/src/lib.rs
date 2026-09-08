@@ -27,7 +27,7 @@ use upse_ps1_spu::{
 };
 use upse_ps1_timers::{
     CPU_HZ, ClockInput, InterruptSink as TimerInterruptSink, RootCounters, TIMER_BASE, TimerError,
-    VBlankClock, VideoStandard,
+    TimerId, TimerRegister, VBlankClock, VideoStandard,
 };
 use upse_psf::{Psf1LoadPlan, RefreshRate};
 use upse_psx_exe::{ExecutableImage, ImageError};
@@ -639,6 +639,7 @@ impl Ps1Machine {
                     source,
                 })?
         };
+        self.apply_root_counter_bios_call(vector, function, arguments, &mut context);
         self.apply_driver_bios_return_quirks(vector, function, &mut context);
         if outcome.action == HleAction::Call {
             self.state.libc_cpu = Some(saved_cpu);
@@ -662,6 +663,79 @@ impl Ps1Machine {
             cycles: outcome.cycles,
             kind: MachineStepKind::Bios(vector),
         })
+    }
+
+    fn apply_root_counter_bios_call(
+        &mut self,
+        vector: BiosVector,
+        function: u8,
+        arguments: [u32; 4],
+        context: &mut CpuContext,
+    ) {
+        if vector != BiosVector::B0 || arguments[0] & 0xffff_fffc != 0xf200_0000 {
+            return;
+        }
+        let index = arguments[0].to_le_bytes()[0] & 3;
+        let interrupt = match index {
+            0 => InterruptSource::Timer0,
+            1 => InterruptSource::Timer1,
+            2 => InterruptSource::Timer2,
+            3 => InterruptSource::VBlank,
+            _ => unreachable!("root-counter handle is two bits"),
+        };
+        let timer = match index {
+            0 => Some(TimerId::Timer0),
+            1 => Some(TimerId::Timer1),
+            2 => Some(TimerId::Timer2),
+            3 => None,
+            _ => unreachable!("root-counter handle is two bits"),
+        };
+        match (function, timer) {
+            (0x02, Some(timer)) => {
+                let target = arguments[1].to_le_bytes();
+                self.state.timers.write_register(
+                    timer,
+                    TimerRegister::Target,
+                    u16::from_le_bytes([target[0], target[1]]),
+                );
+                let mut mode = 1 << 3;
+                mode |= match timer {
+                    TimerId::Timer0 | TimerId::Timer1 => 1 << 8,
+                    TimerId::Timer2 => 1 << 9,
+                };
+                if arguments[2] & 0x1000 != 0 {
+                    mode |= (1 << 4) | (1 << 6);
+                }
+                self.state
+                    .timers
+                    .write_register(timer, TimerRegister::Mode, mode);
+            }
+            (0x03, Some(timer)) => {
+                context.set_register(
+                    2,
+                    u32::from(
+                        self.state
+                            .timers
+                            .read_register(timer, TimerRegister::Counter),
+                    ),
+                );
+            }
+            (0x04, _) => self
+                .state
+                .irq
+                .set_mask(self.state.irq.mask() | interrupt.bit()),
+            (0x05, _) => self
+                .state
+                .irq
+                .set_mask(self.state.irq.mask() & !interrupt.bit()),
+            (0x06, Some(timer)) => {
+                self.state
+                    .timers
+                    .write_register(timer, TimerRegister::Counter, 0);
+                self.state.irq.acknowledge(!interrupt.bit());
+            }
+            _ => {}
+        }
     }
 
     fn apply_driver_bios_return_quirks(
@@ -1547,7 +1621,7 @@ mod tests {
         let outcome = machine.step().unwrap();
         assert_eq!(outcome.kind, MachineStepKind::Syscall(1));
         assert_eq!(outcome.cycles, 7);
-        assert_eq!(machine.pc(), 0x8001_0100);
+        assert_eq!(machine.pc(), wrapper + 8);
         assert_eq!(machine.state.cpu.cop0().status & 0x0f, 1);
         assert!(!machine.state.bios.interrupts_enabled());
 
@@ -1561,7 +1635,7 @@ mod tests {
         machine.step().unwrap();
         let outcome = machine.step().unwrap();
         assert_eq!(outcome.kind, MachineStepKind::Syscall(2));
-        assert_eq!(machine.pc(), 0x8001_0200);
+        assert_eq!(machine.pc(), wrapper + 8);
         assert!(machine.state.bios.interrupts_enabled());
 
         machine
@@ -1689,6 +1763,41 @@ mod tests {
         assert_eq!(outcome.cycles, IDLE_ADVANCE_CYCLES);
         assert!(machine.now() > before);
         assert_eq!(machine.pc(), 0x0000_00a0);
+    }
+
+    #[test]
+    fn bios_root_counter_calls_update_hardware_timers_and_irq_mask() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        let mut context = CpuContext::reset(0, 0);
+        let arguments = [0xf200_0001, 0x138, 0x1000, 0];
+
+        machine.apply_root_counter_bios_call(BiosVector::B0, 0x02, arguments, &mut context);
+        assert_eq!(
+            machine
+                .state
+                .timers
+                .read_register(TimerId::Timer1, TimerRegister::Target),
+            0x138
+        );
+        let mode = machine
+            .state
+            .timers
+            .read_register(TimerId::Timer1, TimerRegister::Mode);
+        assert_eq!(mode & 0x178, 0x158);
+
+        machine.apply_root_counter_bios_call(BiosVector::B0, 0x04, arguments, &mut context);
+        assert_ne!(machine.state.irq.mask() & InterruptSource::Timer1.bit(), 0);
+
+        machine
+            .state
+            .timers
+            .write_register(TimerId::Timer1, TimerRegister::Counter, 17);
+        machine.apply_root_counter_bios_call(BiosVector::B0, 0x03, arguments, &mut context);
+        assert_eq!(context.register(2), Some(17));
+
+        machine.apply_root_counter_bios_call(BiosVector::B0, 0x05, arguments, &mut context);
+        assert_eq!(machine.state.irq.mask() & InterruptSource::Timer1.bit(), 0);
     }
 
     #[test]

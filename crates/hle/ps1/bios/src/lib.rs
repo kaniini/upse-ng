@@ -646,6 +646,8 @@ impl BiosHle {
             (BiosVector::A0, 0x9f) => Self::set_memory_size(context, memory)?,
             (BiosVector::B0, 0x00) => self.allocate_kernel_memory(context)?,
             (BiosVector::B0, 0x01) => self.free_kernel_memory(context),
+            (BiosVector::B0, 0x02 | 0x04..=0x06) => Self::root_counter_control(context),
+            (BiosVector::B0, 0x03) => Self::get_root_counter(context),
             (BiosVector::B0, 0x07) => self.deliver_event(context)?,
             (BiosVector::B0, 0x08) => self.open_event(context),
             (BiosVector::B0, 0x09) => self.close_event(context),
@@ -718,10 +720,7 @@ impl BiosHle {
         context: &mut CpuContext,
     ) -> Result<HleOutcome, BiosError> {
         let cycles = match number {
-            0 => {
-                context.pc = context.pc.wrapping_add(4);
-                6
-            }
+            0 => 6,
             1 => {
                 let was_enabled = self.interrupts_enabled;
                 self.interrupts_enabled = false;
@@ -739,9 +738,7 @@ impl BiosHle {
                 });
             }
         };
-        if number != 0 {
-            context.return_to_caller();
-        }
+        context.pc = context.pc.wrapping_add(4);
         Ok(HleOutcome {
             cycles,
             action: HleAction::Return,
@@ -2717,6 +2714,18 @@ impl BiosHle {
         context.return_value(u32::from(previous));
         Ok(6)
     }
+
+    fn root_counter_control(context: &mut CpuContext) -> u32 {
+        let valid = context.argument(0) & 0xffff_fffc == 0xf200_0000;
+        context.return_value(u32::from(valid));
+        12
+    }
+
+    fn get_root_counter(context: &mut CpuContext) -> u32 {
+        let valid = context.argument(0) & 0xffff_fffc == 0xf200_0000;
+        context.return_value(if valid { 0 } else { u32::MAX });
+        8
+    }
 }
 
 fn event_handle(index: usize) -> u32 {
@@ -3029,6 +3038,44 @@ mod tests {
 
         call(&mut bios, BiosVector::B0, 0x4c, [0; 4], &mut memory).unwrap();
         assert!(!bios.card.started);
+    }
+
+    #[test]
+    fn root_counter_calls_accept_bios_counter_handles() {
+        let mut bios = BiosHle::default();
+        let mut memory = Memory(vec![0; 16]);
+        for function in [0x02, 0x04, 0x05, 0x06] {
+            let (context, outcome) = call(
+                &mut bios,
+                BiosVector::B0,
+                function,
+                [0xf200_0001, 0x138, 0x1000, 0],
+                &mut memory,
+            )
+            .unwrap();
+            assert_eq!(context.register(V0), Some(1));
+            assert_eq!(outcome.cycles, 12);
+        }
+        let (counter, outcome) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x03,
+            [0xf200_0001, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(counter.register(V0), Some(0));
+        assert_eq!(outcome.cycles, 8);
+
+        let (invalid, _) = call(
+            &mut bios,
+            BiosVector::B0,
+            0x02,
+            [0xf200_0004, 0, 0, 0],
+            &mut memory,
+        )
+        .unwrap();
+        assert_eq!(invalid.register(V0), Some(0));
     }
 
     #[test]
@@ -3970,15 +4017,21 @@ mod tests {
         bios.dispatch_syscall(1, &mut context).unwrap();
         assert!(!bios.interrupts_enabled());
         assert_eq!(context.register(V0), Some(1));
+        assert_eq!(context.pc, 0x104);
         context.pc = 0x100;
         bios.dispatch_syscall(1, &mut context).unwrap();
         assert_eq!(context.register(V0), Some(0));
+        assert_eq!(context.pc, 0x104);
         context.set_register(V0, 0xfeed_beef);
+        context.pc = 0x100;
         bios.dispatch_syscall(2, &mut context).unwrap();
         assert!(bios.interrupts_enabled());
         assert_eq!(context.register(V0), Some(0xfeed_beef));
+        assert_eq!(context.pc, 0x104);
+        context.pc = 0x100;
         bios.dispatch_syscall(2, &mut context).unwrap();
         assert!(bios.interrupts_enabled());
+        assert_eq!(context.pc, 0x104);
 
         let mut memory = Memory(vec![0; 8]);
         context.pc = 0x00b0;
