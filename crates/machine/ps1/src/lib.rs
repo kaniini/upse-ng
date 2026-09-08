@@ -1522,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_syscalls_return_from_the_exception_boundary() {
+    fn kernel_syscalls_resume_from_the_exception_boundary() {
         let plan = synthetic_plan();
         let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
         let wrapper = 0x8001_0000;
@@ -1559,6 +1559,21 @@ mod tests {
         let outcome = machine.step().unwrap();
         assert_eq!(outcome.kind, MachineStepKind::Syscall(2));
         assert_eq!(machine.pc(), 0x8001_0200);
+        assert!(machine.state.bios.interrupts_enabled());
+
+        machine
+            .state
+            .memory
+            .write_u32(wrapper, instruction_addiu(4, 0, 0))
+            .unwrap();
+        machine.state.cpu.set_register(2, 0xfeed_beef);
+        machine.state.cpu.set_register(31, 0x8001_0300);
+        machine.state.cpu.set_pc(wrapper);
+        machine.step().unwrap();
+        let outcome = machine.step().unwrap();
+        assert_eq!(outcome.kind, MachineStepKind::Syscall(0));
+        assert_eq!(machine.pc(), wrapper + 8);
+        assert_eq!(machine.state.cpu.register(2), Some(0xfeed_beef));
         assert!(machine.state.bios.interrupts_enabled());
     }
 

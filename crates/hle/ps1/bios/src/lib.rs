@@ -636,6 +636,10 @@ impl BiosHle {
             (BiosVector::A0, 0x3e) | (BiosVector::B0, 0x3f) => self.puts(context, memory)?,
             (BiosVector::A0, 0x3f) => self.printf(context, memory)?,
             (BiosVector::A0, 0x44) => 12,
+            (BiosVector::A0, 0x5a | 0x8e | 0x8f) => {
+                context.return_value(0);
+                6
+            }
             (BiosVector::A0, 0x9f) => Self::set_memory_size(context, memory)?,
             (BiosVector::B0, 0x00) => self.allocate_kernel_memory(context)?,
             (BiosVector::B0, 0x01) => self.free_kernel_memory(context),
@@ -704,13 +708,18 @@ impl BiosHle {
     ///
     /// # Errors
     ///
-    /// Returns [`BiosError::UnsupportedSyscall`] for numbers other than 1 and 2.
+    /// Returns [`BiosError::UnsupportedSyscall`] for numbers other than 0, 1,
+    /// and 2.
     pub fn dispatch_syscall(
         &mut self,
         number: u32,
         context: &mut CpuContext,
     ) -> Result<HleOutcome, BiosError> {
         let cycles = match number {
+            0 => {
+                context.pc = context.pc.wrapping_add(4);
+                6
+            }
             1 => {
                 let was_enabled = self.interrupts_enabled;
                 self.interrupts_enabled = false;
@@ -728,7 +737,9 @@ impl BiosHle {
                 });
             }
         };
-        context.return_to_caller();
+        if number != 0 {
+            context.return_to_caller();
+        }
         Ok(HleOutcome {
             cycles,
             action: HleAction::Return,
@@ -3948,6 +3959,12 @@ mod tests {
         let mut bios = BiosHle::default();
         let mut context = CpuContext::reset(0x100, 0x200);
         context.set_register(RA, 0x300);
+        context.set_register(V0, 0xfeed_beef);
+        bios.dispatch_syscall(0, &mut context).unwrap();
+        assert!(bios.interrupts_enabled());
+        assert_eq!(context.register(V0), Some(0xfeed_beef));
+        assert_eq!(context.pc, 0x104);
+        context.pc = 0x100;
         bios.dispatch_syscall(1, &mut context).unwrap();
         assert!(!bios.interrupts_enabled());
         assert_eq!(context.register(V0), Some(1));
@@ -3979,6 +3996,17 @@ mod tests {
             .unwrap();
         assert_eq!(context.register(V0), Some(0xfeed_beef));
         assert_eq!(context.pc, 0x500);
+
+        for function in [0x5a, 0x8e, 0x8f] {
+            context.pc = 0x00a0;
+            context.set_register(RA, 0x500);
+            context.set_register(T1, function);
+            context.set_register(V0, 0xfeed_beef);
+            bios.dispatch(BiosVector::A0, &mut context, &mut memory)
+                .unwrap();
+            assert_eq!(context.register(V0), Some(0));
+            assert_eq!(context.pc, 0x500);
+        }
 
         for (function, priority) in [(0x00, 1), (0x01, 0), (0x0c, 3)] {
             context.pc = 0x00c0;
