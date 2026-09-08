@@ -84,6 +84,17 @@ impl Gpu {
         Ok(())
     }
 
+    /// Waits for the modeled command port and disables an active DMA mode.
+    ///
+    /// The audio-oriented GPU accepts commands immediately, so synchronization
+    /// cannot time out. The DMA shutdown matches the BIOS `gpu_sync` service.
+    pub fn synchronize(&mut self) -> u32 {
+        if self.status & STATUS_DMA_DIRECTION != 0 {
+            self.set_dma_direction(0);
+        }
+        0
+    }
+
     fn write_gp0(&mut self, value: u32) {
         match value >> 24 {
             0x1f => self.status |= STATUS_IRQ,
@@ -191,6 +202,19 @@ mod tests {
         assert_ne!(gpu.read_register(GP1).unwrap() & STATUS_IRQ, 0);
         gpu.write_register(GP1, 0x0200_0000).unwrap();
         assert_eq!(gpu.read_register(GP1).unwrap() & STATUS_IRQ, 0);
+    }
+
+    #[test]
+    fn synchronization_disables_dma_and_reports_success() {
+        let mut gpu = Gpu::new();
+        gpu.write_register(GP1, 0x0400_0002).unwrap();
+        assert_eq!((gpu.read_register(GP1).unwrap() >> 29) & 3, 2);
+
+        assert_eq!(gpu.synchronize(), 0);
+
+        let status = gpu.read_register(GP1).unwrap();
+        assert_eq!((status >> 29) & 3, 0);
+        assert_eq!(status & STATUS_DMA_REQUEST, 0);
     }
 
     #[test]

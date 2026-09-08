@@ -9,13 +9,14 @@ use thiserror::Error;
 use upse_clock::{ClockError, Deadline, RateConverter, Ticks};
 use upse_ps1_bios::{
     BiosError, BiosHle, BiosVector, CpuContext, GuestMemory, GuestMemoryError, HleAction,
+    HleOutcome,
 };
 use upse_ps1_cdrom::{CDROM_BASE, CDROM_END, CdRom};
 use upse_ps1_dma::{
     DICR, DMA_CHANNEL_END, DMA_CHANNEL_HALFWORD_END, DMA_CHANNEL_START, DMA_CONTROL_END, DPCR,
     DmaController, DmaError, InterruptSink as DmaInterruptSink,
 };
-use upse_ps1_gpu::{GP0, GP1, Gpu};
+use upse_ps1_gpu::{GP0, GP1, Gpu, GpuError};
 use upse_ps1_irq::{I_MASK, I_STAT, InterruptController, InterruptSource};
 use upse_ps1_mdec::{MDEC_CONTROL_STATUS, MDEC_DATA, Mdec};
 use upse_ps1_memory::{
@@ -44,6 +45,7 @@ const EVENT_SPEC_INTERRUPTED: u32 = 0x0000_0002;
 const EVENT_SPEC_COMMAND_COMPLETE: u32 = 0x0000_0020;
 const EVENT_SPEC_INTERRUPT: u32 = 0x0000_1000;
 const EVENT_CLASS_SPU: u32 = 0xf000_0009;
+const BIOS_REGION_BYTE: u32 = 0x1fc7_ff52;
 const AKAO_DRIVER_EVENT_RETURN: u32 = 0x8005_b0d0;
 const AKAO_DRIVER_EVENT_HANDLE: u32 = 0xf100_0001;
 const AKAO_DRIVER_ARGUMENT_PRELOAD: u32 = 0x8009_80bc;
@@ -145,6 +147,9 @@ pub enum MachineError {
         /// Structured HLE failure.
         source: BiosError,
     },
+    /// A BIOS-owned GPU operation failed.
+    #[error("PS1 BIOS GPU failure: {0}")]
+    Gpu(#[from] GpuError),
     /// Deferred BIOS callback state transition failed.
     #[error("PS1 BIOS HLE state failure: {0}")]
     BiosState(#[from] BiosError),
@@ -455,6 +460,10 @@ impl Ps1Machine {
                 spu: &mut state.spu,
                 scheduler: &mut state.scheduler,
                 now: state.now,
+                bios_region: match state.refresh.standard() {
+                    VideoStandard::Pal => b'E',
+                    VideoStandard::Ntsc => b'A',
+                },
                 prefetched_instruction,
             };
             state.cpu.step_without_external_interrupts(&mut bus)?
@@ -595,7 +604,16 @@ impl Ps1Machine {
         let function = context.register(9).unwrap_or(0).to_le_bytes()[0];
         let arguments: [u32; 4] =
             std::array::from_fn(|index| context.register(4 + index).unwrap_or(0));
-        let outcome = {
+        let outcome = if vector == BiosVector::A0 && function == 0x49 {
+            let result = self.state.gpu.synchronize();
+            self.state.gpu.write_register(GP0, arguments[0])?;
+            context.set_register(2, result);
+            context.pc = context.register(31).unwrap_or(0);
+            HleOutcome {
+                cycles: 12,
+                action: HleAction::Return,
+            }
+        } else {
             let mut memory = BiosMemory(&mut self.state.memory);
             self.state
                 .bios
@@ -882,6 +900,7 @@ struct MachineBus<'a> {
     spu: &'a mut Spu,
     scheduler: &'a mut Scheduler,
     now: Deadline,
+    bios_region: u8,
     prefetched_instruction: Option<(u32, u32)>,
 }
 
@@ -984,6 +1003,9 @@ impl Bus for MachineBus<'_> {
                 let aligned = physical & !1;
                 let value = self.read_mmio_u16(aligned)?;
                 Ok(value.to_le_bytes()[usize::from((physical & 1).to_le_bytes()[0])])
+            }
+            MemoryRegion::HleRom { physical } if physical == BIOS_REGION_BYTE => {
+                Ok(self.bios_region)
             }
             _ => self.memory.read_u8(address).map_err(bus_fault),
         }
@@ -1181,8 +1203,8 @@ mod tests {
     use upse_scheduler::Scheduler;
 
     use super::{
-        BiosMemory, CPU_HZ, EVENT_SPEC_INTERRUPTED, IDLE_ADVANCE_CYCLES, MachineConfig,
-        MachineEvent, MachineStepKind, Ps1Machine, StepEvent, VideoStandard,
+        BiosMemory, CPU_HZ, EVENT_SPEC_INTERRUPTED, GP1, IDLE_ADVANCE_CYCLES, MachineConfig,
+        MachineEvent, MachineStepKind, Ps1Machine, StepEvent, VBlankClock, VideoStandard,
     };
 
     #[test]
@@ -1218,6 +1240,10 @@ mod tests {
 
     fn instruction_lw(rt: u32, offset: u16, base: u32) -> u32 {
         (0x23 << 26) | (base << 21) | (rt << 16) | u32::from(offset)
+    }
+
+    fn instruction_lbu(rt: u32, offset: u16, base: u32) -> u32 {
+        (0x24 << 26) | (base << 21) | (rt << 16) | u32::from(offset)
     }
 
     fn synthetic_plan() -> upse_psf::Psf1LoadPlan {
@@ -1339,6 +1365,55 @@ mod tests {
         let mut reset = [0_i16; 32];
         machine.render(16, &mut reset).unwrap();
         assert_eq!(reset, golden);
+    }
+
+    #[test]
+    fn bios_region_byte_tracks_the_selected_video_standard() {
+        let plan = synthetic_plan();
+        for (standard, expected) in [
+            (VideoStandard::Ntsc, u32::from(b'A')),
+            (VideoStandard::Pal, u32::from(b'E')),
+        ] {
+            let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+            machine.state.refresh = VBlankClock::new(standard);
+            let program = 0x8001_8000;
+            machine
+                .state
+                .memory
+                .write_u32(program, instruction_lui(8, 0xbfc8))
+                .unwrap();
+            machine
+                .state
+                .memory
+                .write_u32(program + 4, instruction_lbu(9, 0xff52, 8))
+                .unwrap();
+            machine.state.cpu.set_pc(program);
+
+            machine.step().unwrap();
+            machine.step().unwrap();
+
+            assert_eq!(machine.state.cpu.register(9), Some(expected));
+        }
+    }
+
+    #[test]
+    fn bios_gpu_command_synchronizes_dma_and_writes_gp0() {
+        let plan = synthetic_plan();
+        let mut machine = Ps1Machine::from_plan(&plan, MachineConfig::default()).unwrap();
+        machine.state.gpu.write_register(GP1, 0x0400_0002).unwrap();
+        machine.state.cpu.set_register(4, 0xe100_0123);
+        machine.state.cpu.set_register(9, 0x49);
+        machine.state.cpu.set_register(31, 0x8001_0100);
+        machine.state.cpu.set_pc(0x0000_00a0);
+
+        let outcome = machine.step().unwrap();
+
+        assert_eq!(outcome.kind, MachineStepKind::Bios(BiosVector::A0));
+        assert_eq!(machine.pc(), 0x8001_0100);
+        assert_eq!(machine.state.cpu.register(2), Some(0));
+        let status = machine.state.gpu.read_register(GP1).unwrap();
+        assert_eq!((status >> 29) & 3, 0);
+        assert_eq!(status & 0x0000_07ff, 0x0123);
     }
 
     #[test]
