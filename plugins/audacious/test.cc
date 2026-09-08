@@ -111,8 +111,17 @@ int main(int argc, char ** argv)
     if (!valid_plugin)
         std::fprintf(stderr, "invalid Audacious input plugin descriptor\n");
 
+    const bool initialized = valid_plugin && plugin->init();
+    if (initialized)
+    {
+        aud_set_int("upse-ng", "psf1_length_policy", UPSE_DURATION_TAG);
+        aud_set_int("upse-ng", "psf1_fade_policy", UPSE_DURATION_TAG);
+        aud_set_int("upse-ng", "psf2_length_policy", UPSE_DURATION_TAG);
+        aud_set_int("upse-ng", "psf2_fade_policy", UPSE_DURATION_TAG);
+    }
+
     bool valid_fixtures =
-        valid_plugin && plugin->init() &&
+        initialized &&
         check_fixture(plugin, argv[2], "UPSE-NG synthetic noise",
                       "PlayStation Sound Format (PSF)", 25) &&
         check_fixture(plugin, argv[3], "UPSE-NG synthetic noise",
