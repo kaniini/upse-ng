@@ -153,6 +153,16 @@ pub enum WordAlignmentMode {
     AlignDown,
 }
 
+/// Availability and behavior of the machine's second coprocessor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Coprocessor2Mode {
+    /// Raise a coprocessor-unusable exception for COP2 instructions.
+    #[default]
+    Disabled,
+    /// Preserve register transfers while treating commands as no-ops.
+    Stub,
+}
+
 /// Handling of a control-transfer instruction in another branch's delay slot.
 ///
 /// MIPS-I leaves this sequence architecturally undefined. Machine profiles can
@@ -298,9 +308,12 @@ pub struct Cpu {
     delay_slot: Option<DelaySlotState>,
     pending_load: Option<(usize, u32)>,
     cop0: Cop0,
+    cop2_data: [u32; 32],
+    cop2_control: [u32; 32],
     profile: ResetProfile,
     load_delay_mode: LoadDelayMode,
     word_alignment_mode: WordAlignmentMode,
+    coprocessor2_mode: Coprocessor2Mode,
     delay_slot_branch_mode: DelaySlotBranchMode,
 }
 
@@ -327,9 +340,12 @@ impl Cpu {
                 processor_id: profile.processor_id,
                 ..Cop0::default()
             },
+            cop2_data: [0; 32],
+            cop2_control: [0; 32],
             profile,
             load_delay_mode,
             word_alignment_mode: WordAlignmentMode::Architectural,
+            coprocessor2_mode: Coprocessor2Mode::Disabled,
             delay_slot_branch_mode: DelaySlotBranchMode::Preserve,
         }
     }
@@ -337,15 +353,22 @@ impl Cpu {
     /// Restores architectural reset state.
     pub fn reset(&mut self) {
         let word_alignment_mode = self.word_alignment_mode;
+        let coprocessor2_mode = self.coprocessor2_mode;
         let delay_slot_branch_mode = self.delay_slot_branch_mode;
         *self = Self::with_load_delay_mode(self.profile, self.load_delay_mode);
         self.word_alignment_mode = word_alignment_mode;
+        self.coprocessor2_mode = coprocessor2_mode;
         self.delay_slot_branch_mode = delay_slot_branch_mode;
     }
 
     /// Selects handling for misaligned word data accesses.
     pub fn set_word_alignment_mode(&mut self, mode: WordAlignmentMode) {
         self.word_alignment_mode = mode;
+    }
+
+    /// Selects whether COP2 register operations and no-op commands are usable.
+    pub fn set_coprocessor2_mode(&mut self, mode: Coprocessor2Mode) {
+        self.coprocessor2_mode = mode;
     }
 
     /// Selects handling for a branch encountered in another branch's delay slot.
@@ -654,6 +677,9 @@ impl Cpu {
             0x0e => result.write(rt, left ^ u32::from(immediate)),
             0x0f => result.write(rt, u32::from(immediate) << 16),
             0x10 => self.execute_cop0(&mut result, rs, rt, rd, function),
+            0x12 if self.coprocessor2_mode == Coprocessor2Mode::Stub => {
+                self.execute_cop2(&mut result, rs, rt, rd);
+            }
             0x11..=0x13 => result.exception = Some(Exception::CoprocessorUnusable),
             0x20 => {
                 let address = left.wrapping_add_signed(i32::from(signed_immediate));
@@ -764,6 +790,26 @@ impl Cpu {
                 Self::store_u32(bus, pc, aligned, value)?;
                 result.cycles = 2;
             }
+            0x32 if self.coprocessor2_mode == Coprocessor2Mode::Stub => {
+                let address = left.wrapping_add_signed(i32::from(signed_immediate));
+                if address & 3 != 0 && self.word_alignment_mode == WordAlignmentMode::Architectural
+                {
+                    result.address_exception(Exception::AddressLoad, address);
+                } else {
+                    self.cop2_data[rt] = Self::load_u32(bus, pc, address & !3)?;
+                    result.cycles = 2;
+                }
+            }
+            0x3a if self.coprocessor2_mode == Coprocessor2Mode::Stub => {
+                let address = left.wrapping_add_signed(i32::from(signed_immediate));
+                if address & 3 != 0 && self.word_alignment_mode == WordAlignmentMode::Architectural
+                {
+                    result.address_exception(Exception::AddressStore, address);
+                } else {
+                    Self::store_u32(bus, pc, address & !3, self.cop2_data[rt])?;
+                    result.cycles = 2;
+                }
+            }
             0x30..=0x33 | 0x38..=0x3b => {
                 result.exception = Some(Exception::CoprocessorUnusable);
             }
@@ -793,6 +839,17 @@ impl Cpu {
             0x10 if function == 0x10 => {
                 self.cop0.status = (self.cop0.status & !0x0f) | ((self.cop0.status >> 2) & 0x0f);
             }
+            _ => result.exception = Some(Exception::ReservedInstruction),
+        }
+    }
+
+    fn execute_cop2(&mut self, result: &mut Execution, rs: usize, rt: usize, rd: usize) {
+        match rs {
+            0x00 => result.load(rt, self.cop2_data[rd]),
+            0x02 => result.load(rt, self.cop2_control[rd]),
+            0x04 => self.cop2_data[rd] = self.registers[rt],
+            0x06 => self.cop2_control[rd] = self.registers[rt],
+            0x10..=0x1f => {}
             _ => result.exception = Some(Exception::ReservedInstruction),
         }
     }
@@ -1048,8 +1105,8 @@ impl Cpu {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bus, BusFault, CAUSE_BD, CAUSE_IP2, Cpu, DelaySlotBranchMode, Exception, LoadDelayMode,
-        ResetProfile, StepEvent, WordAlignmentMode,
+        Bus, BusFault, CAUSE_BD, CAUSE_IP2, Coprocessor2Mode, Cpu, DelaySlotBranchMode, Exception,
+        LoadDelayMode, ResetProfile, StepEvent, WordAlignmentMode,
     };
 
     struct TestBus {
@@ -1369,6 +1426,39 @@ mod tests {
     }
 
     #[test]
+    fn cop2_register_transfers_and_memory_operations_are_available() {
+        let move_to_data = (0x12 << 26) | (0x04 << 21) | (1 << 16) | (3 << 11);
+        let move_from_data = (0x12 << 26) | (2 << 16) | (3 << 11);
+        let move_to_control = (0x12 << 26) | (0x06 << 21) | (1 << 16) | (7 << 11);
+        let move_from_control = (0x12 << 26) | (0x02 << 21) | (3 << 16) | (7 << 11);
+        let words = [
+            move_to_data,
+            move_from_data,
+            0,
+            move_to_control,
+            move_from_control,
+            0,
+            i(0x32, 4, 5, 0),
+            i(0x3a, 4, 5, 4),
+            0x4a00_0001,
+        ];
+        let mut bus = TestBus::new(&words);
+        bus.write_u32(0x100, 0x89ab_cdef).unwrap();
+        let mut cpu = Cpu::new(profile());
+        cpu.set_coprocessor2_mode(Coprocessor2Mode::Stub);
+        cpu.set_register(1, 0x1234_5678);
+        cpu.set_register(4, 0x100);
+
+        for _ in words {
+            assert_eq!(cpu.step(&mut bus).unwrap().event, StepEvent::Instruction);
+        }
+
+        assert_eq!(cpu.register(2), Some(0x1234_5678));
+        assert_eq!(cpu.register(3), Some(0x1234_5678));
+        assert_eq!(bus.read_u32(0x104).unwrap(), 0x89ab_cdef);
+    }
+
+    #[test]
     fn aligned_signed_unsigned_loads_and_stores_round_trip() {
         let words = [
             i(0x28, 1, 2, 0),
@@ -1483,7 +1573,9 @@ mod tests {
             (i(0x29, 0, 1, 1), Exception::AddressStore),
             (i(0x2b, 0, 1, 2), Exception::AddressStore),
             (0x4400_0000, Exception::CoprocessorUnusable),
+            (0x4800_0000, Exception::CoprocessorUnusable),
             (0xc000_0000, Exception::CoprocessorUnusable),
+            (0xc800_0000, Exception::CoprocessorUnusable),
             (0x0000_000d, Exception::Break),
         ];
         for (instruction, exception) in cases {

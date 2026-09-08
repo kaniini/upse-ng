@@ -32,8 +32,8 @@ use upse_ps1_timers::{
 use upse_psf::{Psf1LoadPlan, RefreshRate};
 use upse_psx_exe::{ExecutableImage, ImageError};
 use upse_r3000::{
-    Bus, BusFault, Cpu, CpuError, DelaySlotBranchMode, Exception, LoadDelayMode, ResetProfile,
-    StepEvent, WordAlignmentMode,
+    Bus, BusFault, Coprocessor2Mode, Cpu, CpuError, DelaySlotBranchMode, Exception, LoadDelayMode,
+    ResetProfile, StepEvent, WordAlignmentMode,
 };
 use upse_scheduler::{Scheduler, SchedulerError};
 
@@ -276,6 +276,9 @@ impl Ps1Machine {
         // conditional branch's delay slot. The sequence is undefined on MIPS-I,
         // but requires the outer taken branch to retain control of the loop.
         cpu.set_delay_slot_branch_mode(DelaySlotBranchMode::SuppressWhenOuterTaken);
+        // Geometry has no bearing on PSF audio, but PS-X executables commonly
+        // pass through GTE setup helpers before starting their sound driver.
+        cpu.set_coprocessor2_mode(Coprocessor2Mode::Stub);
         // Some emulator-facing PSF rip drivers rely on word accesses being
         // silently aligned during startup.
         cpu.set_word_alignment_mode(WordAlignmentMode::AlignDown);
